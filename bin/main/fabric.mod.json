@@ -1,0 +1,35 @@
+{
+	"schemaVersion": 1,
+	"id": "wendigo",
+	"version": "${version}",
+	"name": "Wendigo",
+	"description": "Server-side-only custom mob rendered via Polymer virtual entities -- no client mod required.",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/wendigo/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.wendigo.WendigoMod"
+		],
+		"client": [
+			"com.wendigo.client.WendigoModClient"
+		]
+	},
+	"mixins": [
+		"wendigo.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.1.2",
+		"java": ">=25",
+		"fabric-api": "*",
+		"polymer-core": "*",
+		"polymer-virtual-entity": "*",
+		"polymer-resource-pack": "*"
+	}
+}

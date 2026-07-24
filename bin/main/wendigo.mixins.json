@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "com.wendigo.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"mixins": [
+		"EnderManMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
