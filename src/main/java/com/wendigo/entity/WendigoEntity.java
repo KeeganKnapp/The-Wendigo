@@ -1,6 +1,7 @@
 package com.wendigo.entity;
 
-import com.google.gson.JsonArray;
+import java.util.List;
+
 import com.google.gson.JsonObject;
 
 import net.minecraft.core.BlockPos;
@@ -10,6 +11,7 @@ import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
+import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.level.Level;
 
@@ -28,16 +30,19 @@ public class WendigoEntity extends EnderMan {
     // naturally enters it (no swim/sneak AI), rather than trying to swap the entity's actual Java
     // class, which Minecraft has no runtime support for.
     //
-    // Width is deliberately narrow (well under a full block), NOT a "spider-ish" wide footprint --
-    // this hitbox is invisible and purely physical (the crawl *look* comes entirely from
-    // WendigoVisual's animation matrices, which don't read these dimensions at all), and this
-    // entity is in the crawling pose for essentially all of its real movement (tick() switches to
-    // it the instant horizontal velocity is nonzero). A hitbox wider than one block routinely
-    // overlaps the neighboring column at any ledge, so at a drop edge it would physically catch the
-    // block's corner -- collision shoves it back, the path follower reissues the same node, and it
-    // visibly spins in place until it wiggles free. A width that fits within a single column avoids
-    // that entirely, same as every vanilla ground mob.
-    private static final EntityDimensions CRAWLING_DIMENSIONS = EntityDimensions.scalable(0.6F, 0.6F);
+    // Effectively one full block wide/tall per explicit user request - this hitbox is invisible and
+    // purely physical (the crawl *look* comes entirely from WendigoVisual's animation matrices,
+    // which don't read these dimensions at all), and this entity is in the crawling pose for
+    // essentially all of its real movement (tick() switches to it the instant horizontal velocity
+    // is nonzero). Width is 0.98, not a literal 1.0: at exactly one block, the hitbox can straddle
+    // two neighboring columns depending on fractional position (no margin at all), which is exactly
+    // what caused the reported ledge-catching/spin-in-place stalls - the entity would collide with
+    // both columns near an inside corner and repeatedly re-turn to route around a collision the
+    // pathfinder's own node graph (which reasons in whole blocks) never saw. 0.98 leaves enough
+    // margin to always fit inside a single column while still reading as "1 block" for any practical
+    // purpose. Confirmed via this file's own prior comment flagging this exact tradeoff as "the first
+    // thing to revisit" if the symptom reappeared - it did.
+    private static final EntityDimensions CRAWLING_DIMENSIONS = EntityDimensions.scalable(0.6F, 0.4F);
     // Real Enderman standing height is 2.9 blocks -- shrunk to a reasonable "upright but not
     // freakishly tall" figure so it reliably fits normal 2-3 tall spaces in either pose, not just
     // while crawling.
@@ -62,6 +67,19 @@ public class WendigoEntity extends EnderMan {
     }
 
     @Override
+    protected PathNavigation createNavigation(Level level) {
+        return new DarknessAwareNavigation(this, level);
+    }
+
+    /** See DarknessNodeEvaluator.lightTolerant - PlanRunner toggles this around the two primitives
+     * (combat.lunge_attack, combat.break_torch) that are meant to cross into light on purpose. */
+    public void setLightTolerantPathing(boolean tolerant) {
+        if (this.getNavigation() instanceof DarknessAwareNavigation navigation) {
+            navigation.setLightTolerant(tolerant);
+        }
+    }
+
+    @Override
     protected void registerGoals() {
         // Deliberately NOT calling super.registerGoals() -- Enderman's own goal set (teleport
         // toward target, melee attack, block pickup/place, stare-based aggro) isn't wanted here.
@@ -80,7 +98,14 @@ public class WendigoEntity extends EnderMan {
             this.desiredPose = desired;
             this.desiredPoseStableTicks = 0;
         }
-        if (this.desiredPoseStableTicks >= POSE_SWITCH_DEBOUNCE_TICKS && this.getPose() != desired) {
+        // Debounce is only needed going crawling -> standing (stairs/slopes cause brief mid-walk
+        // velocity dips that would otherwise flicker the pose back and forth). Starting to crawl
+        // from a genuine standstill has no such ambiguity, and waiting the full debounce there was
+        // making a sudden move (e.g. combat.lunge_attack out of a held stare) visibly float for a
+        // few ticks before the crawl animation caught up - switch to it immediately instead.
+        boolean startingToCrawl = desired == Pose.SWIMMING && this.getPose() == Pose.STANDING;
+        boolean debounceSatisfied = this.desiredPoseStableTicks >= POSE_SWITCH_DEBOUNCE_TICKS;
+        if ((startingToCrawl || debounceSatisfied) && this.getPose() != desired) {
             this.setPose(desired);
             this.refreshDimensions();
         }
@@ -90,9 +115,14 @@ public class WendigoEntity extends EnderMan {
         }
     }
 
-    /** Starts a wave's plan body, running to completion and then to despawnTarget - see PlanRunner. */
-    public void startWave(JsonArray planBody, BlockPos despawnTarget) {
-        this.planRunner.start(planBody, despawnTarget);
+    /**
+     * Starts a wave's plan body, running to completion and then attempting despawnCandidates in
+     * order (falling back to a live scan if all fail) - see PlanRunner. allSpots is the full
+     * labeled spot_a..spot_f list (not just the despawn candidates) so movement.approach_spot can
+     * resolve a label mid-plan.
+     */
+    public void startWave(JsonObject plan, List<BlockPos> despawnCandidates, List<BlockPos> allSpots, int severityPercent, boolean tierGatingBypassed) {
+        this.planRunner.start(plan, despawnCandidates, allSpots, severityPercent, tierGatingBypassed);
     }
 
     /** True once the current wave's plan body and despawn move have both finished. */
@@ -100,10 +130,16 @@ public class WendigoEntity extends EnderMan {
         return this.planRunner.isWaveComplete();
     }
 
+    /** What actually happened this wave so far - see PlanRunner.EncounterOutcome/EncounterHistory. */
+    public PlanRunner.EncounterOutcome getOutcome() {
+        return this.planRunner.outcome();
+    }
+
     /** Entry point for WendigoCommands' {@code /wendigo plantest} debug command - runs the plan
-     * body with no despawn phase, independent of the wave system. */
+     * body with no despawn phase, independent of the wave system. Tier gating bypassed since this
+     * is a raw debug tool, not a real wave. */
     public void debugInjectPlan(JsonObject plan) {
-        this.planRunner.start(plan.getAsJsonArray("plan"), null);
+        this.planRunner.start(plan, null, null, 100, true);
     }
 
     public boolean isCrawling() {

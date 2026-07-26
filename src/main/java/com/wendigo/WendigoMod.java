@@ -14,6 +14,7 @@ import com.wendigo.entity.WendigoEntity;
 import com.wendigo.entity.WendigoVisual;
 import com.wendigo.llm.LlmClient;
 import com.wendigo.llm.LlmConfig;
+import com.wendigo.wave.EncounterHistory;
 import com.wendigo.wave.PlayerSeverityTracker;
 import com.wendigo.wave.WendigoManager;
 import com.wendigo.wave.WendigoWaveConfig;
@@ -35,6 +36,8 @@ public class WendigoMod implements ModInitializer {
 	// Exposed for WendigoCommands' /wendigo wave debug command, which needs to bypass the
 	// manager's normal cooldown/eligibility gating.
 	public static WendigoManager wendigoManager;
+	// Exposed for WendigoCommands' /wendigo aggression get/set debug commands.
+	public static PlayerSeverityTracker severityTracker;
 
 	@Override
 	public void onInitialize() {
@@ -67,9 +70,9 @@ public class WendigoMod implements ModInitializer {
 		llmClient = new LlmClient(LlmConfig.load());
 
 		WendigoWaveConfig waveConfig = WendigoWaveConfig.load();
-		PlayerSeverityTracker severityTracker = new PlayerSeverityTracker(waveConfig);
+		severityTracker = new PlayerSeverityTracker(waveConfig);
 		severityTracker.register();
-		wendigoManager = new WendigoManager(waveConfig, severityTracker);
+		wendigoManager = new WendigoManager(waveConfig, severityTracker, new EncounterHistory());
 		wendigoManager.register();
 
 		WendigoCommands.register();

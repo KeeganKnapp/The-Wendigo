@@ -9,6 +9,7 @@ import eu.pb4.polymer.virtualentity.api.elements.ItemDisplayElement;
 import net.minecraft.core.component.DataComponents; // TODO verify against this MC version's generated mappings
 import net.minecraft.util.Brightness;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Items; // TODO verify against this MC version's generated mappings
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.item.ItemStack;
@@ -33,6 +34,7 @@ public class WendigoVisual extends ElementHolder {
     // Goals beyond FloatGoal) -- reading it raw made the rig visibly jerky. Easing toward it instead
     // of copying it verbatim smooths that out; Mth.rotLerp already takes the shortest way around.
     private static final float YAW_LERP_FACTOR = 0.35f;
+    private static final double LOOK_AT_PLAYER_RADIUS = 64.0;
 
     private final WendigoEntity owner;
     private final Map<String, ItemDisplayElement> bones = new LinkedHashMap<>();
@@ -83,7 +85,15 @@ public class WendigoVisual extends ElementHolder {
         // independent virtual elements with their own yaw, so we have to do that sync ourselves
         // or the rig stays facing whatever direction it last had regardless of which way the
         // real (invisible) entity turns.
-        float targetYaw = this.owner.getYRot();
+        // While staring, the whole rig turns to face the nearest player instead of following
+        // movement - not just the head. Each bone's transformation matrix bakes in its own
+        // translation offset from the rig's shared anchor point (see the class doc), and that
+        // translation gets rotated along with whatever yaw is applied to that element; giving only
+        // the head bone its own yaw rotated its *position* toward the player as well as its facing,
+        // which reads as the head detaching and poking forward off the neck the further it turned.
+        // Turning every bone together keeps the whole rig internally consistent - still doesn't
+        // touch the real entity's yaw/LookControl, that stays driven purely by movement/pathing.
+        float targetYaw = this.owner.isStaring() ? lookAtPlayerYaw() : this.owner.getYRot();
         if (!this.yawInitialized) {
             this.smoothedYaw = targetYaw;
             this.yawInitialized = true;
@@ -112,6 +122,17 @@ public class WendigoVisual extends ElementHolder {
             applyEyes(WendigoAnimationData.REST_POSE.get("head"), yaw);
             this.animationTick = 0;
         }
+    }
+
+    /** Yaw facing the nearest player, or the body's own yaw if none is found nearby. */
+    private float lookAtPlayerYaw() {
+        Player player = this.owner.level().getNearestPlayer(this.owner, LOOK_AT_PLAYER_RADIUS);
+        if (player == null) {
+            return this.owner.getYRot();
+        }
+        double dx = player.getX() - this.owner.getX();
+        double dz = player.getZ() - this.owner.getZ();
+        return (float) (Mth.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
     }
 
     /** Keeps the eyes overlay locked to the head bone's own transform every frame, in either pose. */

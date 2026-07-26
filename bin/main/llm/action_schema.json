@@ -1,367 +1,927 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WendigoActionPlan",
-  "description": "One complete wave for the wendigo: where it spawns, what it does, and where it despawns. This one call drives the entire wave start to finish - there is no mid-wave re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, and the available spawn_at/despawn_at spot labels (spot_a..spot_d, nearest to furthest) with real distances/light levels - that context is NOT part of this schema since it's different every request. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself.",
+  "description": "One complete wave for the wendigo: where it spawns, what it does, and where it despawns. This one call drives the entire wave start to finish - there is no mid-wave re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, and the available spawn_at/despawn_at spot labels (spot_a..spot_f, nearest to furthest) with real distances/light levels - that context is NOT part of this schema since it's different every request. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
   "type": "object",
   "properties": {
     "spawn_at": {
       "type": "string",
-      "enum": ["spot_a", "spot_b", "spot_c", "spot_d"],
-      "description": "Which of the scanned dark spots (given in the prompt, nearest to furthest) the wendigo should spawn at. Only labels actually offered in the prompt are valid for this request."
+      "enum": [
+        "spot_a",
+        "spot_b",
+        "spot_c",
+        "spot_d",
+        "spot_e",
+        "spot_f",
+        "no_players_looking"
+      ],
+      "description": "Which of the scanned dark spots (given in the prompt, nearest to furthest) the wendigo should spawn at. Only labels actually offered in the prompt are valid for this request. 'no_players_looking' is a special value instead of naming a specific spot: the engine picks a random scanned spot the target player isn't currently looking toward (falling back to the furthest scanned spot if every one of them happens to be in view) - use this whenever the point is a clean, unnoticed first appearance rather than a specific spot's particular geometry (dim spots, torches, connectivity), since it's a better guarantee of not being caught mid-spawn than guessing which labeled spot is safest yourself."
     },
     "plan": {
       "type": "array",
       "minItems": 1,
       "maxItems": 6,
-      "items": { "$ref": "#/$defs/step" },
+      "items": {
+        "$ref": "#/$defs/step"
+      },
       "description": "Runs after spawning, before the despawn move. Executed in order. If a step's precondition isn't met (e.g. retreat_to_dark with source=stored but nothing has been stored yet), the engine falls back to a sensible default rather than erroring - it never rejects a whole plan for one bad step."
     },
     "despawn_at": {
       "type": "string",
-      "enum": ["spot_a", "spot_b", "spot_c", "spot_d"],
+      "enum": [
+        "spot_a",
+        "spot_b",
+        "spot_c",
+        "spot_d",
+        "spot_e",
+        "spot_f"
+      ],
       "description": "Which scanned dark spot the wendigo should retreat to and despawn at once 'plan' finishes. Usually further away than spawn_at, to sell the idea of it withdrawing back into the dark."
+    },
+    "global_rules": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/global_rule"
+      },
+      "description": "Hard requirements the engine enforces every tick, independent of whatever 'plan' step is currently running or how deep inside a control.if/control.while it is - not a suggestion the model has to remember to re-check at every step. Each rule fires at most once per wave: the instant its condition becomes true, the engine stops whatever the wendigo is currently doing (interrupting mid-movement if needed) and runs its action immediately, then the plan resumes from wherever it left off once that action finishes (unless the action was control.despawn, which ends the wave outright). Use this for things that must never be allowed to happen regardless of which branch the model chose earlier - e.g. a rule with condition predicate.player_looking_at_self(band=dead_stare) and action control.despawn, so a dead-on stare ends the encounter immediately no matter what movement/posture step happens to be running at that moment, instead of relying on every single plan step remembering to check for it. Don't use this for ordinary reactive branching (e.g. 'wait until the player looks away before approaching') - that belongs in control.if/control.while inside 'plan', where the timing of the check is meant to matter. Empty array if nothing needs this level of enforcement for this wave."
     }
   },
-  "required": ["spawn_at", "plan", "despawn_at"],
+  "required": [
+    "spawn_at",
+    "plan",
+    "despawn_at",
+    "global_rules"
+  ],
   "additionalProperties": false,
-
   "$defs": {
     "step": {
       "description": "Top-level plan entries: any primitive action, or a control.if/control.while wrapping a nested block of primitive actions. Control steps cannot nest inside each other (see action_step) - that keeps a plan at most two levels deep, which is what both the grammar-constrained decoder and a small model can reliably produce.",
-      "oneOf": [
-        { "$ref": "#/$defs/action_step" },
-        { "$ref": "#/$defs/control_if" },
-        { "$ref": "#/$defs/control_while" }
+      "anyOf": [
+        {
+          "$ref": "#/$defs/action_step"
+        },
+        {
+          "$ref": "#/$defs/control_if"
+        },
+        {
+          "$ref": "#/$defs/control_while"
+        }
       ]
     },
-
     "action_step": {
       "description": "A primitive action - the only kind of step allowed inside a control.if/control.while block, so branches/loop bodies can't themselves contain more control flow.",
-      "oneOf": [
-        { "$ref": "#/$defs/movement_approach" },
-        { "$ref": "#/$defs/movement_retreat_to_dark" },
-        { "$ref": "#/$defs/movement_reposition" },
-        { "$ref": "#/$defs/movement_hold" },
-        { "$ref": "#/$defs/memory_store_dark_location" },
-        { "$ref": "#/$defs/posture_stare" },
-        { "$ref": "#/$defs/timing_wait" },
-        { "$ref": "#/$defs/sound_ambient_cue" },
-        { "$ref": "#/$defs/control_none" }
+      "anyOf": [
+        {
+          "$ref": "#/$defs/movement_approach"
+        },
+        {
+          "$ref": "#/$defs/movement_approach_spot"
+        },
+        {
+          "$ref": "#/$defs/movement_approach_dim_spot"
+        },
+        {
+          "$ref": "#/$defs/movement_retreat_to_dark"
+        },
+        {
+          "$ref": "#/$defs/movement_retreat_with_fallback"
+        },
+        {
+          "$ref": "#/$defs/movement_reposition"
+        },
+        {
+          "$ref": "#/$defs/movement_hold"
+        },
+        {
+          "$ref": "#/$defs/memory_store_dark_location"
+        },
+        {
+          "$ref": "#/$defs/posture_stare"
+        },
+        {
+          "$ref": "#/$defs/timing_wait"
+        },
+        {
+          "$ref": "#/$defs/sound_ambient_cue"
+        },
+        {
+          "$ref": "#/$defs/combat_lunge_attack"
+        },
+        {
+          "$ref": "#/$defs/combat_break_torch"
+        },
+        {
+          "$ref": "#/$defs/combat_chase"
+        },
+        {
+          "$ref": "#/$defs/control_none"
+        },
+        {
+          "$ref": "#/$defs/control_despawn"
+        }
       ]
     },
-
     "movement_approach": {
       "type": "object",
       "description": "MOVEMENT branch: close distance toward the player using vanilla pathfinding.",
       "properties": {
-        "type": { "const": "movement.approach" },
+        "type": {
+          "type": "string",
+          "const": "movement.approach"
+        },
         "speed": {
           "type": "string",
-          "enum": ["slow", "normal", "fast"],
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
           "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
         }
       },
-      "required": ["type", "speed"],
+      "required": [
+        "type",
+        "speed"
+      ],
       "additionalProperties": false
     },
-
+    "movement_approach_spot": {
+      "type": "object",
+      "description": "MOVEMENT branch: pathfind to another scanned spot by label - only valid for a label listed in that spot's own \"pathfindable to\" list in the prompt for whichever spot the wendigo currently occupies (an engine-verified real route, not a guess). Mainly useful for reaching a spot's dim spots when it isn't the one the wendigo spawned at: approach_spot there first, then movement.approach_dim_spot (which always searches from the current position) to actually creep to the edge of its light.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "movement.approach_spot"
+        },
+        "spot": {
+          "type": "string",
+          "enum": [
+            "spot_a",
+            "spot_b",
+            "spot_c",
+            "spot_d",
+            "spot_e",
+            "spot_f"
+          ],
+          "description": "Which scanned spot to move to - must be one listed as pathfindable-to from wherever the wendigo currently is."
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
+        }
+      },
+      "required": [
+        "type",
+        "spot",
+        "speed"
+      ],
+      "additionalProperties": false
+    },
+    "movement_approach_dim_spot": {
+      "type": "object",
+      "description": "MOVEMENT branch: pathfind to the nearest dim spot (a standable position at the edge of a light source - not fully dark, not fully lit) reachable from the wendigo's current location. Lets it approach a light source, or observe a player who's in one, without fully exposing itself. Only useful from a spot that has nearby dim spots (see the per-spot count in the prompt) - if there are none nearby, this is a no-op and the plan continues.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "movement.approach_dim_spot"
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
+        }
+      },
+      "required": [
+        "type",
+        "speed"
+      ],
+      "additionalProperties": false
+    },
     "movement_retreat_to_dark": {
       "type": "object",
       "description": "MOVEMENT branch: move toward a dark location instead of the player.",
       "properties": {
-        "type": { "const": "movement.retreat_to_dark" },
+        "type": {
+          "type": "string",
+          "const": "movement.retreat_to_dark"
+        },
         "source": {
           "type": "string",
-          "enum": ["stored", "scan_now"],
+          "enum": [
+            "stored",
+            "scan_now"
+          ],
           "description": "'stored' = pathfind to the location remembered by the most recent memory.store_dark_location step (falls back to scan_now if nothing is stored). 'scan_now' = scan the surroundings immediately and move there."
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant. A calm withdrawal reads differently from a startled flee - pick deliberately."
         }
       },
-      "required": ["type", "source"],
+      "required": [
+        "type",
+        "source",
+        "speed"
+      ],
       "additionalProperties": false
     },
-
+    "movement_retreat_with_fallback": {
+      "type": "object",
+      "description": "MOVEMENT branch: retreat to a dark spot with the same robustness as the automatic despawn move - tries the wave's other scanned dark spots in order if the first attempt fails (stuck/unreachable/times out), then a fresh live scan as a last resort, before giving up. Prefer this over retreat_to_dark right after combat.lunge_attack, where reliably getting back into hiding matters more than a single best-effort attempt.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "movement.retreat_with_fallback"
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant. Applies to every candidate this step tries, including fallback attempts."
+        }
+      },
+      "required": [
+        "type",
+        "speed"
+      ],
+      "additionalProperties": false
+    },
     "movement_reposition": {
       "type": "object",
       "description": "MOVEMENT branch: short-range tactical movement relative to a reference point - never absolute coordinates.",
       "properties": {
-        "type": { "const": "movement.reposition" },
+        "type": {
+          "type": "string",
+          "const": "movement.reposition"
+        },
         "reference": {
           "type": "string",
-          "enum": ["player", "stored_dark_spot"],
+          "enum": [
+            "player",
+            "stored_dark_spot"
+          ],
           "description": "What the direction/distance below are relative to."
         },
         "direction": {
           "type": "string",
-          "enum": ["toward", "away", "orbit_cw", "orbit_ccw"]
+          "enum": [
+            "toward",
+            "away",
+            "orbit_cw",
+            "orbit_ccw"
+          ]
         },
         "distance": {
           "type": "string",
-          "enum": ["close", "medium", "far"],
+          "enum": [
+            "close",
+            "medium",
+            "far"
+          ],
           "description": "Semantic distance band - engine maps to a block-count range, not an exact value."
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
         }
       },
-      "required": ["type", "reference", "direction", "distance"],
+      "required": [
+        "type",
+        "reference",
+        "direction",
+        "distance",
+        "speed"
+      ],
       "additionalProperties": false
     },
-
     "movement_hold": {
       "type": "object",
       "description": "MOVEMENT branch: stop moving and hold the current position.",
       "properties": {
-        "type": { "const": "movement.hold" }
+        "type": {
+          "type": "string",
+          "const": "movement.hold"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
     "memory_store_dark_location": {
       "type": "object",
       "description": "MEMORY branch: scan nearby and remember the darkest valid position for a later movement.retreat_to_dark(source=stored). Overwrites whatever was previously stored.",
       "properties": {
-        "type": { "const": "memory.store_dark_location" },
+        "type": {
+          "type": "string",
+          "const": "memory.store_dark_location"
+        },
         "search_radius": {
           "type": "string",
-          "enum": ["near", "far"],
+          "enum": [
+            "near",
+            "medium",
+            "far"
+          ],
           "description": "Semantic scan radius - engine maps to a block range."
         }
       },
-      "required": ["type", "search_radius"],
+      "required": [
+        "type",
+        "search_radius"
+      ],
       "additionalProperties": false
     },
-
+    "global_rule": {
+      "type": "object",
+      "description": "One always-checked condition/action pair - see 'global_rules' at the top level for the full explanation of when this runs and why it's different from control.if/control.while.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "global_rule"
+        },
+        "condition": {
+          "$ref": "#/$defs/predicate"
+        },
+        "action": {
+          "$ref": "#/$defs/action_step"
+        }
+      },
+      "required": [
+        "type",
+        "condition",
+        "action"
+      ],
+      "additionalProperties": false
+    },
     "posture_stare": {
       "type": "object",
-      "description": "POSTURE branch: toggle the glowing-eyes stare cue (existing setStaring hook).",
+      "description": "POSTURE branch: toggle the glowing-eyes stare cue (existing setStaring hook). IMPORTANT: this step does NOT wait for anything - it's instantaneous, and the very next step in the plan runs immediately, the same tick, regardless of whether the player has noticed yet. Setting enabled=true and then immediately following with a movement step (e.g. fleeing) means the wendigo flees the instant it appears, whether or not the player ever looked at it - almost certainly not what's intended. To actually hold a stare and react to whether the player notices, follow this with a control.while loop whose condition is a predicate.player_looking_at_self or predicate.player_distance check (see control.while's own description for a worked example) - the wait/hold time comes entirely from that loop, not from posture.stare itself.",
       "properties": {
-        "type": { "const": "posture.stare" },
-        "enabled": { "type": "boolean" }
+        "type": {
+          "type": "string",
+          "const": "posture.stare"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
       },
-      "required": ["type", "enabled"],
+      "required": [
+        "type",
+        "enabled"
+      ],
       "additionalProperties": false
     },
-
     "timing_wait": {
       "type": "object",
       "description": "TIMING branch: pause before the next step in the plan executes.",
       "properties": {
-        "type": { "const": "timing.wait" },
+        "type": {
+          "type": "string",
+          "const": "timing.wait"
+        },
         "duration": {
           "type": "string",
-          "enum": ["short", "medium", "long"],
+          "enum": [
+            "immediate",
+            "short",
+            "medium",
+            "long"
+          ],
           "description": "Engine maps this to a tick range (with light randomization) rather than an exact count, so identical plans don't feel mechanically identical."
         }
       },
-      "required": ["type", "duration"],
+      "required": [
+        "type",
+        "duration"
+      ],
       "additionalProperties": false
     },
-
     "sound_ambient_cue": {
       "type": "object",
-      "description": "SOUND branch - EXPERIMENTAL: no sound-effect system is wired up yet, this step is currently a server-side no-op. Included now so the schema doesn't need to change shape once sound is built.",
+      "description": "SOUND branch: plays a cue audible near the wendigo's current position. All three currently play the same underlying ambient cave sound - distinct sound design per cue is future work - but pick the one that matches the moment anyway, since that'll matter once it's built.",
       "properties": {
-        "type": { "const": "sound.ambient_cue" },
+        "type": {
+          "type": "string",
+          "const": "sound.ambient_cue"
+        },
         "cue": {
           "type": "string",
-          "enum": ["low_growl", "breath", "silence"]
+          "enum": [
+            "jumpscare",
+            "caught",
+            "ambience"
+          ],
+          "description": "jumpscare = a sudden, startling sting - use right before/during a lunge or other close-up reveal. caught = a reaction cue for when the wendigo has just been clearly spotted (predicate.player_looking_at_self at dead_stare). ambience = a low, unplaced presence cue - safe to use anytime, including from a distance."
         }
       },
-      "required": ["type", "cue"],
+      "required": [
+        "type",
+        "cue"
+      ],
       "additionalProperties": false
     },
-
+    "combat_lunge_attack": {
+      "type": "object",
+      "description": "COMBAT branch: a direct approach to melee range - one of the few movement primitives that's allowed to cross into light, since closing the distance is the point. Deals a real hit on contact. Don't run this blind - use predicate.player_distance (closer_than lunge_distance) in a control.if/control.while to decide when the player is close enough to commit, since once started it commits to closing the remaining distance. Follow up with movement.retreat_with_fallback to get back into hiding afterward.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "combat.lunge_attack"
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant. 'fast' is the classic dash-in; 'slow' or 'normal' reads as a more deliberate, menacing close-in instead."
+        }
+      },
+      "required": [
+        "type",
+        "speed"
+      ],
+      "additionalProperties": false
+    },
+    "combat_break_torch": {
+      "type": "object",
+      "description": "COMBAT branch: pathfind to the nearest known light source (torch, lantern, etc.) and destroy it, snuffing that light out - like combat.lunge_attack, this is allowed to cross into light since reaching the target is the point. Only useful if the prompt reports torches found near the player - if none are nearby this is a no-op and the plan continues, never fails outright. A good sequence: spawn near a torch, break_torch, then movement.retreat_with_fallback to withdraw before despawning.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "combat.break_torch"
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
+        }
+      },
+      "required": [
+        "type",
+        "speed"
+      ],
+      "additionalProperties": false
+    },
+    "combat_chase": {
+      "type": "object",
+      "description": "COMBAT branch: sustained, aggressive pursuit - reserved for high severity (the engine won't allow this below 60%). Unlike combat.lunge_attack (one commit-and-strike, then done), this keeps pursuing and can strike repeatedly if it stays in melee range, and passively destroys any torch within 10 blocks of wherever the wendigo currently is as it runs through - incidental collateral from the chase itself, not a targeted break_torch (no pathing to torches, no aiming for them specifically). Ends on its own once the player can't be reached for a sustained stretch, at which point the plan simply continues to whatever comes next (typically the automatic despawn phase if nothing else follows) - no explicit flee/despawn step is required right after this one, though adding movement.retreat_with_fallback afterward is fine too. A good use: pair with a global_rule (condition predicate.player_looking_at_self at whichever band, action combat.chase) so being spotted at high severity immediately and reliably escalates into a real chase, regardless of what the current plan step was doing.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "combat.chase"
+        },
+        "speed": {
+          "type": "string",
+          "enum": [
+            "slow",
+            "normal",
+            "fast"
+          ],
+          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant. 'fast' is the expected choice for a real chase."
+        }
+      },
+      "required": [
+        "type",
+        "speed"
+      ],
+      "additionalProperties": false
+    },
     "control_none": {
       "type": "object",
       "description": "CONTROL branch: explicit do-nothing step. Lets the model choose inaction deliberately instead of being forced to always act.",
       "properties": {
-        "type": { "const": "control.none" }
+        "type": {
+          "type": "string",
+          "const": "control.none"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
+    "control_despawn": {
+      "type": "object",
+      "description": "CONTROL branch: end the wave immediately by vanishing right where the wendigo currently stands - no travel to despawn_at, no despawn fallback chain, no walk-away transition. Ends the plan the instant this step runs, so put it last. Use this for a fleeting, passive presence: appear, do something small and unsettling from a distance, then simply not be there anymore - a much subtler beat than being watched fleeing into the dark. Not the same as movement.retreat_with_fallback (a real flight back into darkness, for when the wendigo needs to physically get away first) - if the wendigo isn't already somewhere fine to vanish from, retreat before using this.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "control.despawn"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false
+    },
     "control_if": {
       "type": "object",
       "description": "CONTROL branch: evaluate 'condition' once, at the point this step is reached in plan execution, and run 'then' if true, otherwise 'else' (if given). Example: if the player isn't looking, take a step closer; otherwise hold.",
       "properties": {
-        "type": { "const": "control.if" },
-        "condition": { "$ref": "#/$defs/predicate" },
+        "type": {
+          "type": "string",
+          "const": "control.if"
+        },
+        "condition": {
+          "$ref": "#/$defs/predicate"
+        },
         "then": {
           "type": "array",
-          "items": { "$ref": "#/$defs/action_step" },
+          "items": {
+            "$ref": "#/$defs/action_step"
+          },
           "minItems": 1,
           "maxItems": 3
         },
         "else": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/action_step" },
-          "minItems": 1,
-          "maxItems": 3
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/action_step"
+              },
+              "minItems": 1,
+              "maxItems": 3
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set this to null if there's nothing to do on the false branch - not every control.if needs an else."
         }
       },
-      "required": ["type", "condition", "then"],
+      "required": [
+        "type",
+        "condition",
+        "then",
+        "else"
+      ],
       "additionalProperties": false
     },
-
     "control_while": {
       "type": "object",
       "description": "CONTROL branch: repeat 'body' in a loop as long as 'condition' holds (re-checked between each iteration by the engine). Example: 'stalk the player while they are not looking at us' = while(not(predicate.player_looking_at_self)) { movement.approach }. 'max_iterations' is a mandatory safety cap - the engine still stops the loop after that many iterations even if the condition never flips, so a stuck predicate can't hang the entity forever without a new decision turn.",
       "properties": {
-        "type": { "const": "control.while" },
-        "condition": { "$ref": "#/$defs/predicate" },
+        "type": {
+          "type": "string",
+          "const": "control.while"
+        },
+        "condition": {
+          "$ref": "#/$defs/predicate"
+        },
         "body": {
           "type": "array",
-          "items": { "$ref": "#/$defs/action_step" },
+          "items": {
+            "$ref": "#/$defs/action_step"
+          },
           "minItems": 1,
           "maxItems": 3
         },
         "max_iterations": {
           "type": "string",
-          "enum": ["few", "some", "many"],
+          "enum": [
+            "few",
+            "some",
+            "many"
+          ],
           "description": "Semantic iteration cap - engine maps to a real bound (e.g. few=~3, some=~8, many=~20), not an exact count."
         }
       },
-      "required": ["type", "condition", "body", "max_iterations"],
+      "required": [
+        "type",
+        "condition",
+        "body",
+        "max_iterations"
+      ],
       "additionalProperties": false
     },
-
     "predicate": {
       "description": "A boolean fact the engine evaluates on demand - the model picks which fact to check, never computes the answer itself. Compound predicates (not/and/or) wrap only simple predicates, one level deep, to keep the condition tree shallow and reliable for a small model to produce.",
-      "oneOf": [
-        { "$ref": "#/$defs/predicate_simple" },
-        { "$ref": "#/$defs/predicate_not" },
-        { "$ref": "#/$defs/predicate_and" },
-        { "$ref": "#/$defs/predicate_or" }
+      "anyOf": [
+        {
+          "$ref": "#/$defs/predicate_simple"
+        },
+        {
+          "$ref": "#/$defs/predicate_not"
+        },
+        {
+          "$ref": "#/$defs/predicate_and"
+        },
+        {
+          "$ref": "#/$defs/predicate_or"
+        }
       ]
     },
-
     "predicate_simple": {
-      "oneOf": [
-        { "$ref": "#/$defs/predicate_player_looking_at_self" },
-        { "$ref": "#/$defs/predicate_self_in_darkness" },
-        { "$ref": "#/$defs/predicate_player_in_darkness" },
-        { "$ref": "#/$defs/predicate_player_near_light_edge" },
-        { "$ref": "#/$defs/predicate_dark_location_stored" },
-        { "$ref": "#/$defs/predicate_player_distance" },
-        { "$ref": "#/$defs/predicate_player_unreachable" }
+      "anyOf": [
+        {
+          "$ref": "#/$defs/predicate_player_looking_at_self"
+        },
+        {
+          "$ref": "#/$defs/predicate_player_undetected"
+        },
+        {
+          "$ref": "#/$defs/predicate_player_approaching"
+        },
+        {
+          "$ref": "#/$defs/predicate_self_in_darkness"
+        },
+        {
+          "$ref": "#/$defs/predicate_player_in_darkness"
+        },
+        {
+          "$ref": "#/$defs/predicate_player_near_light_edge"
+        },
+        {
+          "$ref": "#/$defs/predicate_dark_location_stored"
+        },
+        {
+          "$ref": "#/$defs/predicate_player_distance"
+        },
+        {
+          "$ref": "#/$defs/predicate_player_unreachable"
+        }
       ]
     },
-
     "predicate_player_looking_at_self": {
       "type": "object",
-      "description": "True if the player currently has line of sight to / is facing the wendigo (Enderman-style stare detection).",
+      "description": "True if the player currently has line of sight to / is facing the wendigo (Enderman-style stare detection), within the given angular band.",
       "properties": {
-        "type": { "const": "predicate.player_looking_at_self" }
+        "type": {
+          "type": "string",
+          "const": "predicate.player_looking_at_self"
+        },
+        "band": {
+          "type": "string",
+          "enum": [
+            "corner_of_eye",
+            "in_view",
+            "dead_stare"
+          ],
+          "description": "How directly the player has to be facing the wendigo to count, widest to narrowest: corner_of_eye (~60 degrees - about as wide as it can go before it's no longer plausibly visible in normal FOV at all), in_view (~30 degrees - actually looking toward it, not just able to see it peripherally), dead_stare (~10 degrees - looking almost dead at it). Pick corner_of_eye for 'notices something's off but hasn't focused on it yet', dead_stare for 'is definitely staring right at me'."
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type",
+        "band"
+      ],
       "additionalProperties": false
     },
-
+    "predicate_player_approaching": {
+      "type": "object",
+      "description": "True once the player has closed at least this much of the distance between them and the wendigo, measured relative to however far apart they were the moment the CURRENTLY-RUNNING control.while loop started (that distance is captured once, fresh, each time a control.while begins - capped at 18 blocks, so a loop that started very far away doesn't need an unrealistic amount of closing to trigger). low/medium/high are relative thresholds scaled to that starting distance (roughly 22%/44%/67% of it), not fixed block counts, so this behaves consistently whether the loop started 6 blocks away or 18. Prefer this over predicate.player_distance for a 'break once they've closed in meaningfully during this loop' condition: a fixed absolute distance can already be satisfied or violated by whatever step ran right before the loop started (e.g. the wendigo's own movement.approach_dim_spot closing distance on its way in), which this avoids since it only measures change from the moment the loop itself began. Only meaningful inside a control.while - used inside control.if or a global_rule (neither of which loop) it always reads as though nothing has been covered yet.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "predicate.player_approaching"
+        },
+        "band": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "description": "How much of the loop-start distance counts as 'closed in' - low is a small amount of ground covered, high is most of it."
+        }
+      },
+      "required": [
+        "type",
+        "band"
+      ],
+      "additionalProperties": false
+    },
+    "predicate_player_undetected": {
+      "type": "object",
+      "description": "True as long as the wendigo is still safely unnoticed: the player is NOT looking at it within the given band, AND the player has NOT closed in by approach_band's amount since the current control.while loop started (see predicate.player_approaching for exactly what that measures - the negation is baked in here so composing it yourself isn't necessary). This is the single check for a 'stay hidden and keep creeping closer' loop (control.while(predicate.player_undetected(...)) { movement.approach_dim_spot } then control.despawn/combat.lunge_attack once the loop ends) - prefer this over hand-building predicate.and(predicate.not(predicate.player_looking_at_self), predicate.not(predicate.player_approaching)) for that exact idiom, since manually composing a double negation is easy to get backwards (predicate.and(player_looking_at_self, player_approaching) looks similar but means the opposite: 'only keep going once already spotted and already closing in', which is false the instant the wendigo spawns unseen, so the loop runs zero times and immediately falls through to whatever comes next).",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "predicate.player_undetected"
+        },
+        "band": {
+          "type": "string",
+          "enum": [
+            "corner_of_eye",
+            "in_view",
+            "dead_stare"
+          ],
+          "description": "The player must NOT be looking at the wendigo within this angular band for it to still count as undetected - same bands as predicate.player_looking_at_self."
+        },
+        "approach_band": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "description": "The player must NOT have closed in by this much since the current control.while loop started for it to still count as undetected - same relative bands as predicate.player_approaching (low = a small amount of ground closed already breaks it, high = tolerates them closing in quite a lot before it breaks)."
+        }
+      },
+      "required": [
+        "type",
+        "band",
+        "approach_band"
+      ],
+      "additionalProperties": false
+    },
     "predicate_self_in_darkness": {
       "type": "object",
       "description": "True if the wendigo's current position is dark enough to be considered hidden.",
       "properties": {
-        "type": { "const": "predicate.self_in_darkness" }
+        "type": {
+          "type": "string",
+          "const": "predicate.self_in_darkness"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
     "predicate_player_in_darkness": {
       "type": "object",
       "description": "True if the player's current position is dark enough to be considered hidden.",
       "properties": {
-        "type": { "const": "predicate.player_in_darkness" }
+        "type": {
+          "type": "string",
+          "const": "predicate.player_in_darkness"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
     "predicate_player_near_light_edge": {
       "type": "object",
       "description": "True if the player is near the boundary between a lit and dark area (e.g. at the edge of a torch's light radius) - useful for deciding whether to wait for them to cross into darkness rather than approaching now.",
       "properties": {
-        "type": { "const": "predicate.player_near_light_edge" }
+        "type": {
+          "type": "string",
+          "const": "predicate.player_near_light_edge"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
     "predicate_dark_location_stored": {
       "type": "object",
       "description": "True if a memory.store_dark_location step has stored a spot that's still considered valid (not yet consumed/invalidated).",
       "properties": {
-        "type": { "const": "predicate.dark_location_stored" }
+        "type": {
+          "type": "string",
+          "const": "predicate.dark_location_stored"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
     "predicate_player_distance": {
       "type": "object",
       "description": "Compares the player's current distance against a semantic band.",
       "properties": {
-        "type": { "const": "predicate.player_distance" },
-        "comparator": { "type": "string", "enum": ["closer_than", "farther_than"] },
+        "type": {
+          "type": "string",
+          "const": "predicate.player_distance"
+        },
+        "comparator": {
+          "type": "string",
+          "enum": [
+            "closer_than",
+            "farther_than"
+          ]
+        },
         "distance": {
           "type": "string",
-          "enum": ["close", "medium", "far"],
-          "description": "Same semantic bands as elsewhere in the schema - engine maps to a block-count range."
+          "enum": [
+            "grab_distance",
+            "lunge_distance",
+            "close_quarters",
+            "medium",
+            "far"
+          ],
+          "description": "Shared proximity ladder, nearest to furthest: grab_distance (~0-4 blocks, melee/strike range), lunge_distance (~5-9, the range to commit to combat.lunge_attack from), close_quarters (~10-14), medium (~15-24), far (~25+). These are the same bands used to label each scanned spot's distance in the prompt, so you can tell before committing to spawn_at whether a spot is already inside combat/flee range of the player - e.g. control.while(farther_than lunge_distance) to wait before lunging, or closer_than close_quarters to decide it's time to retreat."
         }
       },
-      "required": ["type", "comparator", "distance"],
+      "required": [
+        "type",
+        "comparator",
+        "distance"
+      ],
       "additionalProperties": false
     },
-
     "predicate_player_unreachable": {
       "type": "object",
       "description": "True if the wendigo's most recent movement action couldn't find or maintain a path to its target (e.g. the player is behind a sealed wall, or across a gap it can't cross). Useful for giving up and retreating instead of holding forever.",
       "properties": {
-        "type": { "const": "predicate.player_unreachable" }
+        "type": {
+          "type": "string",
+          "const": "predicate.player_unreachable"
+        }
       },
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false
     },
-
     "predicate_not": {
       "type": "object",
       "description": "Negates a simple predicate.",
       "properties": {
-        "type": { "const": "predicate.not" },
-        "operand": { "$ref": "#/$defs/predicate_simple" }
+        "type": {
+          "type": "string",
+          "const": "predicate.not"
+        },
+        "operand": {
+          "$ref": "#/$defs/predicate_simple"
+        }
       },
-      "required": ["type", "operand"],
+      "required": [
+        "type",
+        "operand"
+      ],
       "additionalProperties": false
     },
-
     "predicate_and": {
       "type": "object",
       "description": "True only if both operand predicates are true.",
       "properties": {
-        "type": { "const": "predicate.and" },
+        "type": {
+          "type": "string",
+          "const": "predicate.and"
+        },
         "operands": {
           "type": "array",
-          "items": { "$ref": "#/$defs/predicate_simple" },
+          "items": {
+            "$ref": "#/$defs/predicate_simple"
+          },
           "minItems": 2,
           "maxItems": 2
         }
       },
-      "required": ["type", "operands"],
+      "required": [
+        "type",
+        "operands"
+      ],
       "additionalProperties": false
     },
-
     "predicate_or": {
       "type": "object",
       "description": "True if either operand predicate is true.",
       "properties": {
-        "type": { "const": "predicate.or" },
+        "type": {
+          "type": "string",
+          "const": "predicate.or"
+        },
         "operands": {
           "type": "array",
-          "items": { "$ref": "#/$defs/predicate_simple" },
+          "items": {
+            "$ref": "#/$defs/predicate_simple"
+          },
           "minItems": 2,
           "maxItems": 2
         }
       },
-      "required": ["type", "operands"],
+      "required": [
+        "type",
+        "operands"
+      ],
       "additionalProperties": false
     }
   }

@@ -1,8 +1,10 @@
 package com.wendigo.llm;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Iterator;
 import java.util.Map;
@@ -13,6 +15,7 @@ import java.util.concurrent.Executors;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -27,17 +30,26 @@ import com.anthropic.models.messages.OutputConfig;
 import com.anthropic.models.messages.StopReason;
 
 /**
- * Async wrapper around the Claude API, used to request one wendigo decision plan per call.
- * The SDK's messages().create(...) is blocking, so every call runs on its own executor, off the
- * server tick thread - callers must hop back via MinecraftServer.execute(...) before touching
- * entity/world state with the result.
+ * Async wrapper around one wendigo decision request, backed by either the Claude API (official
+ * SDK) or GPT-4o (raw REST call over java.net.http - no SDK dependency added) depending on
+ * LlmConfig.provider. Only the selected provider's client is ever constructed, so the other
+ * provider's API key doesn't need to be set. Both paths are blocking under the hood, so every call
+ * runs off the server tick thread - callers must hop back via MinecraftServer.execute(...) before
+ * touching entity/world state with the result.
+ *
+ * The schema is supplied per-request (see requestPlan), not loaded/fixed once at construction -
+ * see com.wendigo.plan.SchemaBuilder, which filters the base action_schema.json down to whatever's
+ * actually unlocked at the caller's current severity, rather than this class always sending the
+ * full static schema regardless of tier.
  */
 public class LlmClient {
+	private static final String OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+
 	private final LlmConfig config;
-	private final AnthropicClient client;
-	private final JsonOutputFormat.Schema actionSchema;
 	private final Gson gson = new Gson();
 
+	// Anthropic path - null when provider = "openai".
+	private final AnthropicClient anthropicClient;
 	// Blocking SDK calls each need their own thread; there's only ever a handful of decision
 	// requests in flight at once (one per active wendigo), so an unbounded cached pool is fine.
 	private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
@@ -46,30 +58,38 @@ public class LlmClient {
 		return t;
 	});
 
+	// OpenAI path - null when provider = "anthropic". HttpClient.sendAsync is natively async, so
+	// this path doesn't need the executor above at all.
+	private final HttpClient openAiHttpClient;
+
 	public LlmClient(LlmConfig config) {
 		this.config = config;
-		this.client = AnthropicOkHttpClient.builder()
-			.fromEnv()
-			.timeout(Duration.ofSeconds(config.requestTimeoutSeconds))
-			.build();
-		this.actionSchema = loadSchema();
+
+		if (isOpenAi()) {
+			this.anthropicClient = null;
+			this.openAiHttpClient = HttpClient.newBuilder()
+				.connectTimeout(Duration.ofSeconds(config.requestTimeoutSeconds))
+				.build();
+		} else {
+			this.anthropicClient = AnthropicOkHttpClient.builder()
+				.fromEnv()
+				.timeout(Duration.ofSeconds(config.requestTimeoutSeconds))
+				.build();
+			this.openAiHttpClient = null;
+		}
 	}
 
-	private static JsonOutputFormat.Schema loadSchema() {
-		String schemaJson;
-		try (InputStream in = LlmClient.class.getResourceAsStream("/llm/action_schema.json")) {
-			if (in == null) {
-				throw new IllegalStateException("Missing bundled resource /llm/action_schema.json");
-			}
-			schemaJson = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-		} catch (IOException e) {
-			throw new RuntimeException("Failed to load action schema resource", e);
-		}
+	private boolean isOpenAi() {
+		return "openai".equalsIgnoreCase(this.config.provider);
+	}
 
-		// JsonOutputFormat.Schema has no typed fields of its own - it's a freeform bag of
-		// additionalProperties, so the whole schema is rebuilt one top-level key at a time.
+	// JsonOutputFormat.Schema has no typed fields of its own - it's a freeform bag of
+	// additionalProperties, so the whole schema is rebuilt one top-level key at a time. Bridges
+	// Gson's JsonObject to Jackson's JsonNode via its serialized text - the two libraries have no
+	// direct interop, and this only runs once per request, not per tick.
+	private static JsonOutputFormat.Schema buildAnthropicSchema(JsonObject schema) {
 		try {
-			JsonNode root = new ObjectMapper().readTree(schemaJson);
+			JsonNode root = new ObjectMapper().readTree(schema.toString());
 			JsonOutputFormat.Schema.Builder builder = JsonOutputFormat.Schema.builder();
 			Iterator<Map.Entry<String, JsonNode>> fields = root.fields();
 			while (fields.hasNext()) {
@@ -78,31 +98,44 @@ public class LlmClient {
 			}
 			return builder.build();
 		} catch (IOException e) {
-			throw new RuntimeException("Failed to parse action schema resource as JSON", e);
+			throw new RuntimeException("Failed to convert filtered schema for the Anthropic client", e);
 		}
 	}
 
+	// OpenAI's strict structured-output mode wants the schema object itself, not a JSON Schema
+	// dialect declaration - $schema is metadata about the schema, not a constraint, so it's
+	// stripped rather than passed through untouched.
+	private static JsonObject buildOpenAiSchema(JsonObject schema) {
+		JsonObject copy = schema.deepCopy();
+		copy.remove("$schema");
+		return copy;
+	}
+
 	/**
-	 * Asks the model for one decision turn, constrained to the action_schema.json shape.
-	 * Completes with the parsed action-plan JSON, or completes exceptionally on a refusal or
-	 * malformed output.
+	 * Asks the model for one decision turn, constrained to the given schema shape (see
+	 * com.wendigo.plan.SchemaBuilder). Completes with the parsed action-plan JSON, or completes
+	 * exceptionally on a refusal or malformed output.
 	 */
-	public CompletableFuture<JsonObject> requestPlan(String systemPrompt, String userPrompt) {
-		JsonOutputFormat format = JsonOutputFormat.builder().schema(actionSchema).build();
+	public CompletableFuture<JsonObject> requestPlan(String systemPrompt, String userPrompt, JsonObject schema) {
+		return isOpenAi() ? requestPlanOpenAi(systemPrompt, userPrompt, schema) : requestPlanAnthropic(systemPrompt, userPrompt, schema);
+	}
+
+	private CompletableFuture<JsonObject> requestPlanAnthropic(String systemPrompt, String userPrompt, JsonObject schema) {
+		JsonOutputFormat format = JsonOutputFormat.builder().schema(buildAnthropicSchema(schema)).build();
 		OutputConfig outputConfig = OutputConfig.builder().format(format).build();
 
 		MessageCreateParams params = MessageCreateParams.builder()
-			.model(config.model)
-			.maxTokens(config.maxTokens)
+			.model(this.config.model)
+			.maxTokens(this.config.maxTokens)
 			.system(systemPrompt)
 			.addUserMessage(userPrompt)
 			.outputConfig(outputConfig)
 			.build();
 
-		return CompletableFuture.supplyAsync(() -> parsePlan(client.messages().create(params)), executor);
+		return CompletableFuture.supplyAsync(() -> parseAnthropicPlan(this.anthropicClient.messages().create(params)), this.executor);
 	}
 
-	private JsonObject parsePlan(Message response) {
+	private JsonObject parseAnthropicPlan(Message response) {
 		if (response.stopReason().isPresent() && response.stopReason().get().equals(StopReason.REFUSAL)) {
 			throw new RuntimeException("Claude declined the request (refusal)");
 		}
@@ -113,5 +146,67 @@ public class LlmClient {
 			}
 		}
 		throw new RuntimeException("No text content block in Claude's response");
+	}
+
+	private CompletableFuture<JsonObject> requestPlanOpenAi(String systemPrompt, String userPrompt, JsonObject schema) {
+		String apiKey = System.getenv("OPENAI_API_KEY");
+		if (apiKey == null || apiKey.isBlank()) {
+			return CompletableFuture.failedFuture(new IllegalStateException("OPENAI_API_KEY is not set"));
+		}
+
+		JsonObject body = new JsonObject();
+		body.addProperty("model", this.config.openaiModel);
+		body.addProperty("max_completion_tokens", this.config.maxTokens);
+
+		JsonArray messages = new JsonArray();
+		messages.add(chatMessage("system", systemPrompt));
+		messages.add(chatMessage("user", userPrompt));
+		body.add("messages", messages);
+
+		JsonObject jsonSchema = new JsonObject();
+		jsonSchema.addProperty("name", "wendigo_action_plan");
+		jsonSchema.addProperty("strict", true);
+		jsonSchema.add("schema", buildOpenAiSchema(schema));
+		JsonObject responseFormat = new JsonObject();
+		responseFormat.addProperty("type", "json_schema");
+		responseFormat.add("json_schema", jsonSchema);
+		body.add("response_format", responseFormat);
+
+		HttpRequest request = HttpRequest.newBuilder()
+			.uri(URI.create(OPENAI_CHAT_COMPLETIONS_URL))
+			.timeout(Duration.ofSeconds(this.config.requestTimeoutSeconds))
+			.header("Authorization", "Bearer " + apiKey)
+			.header("Content-Type", "application/json")
+			.POST(HttpRequest.BodyPublishers.ofString(this.gson.toJson(body)))
+			.build();
+
+		return this.openAiHttpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+			.thenApply(this::parseOpenAiPlan);
+	}
+
+	private static JsonObject chatMessage(String role, String content) {
+		JsonObject message = new JsonObject();
+		message.addProperty("role", role);
+		message.addProperty("content", content);
+		return message;
+	}
+
+	private JsonObject parseOpenAiPlan(HttpResponse<String> response) {
+		JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+		if (response.statusCode() != 200) {
+			String message = body.has("error") && body.getAsJsonObject("error").has("message")
+				? body.getAsJsonObject("error").get("message").getAsString()
+				: response.body();
+			throw new RuntimeException("OpenAI request failed (" + response.statusCode() + "): " + message);
+		}
+
+		JsonObject message = body.getAsJsonArray("choices").get(0).getAsJsonObject().getAsJsonObject("message");
+		if (message.has("refusal") && !message.get("refusal").isJsonNull()) {
+			throw new RuntimeException("GPT-4o declined the request (refusal): " + message.get("refusal").getAsString());
+		}
+		if (!message.has("content") || message.get("content").isJsonNull()) {
+			throw new RuntimeException("No content in OpenAI's response");
+		}
+		return JsonParser.parseString(message.get("content").getAsString()).getAsJsonObject();
 	}
 }

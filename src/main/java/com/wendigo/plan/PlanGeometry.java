@@ -14,9 +14,14 @@ final class PlanGeometry {
 	private PlanGeometry() {
 	}
 
-	/** Darkest standable spot within radius of self - delegates to the shared DarkSpotScanner. */
+	/** Darkest standable spot within radius of self, biased away from the nearest player if there is
+	 * one - see DarkSpotScanner.findDarkestAwayFrom. Every caller of this (movement.retreat_to_dark,
+	 * memory.store_dark_location) is picking a place to flee to, not just anywhere dark, so heading
+	 * toward/past the player it's meant to be getting away from defeats the point. */
 	static BlockPos findDarkSpot(WendigoEntity self, double radius) {
-		return DarkSpotScanner.findDarkest(self.level(), self.blockPosition(), radius);
+		Player player = Targeting.nearestPlayer(self);
+		BlockPos avoid = player != null ? player.blockPosition() : null;
+		return DarkSpotScanner.findDarkestAwayFrom(self.level(), self.blockPosition(), radius, avoid);
 	}
 
 	/** Target position for movement.reposition, relative to the requested reference point. */

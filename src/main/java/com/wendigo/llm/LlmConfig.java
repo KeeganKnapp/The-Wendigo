@@ -11,13 +11,19 @@ import com.google.gson.GsonBuilder;
 import net.fabricmc.loader.api.FabricLoader;
 
 /**
- * Tunables for the wendigo's Claude API calls, stored as config/wendigo-llm.json so a server
- * admin can change model/limits without recompiling. The API key itself is intentionally NOT a
- * field here - it's read from the environment (ANTHROPIC_API_KEY, or an `ant auth login`
- * profile) by LlmClient, so it never ends up committed alongside this file.
+ * Tunables for the wendigo's LLM calls, stored as config/wendigo-llm.json so a server admin can
+ * change provider/model/limits without recompiling. API keys themselves are intentionally NOT
+ * fields here - read from the environment by LlmClient (ANTHROPIC_API_KEY for provider=anthropic,
+ * or an `ant auth login` profile; OPENAI_API_KEY for provider=openai), so neither ends up
+ * committed alongside this file.
  */
 public class LlmConfig {
-	public String model = "claude-haiku-4-5";
+	// "anthropic" or "openai" - selects which of the two below (model/openaiModel) and which env
+	// var (ANTHROPIC_API_KEY/OPENAI_API_KEY) LlmClient actually uses; the other provider's client
+	// is never constructed, so its key doesn't need to be set at all.
+	public String provider = "openai";
+	public String model = "claude-haiku-4-5"; // used when provider = "anthropic"
+	public String openaiModel = "gpt-4o"; // used when provider = "openai"
 	public long maxTokens = 512;
 	public int requestTimeoutSeconds = 30;
 

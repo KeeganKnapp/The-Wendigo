@@ -68,6 +68,16 @@ tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25
 }
 
+// --debug-jvm's default JDWP bind (address=5005, no host) only trusts loopback
+// peers. Through the sandbox container's port-forwarding, connections from the
+// host don't look like they came from the container's own loopback, so the JVM
+// resets them. Binding on all interfaces avoids that without opening a host port.
+tasks.named('runClient') {
+	debugOptions {
+		host = '*'
+	}
+}
+
 java {
 	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
 	// if it is present.

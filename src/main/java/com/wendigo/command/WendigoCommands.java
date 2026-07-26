@@ -7,8 +7,10 @@ import java.nio.file.Path;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
 
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.loader.api.FabricLoader;
@@ -21,7 +23,10 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.AABB;
 
 import com.wendigo.WendigoMod;
+import com.wendigo.debug.WendigoDebug;
 import com.wendigo.entity.WendigoEntity;
+import com.wendigo.plan.SchemaBuilder;
+import com.wendigo.spatial.CaveScaleScanner;
 
 /**
  * Debug-only commands for exercising the LLM/plan-execution subsystem: {@code llmtest} proves
@@ -31,7 +36,11 @@ import com.wendigo.entity.WendigoEntity;
  * included) targeting a given player immediately, and {@code wavetest} does the same but reads a
  * hand-authored plan from a JSON file instead of calling the LLM - free, repeatable iteration on
  * spawn/despawn behavior. All bypass the normal cooldown/severity gating, since waiting on real
- * y<0 dwell time isn't practical to test with.
+ * y&lt;0 dwell time isn't practical to test with. {@code debug} toggles the sender's own debug
+ * session (see com.wendigo.debug.WendigoDebug) - chat commentary plus scanned-spot/dim-spot/live-
+ * path particles for whatever wave is currently active. {@code aggression get/set} reads or
+ * directly overrides a player's dweller severity, for jumping straight to a given tier instead of
+ * grinding real time below y=0.
  */
 public final class WendigoCommands {
 	private static final String DEFAULT_SCENARIO =
@@ -39,16 +48,26 @@ public final class WendigoCommands {
 
 	private static final String DEFAULT_TEST_PLAN_FILE = "test-plan.json";
 	private static final String DEFAULT_TEST_PLAN_CONTENT = """
-		{
-		  "spawn_at": "spot_a",
-		  "plan": [
-		    { "type": "posture.stare", "enabled": true },
-		    { "type": "timing.wait", "duration": "short" },
-		    { "type": "movement.approach", "speed": "slow" }
-		  ],
-		  "despawn_at": "spot_d"
-		}
-		""";
+	{
+	"spawn_at": "spot_a",
+	"plan": [
+	{ "type": "movement.approach_dim_spot", "speed": "slow" },
+	{ "type": "posture.stare", "enabled": true },
+	{
+	"type": "control.while",
+	"condition": { "type": "predicate.player_distance", "comparator": "farther_than", "distance": "lunge_distance" },
+	"body": [
+	{ "type": "timing.wait", "duration": "short" }
+	],
+	"max_iterations": "many"
+	},
+	{ "type": "posture.stare", "enabled": false },
+	{ "type": "combat.lunge_attack", "speed": "fast" },
+	{ "type": "movement.retreat_with_fallback", "speed": "fast" }
+	],
+	"despawn_at": "spot_d"
+	}
+	""";
 
 	private WendigoCommands() {
 	}
@@ -78,7 +97,60 @@ public final class WendigoCommands {
 					.executes(ctx -> forceWaveTest(ctx.getSource(), EntityArgument.getPlayer(ctx, "target"), DEFAULT_TEST_PLAN_FILE))
 					.then(Commands.argument("file", StringArgumentType.string())
 						.executes(ctx -> forceWaveTest(ctx.getSource(), EntityArgument.getPlayer(ctx, "target"),
-							StringArgumentType.getString(ctx, "file"))))));
+							StringArgumentType.getString(ctx, "file"))))))
+			.then(Commands.literal("debug")
+				.executes(ctx -> toggleDebug(ctx.getSource())))
+			.then(Commands.literal("aggression")
+				.then(Commands.literal("get")
+					.executes(ctx -> getAggression(ctx.getSource(), ctx.getSource().getPlayerOrException()))
+					.then(Commands.argument("target", EntityArgument.player())
+						.executes(ctx -> getAggression(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))))
+				.then(Commands.literal("set")
+					.then(Commands.argument("target", EntityArgument.player())
+						.then(Commands.argument("value", IntegerArgumentType.integer(0))
+							.executes(ctx -> setAggression(ctx.getSource(), EntityArgument.getPlayer(ctx, "target"),
+								IntegerArgumentType.getInteger(ctx, "value")))))));
+	}
+
+	/**
+	 * Toggles the sender's own debug session: chat commentary of what the wendigo is doing/hits
+	 * trouble with (see PlanRunner#debugSay), plus particles for the active wave's scanned dark
+	 * spots (colored per spot_a..d), their dim spots (same color, darker), and the wendigo's live
+	 * path (white) - see com.wendigo.debug.WendigoDebug.
+	 */
+	private static int toggleDebug(CommandSourceStack source) throws CommandSyntaxException {
+		ServerPlayer player = source.getPlayerOrException();
+		boolean nowEnabled = WendigoDebug.toggle(player);
+		source.sendSystemMessage(Component.literal("[wendigo] Debug mode " + (nowEnabled ? "enabled" : "disabled") + "."));
+		return 1;
+	}
+
+	/** Reports a player's current dweller severity ("aggression") - the same number/cap the LLM sees each request. */
+	private static int getAggression(CommandSourceStack source, ServerPlayer target) {
+		if (WendigoMod.severityTracker == null) {
+			source.sendFailure(Component.literal("Severity tracker isn't initialized."));
+			return 0;
+		}
+		int severity = WendigoMod.severityTracker.severityOf(target);
+		int cap = WendigoMod.severityTracker.severityCap();
+		int percent = cap > 0 ? 100 * severity / cap : 0;
+		source.sendSystemMessage(Component.literal("[wendigo] " + target.getGameProfile().name() + " aggression: "
+			+ severity + "/" + cap + " (" + percent + "%)"));
+		return severity;
+	}
+
+	/** Directly sets a player's dweller severity ("aggression") - jump straight to a tier for testing
+	 * instead of grinding real time below y=0. Clamped to [0, cap] by PlayerSeverityTracker. */
+	private static int setAggression(CommandSourceStack source, ServerPlayer target, int value) {
+		if (WendigoMod.severityTracker == null) {
+			source.sendFailure(Component.literal("Severity tracker isn't initialized."));
+			return 0;
+		}
+		WendigoMod.severityTracker.setSeverity(target, value);
+		int actual = WendigoMod.severityTracker.severityOf(target);
+		source.sendSystemMessage(Component.literal("[wendigo] Set " + target.getGameProfile().name() + " aggression to "
+			+ actual + "/" + WendigoMod.severityTracker.severityCap()));
+		return actual;
 	}
 
 	/** Forces WendigoManager to start a wave targeting the given player right now, bypassing cooldown/severity checks. */
@@ -158,7 +230,9 @@ public final class WendigoCommands {
 			+ "Given the scenario, choose a short plan (1-6 steps) using only the provided action schema.";
 
 		var server = source.getServer();
-		WendigoMod.llmClient.requestPlan(systemPrompt, scenario)
+		// Raw connectivity test, not tied to any player/severity - full unfiltered schema (TIGHT
+		// unlocks on_torch too, maximizing schema coverage for this test).
+		WendigoMod.llmClient.requestPlan(systemPrompt, scenario, SchemaBuilder.forSeverity(100, CaveScaleScanner.CaveScale.TIGHT))
 			.whenComplete((plan, error) -> server.execute(() -> {
 				if (error != null) {
 					source.sendFailure(Component.literal("[wendigo] LLM request failed: " + error.getMessage()));
