@@ -40,7 +40,8 @@ import com.wendigo.spatial.CaveScaleScanner;
  * session (see com.wendigo.debug.WendigoDebug) - chat commentary plus scanned-spot/dim-spot/live-
  * path particles for whatever wave is currently active. {@code aggression get/set} reads or
  * directly overrides a player's dweller severity, for jumping straight to a given tier instead of
- * grinding real time below y=0.
+ * grinding real time below y=0. {@code reset} discards the current wave and its cooldown so a fresh
+ * {@code wave}/{@code wavetest} can fire right away instead of waiting for the current one to finish.
  */
 public final class WendigoCommands {
 	private static final String DEFAULT_SCENARIO =
@@ -64,8 +65,7 @@ public final class WendigoCommands {
 	{ "type": "posture.stare", "enabled": false },
 	{ "type": "combat.lunge_attack", "speed": "fast" },
 	{ "type": "movement.retreat_with_fallback", "speed": "fast" }
-	],
-	"despawn_at": "spot_d"
+	]
 	}
 	""";
 
@@ -100,6 +100,8 @@ public final class WendigoCommands {
 							StringArgumentType.getString(ctx, "file"))))))
 			.then(Commands.literal("debug")
 				.executes(ctx -> toggleDebug(ctx.getSource())))
+			.then(Commands.literal("reset")
+				.executes(ctx -> resetForTesting(ctx.getSource())))
 			.then(Commands.literal("aggression")
 				.then(Commands.literal("get")
 					.executes(ctx -> getAggression(ctx.getSource(), ctx.getSource().getPlayerOrException()))
@@ -151,6 +153,19 @@ public final class WendigoCommands {
 		source.sendSystemMessage(Component.literal("[wendigo] Set " + target.getGameProfile().name() + " aggression to "
 			+ actual + "/" + WendigoMod.severityTracker.severityCap()));
 		return actual;
+	}
+
+	/** Discards the current level's active/pending wave (if any) and zeroes its cooldown, so a fresh
+	 * /wendigo wave can fire immediately instead of waiting for the current encounter to finish
+	 * naturally or for the post-wave cooldown to lapse afterward. */
+	private static int resetForTesting(CommandSourceStack source) {
+		if (WendigoMod.wendigoManager == null) {
+			source.sendFailure(Component.literal("Wendigo manager isn't initialized."));
+			return 0;
+		}
+		WendigoMod.wendigoManager.resetForTesting(source.getLevel());
+		source.sendSystemMessage(Component.literal("[wendigo] Reset - a new /wendigo wave can fire immediately."));
+		return 1;
 	}
 
 	/** Forces WendigoManager to start a wave targeting the given player right now, bypassing cooldown/severity checks. */
@@ -231,8 +246,9 @@ public final class WendigoCommands {
 
 		var server = source.getServer();
 		// Raw connectivity test, not tied to any player/severity - full unfiltered schema (TIGHT
-		// unlocks on_torch too, maximizing schema coverage for this test).
-		WendigoMod.llmClient.requestPlan(systemPrompt, scenario, SchemaBuilder.forSeverity(100, CaveScaleScanner.CaveScale.TIGHT))
+		// unlocks spot_a too, torchSpawnAvailable=true unlocks spawn_on_torch too, maximizing schema
+		// coverage for this test).
+		WendigoMod.llmClient.requestPlan(systemPrompt, scenario, SchemaBuilder.forSeverity(100, CaveScaleScanner.CaveScale.TIGHT, true))
 			.whenComplete((plan, error) -> server.execute(() -> {
 				if (error != null) {
 					source.sendFailure(Component.literal("[wendigo] LLM request failed: " + error.getMessage()));

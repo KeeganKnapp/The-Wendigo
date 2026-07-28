@@ -7,6 +7,8 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.PathNavigationRegion;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.pathfinder.Node;
+import net.minecraft.world.level.pathfinder.PathType;
+import net.minecraft.world.level.pathfinder.PathfindingContext;
 import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
 
 /**
@@ -59,14 +61,52 @@ public class DarknessNodeEvaluator extends WalkNodeEvaluator {
 	// getting stuck is a mobility problem, not a light-exposure tradeoff, so it applies regardless.
 	private boolean lightTolerant;
 
+	// Below this severity, a route through anything brighter than EDGE_LIGHT (5, the same "spawn
+	// limit" DarkSpotScanner.MAX_DARK_LIGHT uses) doesn't exist as far as pathfinding is concerned at
+	// all - not just expensive, genuinely excluded from the node graph (see getNeighbors) - so an
+	// early-stage wendigo with no all-dark route available fails to path rather than walking through
+	// open light, and falls back to whatever "couldn't get there" already does elsewhere (try the
+	// next despawn candidate, eventually just vanish). At/above this, it's allowed through again,
+	// still steeply malused (see lightMalus) but no longer a hard wall. Doesn't apply while
+	// lightTolerant is set - those two primitives cross into light on purpose regardless of stage.
+	private static final int HARD_BLOCK_MAX_PERCENT = 40;
+	// Set by WendigoEntity right after severityPercent is known for the current wave (see
+	// PlanRunner.start) - defaults to 100 (no hard block) so pathfinding never misbehaves before a
+	// wave has actually told it what stage this is, e.g. any incidental navigation between
+	// construction and the first startWave call.
+	private int severityPercent = 100;
+	// Light level at the mob's own position when this search began (see prepare) - real bug found via
+	// logs/reports: the hard block above was excluding EVERY neighbor whenever the mob's actual
+	// current spot was itself already lit (e.g. standing right next to a torch it just broke), since
+	// nothing directly reachable from a lit position necessarily reads as "dark enough" either -
+	// leaving getNeighbors returning zero candidates, moveTo silently failing to find any path at
+	// all, and the action never resolving on its own ("stands there doing nothing"). The hard block
+	// is about refusing to leave safety, not about refusing to ever move again once already exposed -
+	// skip it entirely for a search that starts already brighter than EDGE_LIGHT, falling back to the
+	// normal finite malus so it can still find its way back to real darkness.
+	private int startLight;
+
 	public void setLightTolerant(boolean lightTolerant) {
 		this.lightTolerant = lightTolerant;
+	}
+
+	public void setSeverityPercent(int severityPercent) {
+		this.severityPercent = severityPercent;
 	}
 
 	@Override
 	public void prepare(PathNavigationRegion region, Mob mob) {
 		super.prepare(region, mob);
 		this.nodeMalusApplied.clear();
+		// super.prepare() derives entityHeight from the mob's CURRENT bounding box - full standing
+		// height (STANDING_DIMENSIONS) while standing, 1 while already crawling (WendigoEntity's own
+		// pose, driven by whether its current position actually has standing room - see updatePose).
+		// A search only treats 1-block gaps as valid while the mob is ALREADY in crawl pose when it
+		// begins - true right after spawning inside a crevice (see WendigoEntity.syncPoseToSpawnPosition,
+		// which sets pose before this is ever called), so "spawn in a crevice, path back out of it"
+		// works; a search starting from a normal standing position requires full standing-height
+		// clearance throughout.
+		this.startLight = mob.level().getMaxLocalRawBrightness(mob.blockPosition());
 	}
 
 	@Override
@@ -75,30 +115,62 @@ public class DarknessNodeEvaluator extends WalkNodeEvaluator {
 		super.done();
 	}
 
+	/**
+	 * Vanilla's own WalkNodeEvaluator.getPathTypeOfMob downgrades a rail tile from PathType.RAIL
+	 * (malus 0.0F, perfectly normal - verified via bytecode) to PathType.UNPASSABLE_RAIL (malus
+	 * -1.0F, effectively BLOCKED) unless the searching mob's OWN current position is also a rail
+	 * tile - a heuristic that happens to work out for a live entity already walking along a track
+	 * (its own position often satisfies that check once it's actually engaged with the rails), but
+	 * produces a false "blocked" verdict for anything searching from a position that simply isn't
+	 * itself sitting on a rail - including the live entity itself, any time it starts a fresh search
+	 * from off the tracks. Real bug found via user testing: surrounding a player with rails in an
+	 * otherwise perfectly ordinary 2-tall room
+	 * made every candidate spot read as unreachable; removing a single rail immediately fixed it,
+	 * and the live (already-moving) wendigo never had any trouble crossing the same rails. Rails
+	 * have no special meaning to this mob at all - undo the downgrade unconditionally.
+	 */
+	@Override
+	public PathType getPathTypeOfMob(PathfindingContext context, int x, int y, int z, Mob mob) {
+		PathType type = super.getPathTypeOfMob(context, x, y, z, mob);
+		return type == PathType.UNPASSABLE_RAIL ? PathType.RAIL : type;
+	}
+
 	@Override
 	public int getNeighbors(Node[] neighbors, Node node) {
 		int count = super.getNeighbors(neighbors, node);
+		boolean hardBlockLight = !this.lightTolerant && this.severityPercent < HARD_BLOCK_MAX_PERCENT
+			&& this.startLight <= EDGE_LIGHT;
+		// Compacted in place rather than nulling entries within the returned count - PathFinder
+		// dereferences every neighbor up to whatever count getNeighbors returns with no null check of
+		// its own (confirmed via bytecode), so a genuinely excluded node has to actually be removed
+		// from the array/count, not just left as a null hole in it.
+		int kept = 0;
 		for (int i = 0; i < count; i++) {
 			Node neighbor = neighbors[i];
 			if (neighbor == null) {
 				continue;
 			}
-			long key = BlockPos.asLong(neighbor.x, neighbor.y, neighbor.z);
-			if (this.nodeMalusApplied.containsKey(key)) {
-				continue;
-			}
 			BlockPos pos = new BlockPos(neighbor.x, neighbor.y, neighbor.z);
-			float malus = 0.0F;
-			if (!this.lightTolerant) {
-				malus += lightMalus(this.mob.level().getMaxLocalRawBrightness(pos));
+			int light = this.mob.level().getMaxLocalRawBrightness(pos);
+			if (hardBlockLight && light > EDGE_LIGHT) {
+				continue; // excluded entirely below HARD_BLOCK_MAX_PERCENT - this route doesn't exist
 			}
-			if (this.mob.level().getBlockState(pos).is(Blocks.COBWEB)) {
-				malus += COBWEB_MALUS;
+			long key = BlockPos.asLong(neighbor.x, neighbor.y, neighbor.z);
+			if (!this.nodeMalusApplied.containsKey(key)) {
+				float malus = 0.0F;
+				if (!this.lightTolerant) {
+					malus += lightMalus(light);
+				}
+				if (this.mob.level().getBlockState(pos).is(Blocks.COBWEB)) {
+					malus += COBWEB_MALUS;
+				}
+				neighbor.costMalus += malus;
+				this.nodeMalusApplied.put(key, malus);
 			}
-			neighbor.costMalus += malus;
-			this.nodeMalusApplied.put(key, malus);
+			neighbors[kept] = neighbor;
+			kept++;
 		}
-		return count;
+		return kept;
 	}
 
 	private static float lightMalus(int light) {

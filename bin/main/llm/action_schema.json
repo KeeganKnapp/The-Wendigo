@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WendigoActionPlan",
-  "description": "One complete wave for the wendigo: where it spawns, what it does, and where it despawns. This one call drives the entire wave start to finish - there is no mid-wave re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, and the available spawn_at/despawn_at spot labels (spot_a..spot_f, nearest to furthest) with real distances/light levels - that context is NOT part of this schema since it's different every request. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
+  "description": "One complete wave for the wendigo: where it spawns, what it does, and where it despawns. This one call drives the entire wave start to finish - there is no mid-wave re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, and the available spawn_at spot labels (spot_a..spot_f, nearest to furthest) with real distances/light levels - that context is NOT part of this schema since it's different every request. Where the wendigo despawns is NOT a model choice - the engine always picks the scanned spot that's farthest from and/or most obstructed from every nearby player, trying the next-best one automatically if the best pick turns out unreachable when it's actually time to flee. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
   "type": "object",
   "properties": {
     "spawn_at": {
@@ -13,9 +13,10 @@
         "spot_d",
         "spot_e",
         "spot_f",
-        "no_players_looking"
+        "no_players_looking",
+        "spawn_on_torch"
       ],
-      "description": "Which of the scanned dark spots (given in the prompt, nearest to furthest) the wendigo should spawn at. Only labels actually offered in the prompt are valid for this request. 'no_players_looking' is a special value instead of naming a specific spot: the engine picks a random scanned spot the target player isn't currently looking toward (falling back to the furthest scanned spot if every one of them happens to be in view) - use this whenever the point is a clean, unnoticed first appearance rather than a specific spot's particular geometry (dim spots, torches, connectivity), since it's a better guarantee of not being caught mid-spawn than guessing which labeled spot is safest yourself."
+      "description": "Which of the scanned dark spots (given in the prompt, nearest to furthest) the wendigo should spawn at. Only labels actually offered in the prompt are valid for this request - spot_a (the nearest one) only ever appears in a tight, mineshaft-like space (see the prompt's caving-scenario note), at any severity, since there's nowhere far to spawn anyway in a cramped space; spot_b/c/d/e/f otherwise unlock progressively closer to the player as severity climbs (e/f earliest, then d, then c, then b) - which labels are even offered already reflects how bold the wendigo is allowed to be right now. 'no_players_looking' is a special value instead of naming a specific spot: the engine picks a random scanned spot the target player isn't currently looking toward (falling back to the furthest scanned spot if every one of them happens to be in view) - use this whenever the point is a clean, unnoticed first appearance rather than a specific spot's particular geometry (dim spots, torches, connectivity), since it's a better guarantee of not being caught mid-spawn than guessing which labeled spot is safest yourself. 'spawn_on_torch' - only offered at high severity, and only when there's little to no real darkness nearby to work with - spawns already exposed at a random nearby lit position, destroying its torch the instant it appears, no hiding or staring involved; only makes sense paired with an aggressive plan (e.g. sound.ambient_cue(danger) then combat.chase) since there's nothing subtle about it - don't pick it if a genuine dark spot is available and would fit the moment better."
     },
     "plan": {
       "type": "array",
@@ -25,18 +26,6 @@
         "$ref": "#/$defs/step"
       },
       "description": "Runs after spawning, before the despawn move. Executed in order. If a step's precondition isn't met (e.g. retreat_to_dark with source=stored but nothing has been stored yet), the engine falls back to a sensible default rather than erroring - it never rejects a whole plan for one bad step."
-    },
-    "despawn_at": {
-      "type": "string",
-      "enum": [
-        "spot_a",
-        "spot_b",
-        "spot_c",
-        "spot_d",
-        "spot_e",
-        "spot_f"
-      ],
-      "description": "Which scanned dark spot the wendigo should retreat to and despawn at once 'plan' finishes. Usually further away than spawn_at, to sell the idea of it withdrawing back into the dark."
     },
     "global_rules": {
       "type": "array",
@@ -51,7 +40,6 @@
   "required": [
     "spawn_at",
     "plan",
-    "despawn_at",
     "global_rules"
   ],
   "additionalProperties": false,
@@ -447,25 +435,15 @@
     },
     "combat_lunge_attack": {
       "type": "object",
-      "description": "COMBAT branch: a direct approach to melee range - one of the few movement primitives that's allowed to cross into light, since closing the distance is the point. Deals a real hit on contact. Don't run this blind - use predicate.player_distance (closer_than lunge_distance) in a control.if/control.while to decide when the player is close enough to commit, since once started it commits to closing the remaining distance. Follow up with movement.retreat_with_fallback to get back into hiding afterward.",
+      "description": "COMBAT branch: a direct approach to melee range - one of the few movement primitives that's allowed to cross into light, since closing the distance is the point. Always closes at the fastest pace, not a semantic choice like other movement (no 'speed' field here) - a lunge is a commit-to-the-grab moment. On contact this doesn't deal damage directly - it grabs the player, forcing them to ride along with the wendigo until they either struggle free or the wendigo reaches wherever it's headed next (typically its despawn point), at which point it's their loss to make. Don't run this blind - use predicate.player_distance (closer_than lunge_distance) in a control.if/control.while to decide when the player is close enough to commit, since once started it commits to closing the remaining distance. Follow up with movement.retreat_with_fallback to get back into hiding afterward - the grabbed player rides along for that too. The engine also requires a dark-enough spot near the player before this will run at all (how near scales up with severity) - if the player is standing somewhere too brightly lit with nothing dark nearby to retreat to, this is a no-op and the plan continues, same as combat.break_torch finding no torch.",
       "properties": {
         "type": {
           "type": "string",
           "const": "combat.lunge_attack"
-        },
-        "speed": {
-          "type": "string",
-          "enum": [
-            "slow",
-            "normal",
-            "fast"
-          ],
-          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant. 'fast' is the classic dash-in; 'slow' or 'normal' reads as a more deliberate, menacing close-in instead."
         }
       },
       "required": [
-        "type",
-        "speed"
+        "type"
       ],
       "additionalProperties": false
     },
@@ -495,25 +473,15 @@
     },
     "combat_chase": {
       "type": "object",
-      "description": "COMBAT branch: sustained, aggressive pursuit - reserved for high severity (the engine won't allow this below 60%). Unlike combat.lunge_attack (one commit-and-strike, then done), this keeps pursuing and can strike repeatedly if it stays in melee range, and passively destroys any torch within 10 blocks of wherever the wendigo currently is as it runs through - incidental collateral from the chase itself, not a targeted break_torch (no pathing to torches, no aiming for them specifically). Ends on its own once the player can't be reached for a sustained stretch, at which point the plan simply continues to whatever comes next (typically the automatic despawn phase if nothing else follows) - no explicit flee/despawn step is required right after this one, though adding movement.retreat_with_fallback afterward is fine too. A good use: pair with a global_rule (condition predicate.player_looking_at_self at whichever band, action combat.chase) so being spotted at high severity immediately and reliably escalates into a real chase, regardless of what the current plan step was doing.",
+      "description": "COMBAT branch: sustained, aggressive pursuit - reserved for the most aggressive tier (the engine won't allow this below 80%). Always runs at the fastest pace, not a semantic choice like other movement (no 'speed' field here). Should almost always be preceded by a posture.stare - this is the payoff for being noticed while staring, not something to trigger with no reveal moment first. Like combat.lunge_attack, catching the player here doesn't deal damage directly - it grabs them, forcing them to ride along until they struggle free or the wendigo reaches wherever it's headed next, ending the chase there rather than sustaining it further. Until it catches them, it passively destroys any torch within 10 blocks of wherever the wendigo currently is as it runs through - incidental collateral from the chase itself, not a targeted break_torch (no pathing to torches, no aiming for them specifically). Also ends on its own (without ever catching them) once the player can't be reached for a sustained stretch, at which point the plan simply continues to whatever comes next (typically the automatic despawn phase if nothing else follows) - no explicit flee/despawn step is required right after this one, though adding movement.retreat_with_fallback afterward is fine too. A good use: pair with a global_rule (condition predicate.player_looking_at_self at whichever band, action combat.chase) so being spotted at this tier immediately and reliably escalates into a real chase, regardless of what the current plan step was doing.",
       "properties": {
         "type": {
           "type": "string",
           "const": "combat.chase"
-        },
-        "speed": {
-          "type": "string",
-          "enum": [
-            "slow",
-            "normal",
-            "fast"
-          ],
-          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant. 'fast' is the expected choice for a real chase."
         }
       },
       "required": [
-        "type",
-        "speed"
+        "type"
       ],
       "additionalProperties": false
     },
@@ -533,7 +501,7 @@
     },
     "control_despawn": {
       "type": "object",
-      "description": "CONTROL branch: end the wave immediately by vanishing right where the wendigo currently stands - no travel to despawn_at, no despawn fallback chain, no walk-away transition. Ends the plan the instant this step runs, so put it last. Use this for a fleeting, passive presence: appear, do something small and unsettling from a distance, then simply not be there anymore - a much subtler beat than being watched fleeing into the dark. Not the same as movement.retreat_with_fallback (a real flight back into darkness, for when the wendigo needs to physically get away first) - if the wendigo isn't already somewhere fine to vanish from, retreat before using this.",
+      "description": "CONTROL branch: end the wave immediately by vanishing right where the wendigo currently stands - no travel to a despawn point, no despawn fallback chain, no walk-away transition. Ends the plan the instant this step runs, so put it last. Use this for a fleeting, passive presence: appear, do something small and unsettling from a distance, then simply not be there anymore - a much subtler beat than being watched fleeing into the dark. Not the same as movement.retreat_with_fallback (a real flight back into darkness, for when the wendigo needs to physically get away first) - if the wendigo isn't already somewhere fine to vanish from, retreat before using this.",
       "properties": {
         "type": {
           "type": "string",

@@ -14,6 +14,7 @@ import com.wendigo.entity.WendigoEntity;
 import com.wendigo.entity.WendigoVisual;
 import com.wendigo.llm.LlmClient;
 import com.wendigo.llm.LlmConfig;
+import com.wendigo.wave.DarknessOverstayTracker;
 import com.wendigo.wave.EncounterHistory;
 import com.wendigo.wave.PlayerSeverityTracker;
 import com.wendigo.wave.WendigoManager;
@@ -74,6 +75,7 @@ public class WendigoMod implements ModInitializer {
 		severityTracker.register();
 		wendigoManager = new WendigoManager(waveConfig, severityTracker, new EncounterHistory());
 		wendigoManager.register();
+		new DarknessOverstayTracker(severityTracker, wendigoManager).register();
 
 		WendigoCommands.register();
 	}

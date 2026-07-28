@@ -10,6 +10,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import com.wendigo.spatial.CaveScaleScanner.CaveScale;
+import com.wendigo.spatial.DarkSpotScanner;
 
 /**
  * Builds a per-request WendigoActionPlan schema with anything not yet unlocked for the given
@@ -22,30 +23,56 @@ import com.wendigo.spatial.CaveScaleScanner.CaveScale;
  * visible there specifically for this reuse) so the two can't silently drift apart.
  */
 public final class SchemaBuilder {
-	// spawn_at's "on_torch" option isn't an action_step, so it isn't covered by TierGates at all -
-	// this is its own, separate gate, requiring BOTH the top severity tier AND a tight/mineshaft-like
-	// cave (see CaveScaleScanner) - spawning on a torch and destroying it reads as a cramped, sudden
-	// ambush, which doesn't fit a massive open cavern. See PlanRunner/WendigoManager for the
-	// spawn-resolution side, and WendigoManager.spawnWave for the matching defensive re-check.
-	private static final int SPAWN_ON_TORCH_MIN_PERCENT = 80;
-
 	private static final String BASE_SCHEMA_JSON = readBaseSchema();
 
 	private SchemaBuilder() {
 	}
 
 	/** A fresh, filtered copy of the base schema for this severity/cave scale - safe to mutate
-	 * further, callers never share the returned instance. */
-	public static JsonObject forSeverity(int severityPercent, CaveScale caveScale) {
+	 * further, callers never share the returned instance. torchSpawnAvailable is whether
+	 * WaveContext actually found at least one reachable torch-adjacent spawn_on_torch candidate this
+	 * request - a world fact, kept separate from the severity policy check in isSpawnSpotAllowed. */
+	public static JsonObject forSeverity(int severityPercent, CaveScale caveScale, boolean torchSpawnAvailable) {
 		JsonObject schema = JsonParser.parseString(BASE_SCHEMA_JSON).getAsJsonObject();
 		JsonObject defs = schema.getAsJsonObject("$defs");
 
 		filterActionStepUnion(defs, severityPercent);
 		filterSoundCue(defs, severityPercent);
-		filterSpawnAt(schema, severityPercent, caveScale);
-		filterDespawnAt(schema, caveScale);
+		filterSpawnAt(schema, severityPercent, caveScale, torchSpawnAvailable);
+		filterStareBand(defs, severityPercent);
 
 		return schema;
+	}
+
+	// Above this severity, a stare only counts as "noticed" if the player is actually looking
+	// toward the wendigo (in_view) or dead-on (dead_stare) - corner_of_eye (the widest, ~60 degree
+	// band) is dropped entirely. Below this, a barely-established relationship with the player
+	// plausibly still gets "made" by the faintest peripheral glimpse; once it's established enough
+	// to be bold (40%+), that bar tightens to something a player would actually recognize as looking
+	// at it.
+	private static final int STARE_BAND_NARROW_MIN_PERCENT = 40;
+
+	/** Removes "corner_of_eye" from predicate.player_looking_at_self/predicate.player_undetected's
+	 * band enum at/above STARE_BAND_NARROW_MIN_PERCENT - both predicate defs stay present regardless
+	 * of severity (TierGates never gates predicates, only action_step types), only the band choice
+	 * narrows. */
+	private static void filterStareBand(JsonObject defs, int severityPercent) {
+		if (severityPercent < STARE_BAND_NARROW_MIN_PERCENT) {
+			return;
+		}
+		for (String defName : new String[] {"predicate_player_looking_at_self", "predicate_player_undetected"}) {
+			if (!defs.has(defName)) {
+				continue;
+			}
+			JsonObject bandProperty = defs.getAsJsonObject(defName).getAsJsonObject("properties").getAsJsonObject("band");
+			JsonArray kept = new JsonArray();
+			for (JsonElement value : bandProperty.getAsJsonArray("enum")) {
+				if (!"corner_of_eye".equals(value.getAsString())) {
+					kept.add(value);
+				}
+			}
+			bandProperty.add("enum", kept);
+		}
 	}
 
 	/**
@@ -56,30 +83,51 @@ public final class SchemaBuilder {
 	 *   severity encounter there can start close; a normal/massive cave never offers it.
 	 * - spot_b/c/d/e/f unlock progressively closer as severity climbs (e/f at 20%, d at 40%, c at
 	 *   60%, b at 80%) - the wendigo is allowed to appear progressively bolder/closer the more
-	 *   established this player's relationship with it already is.
-	 * - on_torch: SPAWN_ON_TORCH_MIN_PERCENT AND a tight cave (see the field's own comment).
+	 *   established this player's relationship with it already is. Some of these may be torch-linked
+	 *   rather than genuinely dark (see DarkSpotScanner.WaveSpot) - invisible here, spawn_at doesn't
+	 *   distinguish, only WendigoManager.spawnWave's resolution side reads that.
 	 * - no_players_looking: always allowed - the safe, unwatched default.
+	 * - spawn_on_torch: unlocks on the exact same schedule as spot_b/c/d/e/f, just measured against
+	 *   the separate torch-spawn-candidate pool instead of a labeled spot - see minTorchSpawnDistance.
+	 *   torchSpawnAvailable is the caller's answer to "does at least one candidate clear that
+	 *   distance" (a world fact WaveContext/the caller computed, not a policy choice re-derived here).
+	 *   At 80%+ this lines up with combat.chase also being unlocked - see the prompt guidance in
+	 *   WendigoManager for the "commit to a hunt" framing that only applies at that top tier; below
+	 *   80% it's offered as an ordinary spawn location choice, no forced follow-up.
 	 */
-	public static boolean isSpawnSpotAllowed(String label, int severityPercent, CaveScale caveScale) {
+	public static boolean isSpawnSpotAllowed(String label, int severityPercent, CaveScale caveScale, boolean torchSpawnAvailable) {
 		return switch (label) {
 			case "spot_a" -> caveScale == CaveScale.TIGHT;
 			case "spot_b" -> severityPercent >= 80;
 			case "spot_c" -> severityPercent >= 60;
 			case "spot_d" -> severityPercent >= 40;
 			case "spot_e", "spot_f" -> severityPercent >= 20;
-			case "on_torch" -> severityPercent >= SPAWN_ON_TORCH_MIN_PERCENT && caveScale == CaveScale.TIGHT;
+			case "spawn_on_torch" -> torchSpawnAvailable && severityPercent >= 20;
 			default -> true; // "no_players_looking"
 		};
 	}
 
-	/** Whether this despawn_at value is allowed at this cave scale - not tiered by severity at all,
-	 * unlike spawn_at; spot_a/spot_b are reserved for a tight cave same as their spawn_at rule, every
-	 * other scanned spot is a valid despawn point at any severity. */
-	public static boolean isDespawnSpotAllowed(String label, CaveScale caveScale) {
-		return switch (label) {
-			case "spot_a", "spot_b" -> caveScale == CaveScale.TIGHT;
-			default -> true; // spot_c, spot_d, spot_e, spot_f
-		};
+	/** The minimum distance-from-player a spawn_on_torch candidate must clear to be usable at this
+	 * severity - the exact same progressive tiers spot_b(16)/c(24)/d(32)/e(40) unlock at (see
+	 * DarkSpotScanner.spotDistanceThreshold), just applied to the separate torch-spawn-candidate pool
+	 * instead of a labeled spot: 20-39% needs e-or-further, 40-59% d-or-further, 60-79% c-or-further,
+	 * 80%+ b-or-further. Below 20%, nothing qualifies (matches spot_e/f's own floor - there's no tier
+	 * below that one to fall back to). Public so WendigoManager's resolution side filters the same
+	 * candidate pool this schema check reasons about, not just gates the option's visibility. */
+	public static double minTorchSpawnDistance(int severityPercent) {
+		if (severityPercent >= 80) {
+			return DarkSpotScanner.spotDistanceThreshold(1); // spot_b's own threshold
+		}
+		if (severityPercent >= 60) {
+			return DarkSpotScanner.spotDistanceThreshold(2); // spot_c's own threshold
+		}
+		if (severityPercent >= 40) {
+			return DarkSpotScanner.spotDistanceThreshold(3); // spot_d's own threshold
+		}
+		if (severityPercent >= 20) {
+			return DarkSpotScanner.spotDistanceThreshold(4); // spot_e's own threshold
+		}
+		return Double.POSITIVE_INFINITY;
 	}
 
 	/** Removes any action_step $ref (and its now-unreferenced $def body) whose action type isn't
@@ -122,26 +170,15 @@ public final class SchemaBuilder {
 		cueProperty.add("enum", kept);
 	}
 
-	private static void filterSpawnAt(JsonObject schema, int severityPercent, CaveScale caveScale) {
+	private static void filterSpawnAt(JsonObject schema, int severityPercent, CaveScale caveScale, boolean torchSpawnAvailable) {
 		JsonObject spawnAt = schema.getAsJsonObject("properties").getAsJsonObject("spawn_at");
 		JsonArray kept = new JsonArray();
 		for (JsonElement value : spawnAt.getAsJsonArray("enum")) {
-			if (isSpawnSpotAllowed(value.getAsString(), severityPercent, caveScale)) {
+			if (isSpawnSpotAllowed(value.getAsString(), severityPercent, caveScale, torchSpawnAvailable)) {
 				kept.add(value);
 			}
 		}
 		spawnAt.add("enum", kept);
-	}
-
-	private static void filterDespawnAt(JsonObject schema, CaveScale caveScale) {
-		JsonObject despawnAt = schema.getAsJsonObject("properties").getAsJsonObject("despawn_at");
-		JsonArray kept = new JsonArray();
-		for (JsonElement value : despawnAt.getAsJsonArray("enum")) {
-			if (isDespawnSpotAllowed(value.getAsString(), caveScale)) {
-				kept.add(value);
-			}
-		}
-		despawnAt.add("enum", kept);
 	}
 
 	private static String refName(String ref) {

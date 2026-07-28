@@ -6,8 +6,14 @@ import java.util.List;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.TorchBlock;
 
 /**
  * Finds light-emitting blocks (torches, lanterns, etc.) near an origin - the counterpart to
@@ -62,6 +68,32 @@ public final class LightSourceScanner {
 		}
 		found.sort(Comparator.comparingDouble(p -> p.distSqr(origin)));
 		return found;
+	}
+
+	// A real torch's own crafting recipe (1 coal/charcoal + 1 stick -> torches) - not an exact
+	// yield, just a flavor-appropriate "salvaged the parts" drop for a light source the wendigo
+	// itself tore down, distinct from a torch broken any other way (player, explosion, fire, etc.),
+	// which still gets vanilla's own default drop (the torch item itself) untouched - this helper is
+	// only ever called from the wendigo's own destruction paths.
+	private static final ItemStack TORCH_BREAK_DROP_COAL = new ItemStack(Items.COAL);
+	private static final ItemStack TORCH_BREAK_DROP_STICK = new ItemStack(Items.STICK);
+
+	/**
+	 * Destroys a light source the wendigo itself is responsible for (combat.break_torch,
+	 * combat.chase's passive collateral, or a torch-linked spawn spot) - no vanilla drop
+	 * (dropBlock=false, same convention as everywhere else this mod destroys a block), replaced with
+	 * a coal + a stick if (and only if) the block was actually a torch (standing, wall, or soul -
+	 * see TorchBlock; deliberately excludes RedstoneTorchBlock, a different subclass of
+	 * BaseTorchBlock that isn't really "a torch" for this purpose). Any other light source type
+	 * (lantern, glowstone, redstone torch/lamp, etc.) still drops nothing, same as before.
+	 */
+	public static void destroyByWendigo(ServerLevel level, BlockPos pos, Entity source) {
+		boolean isTorch = level.getBlockState(pos).getBlock() instanceof TorchBlock;
+		level.destroyBlock(pos, false, source, 512);
+		if (isTorch) {
+			level.addFreshEntity(new ItemEntity(level, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, TORCH_BREAK_DROP_COAL.copy()));
+			level.addFreshEntity(new ItemEntity(level, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, TORCH_BREAK_DROP_STICK.copy()));
+		}
 	}
 
 	/**

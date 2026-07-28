@@ -1,6 +1,6 @@
 {
 	"textures": {
-		"0": "wendigo:blueprint/wendigo/texture",
+		"1": "wendigo:blueprint/wendigo/texture_e",
 		"particle": "minecraft:item/pufferfish"
 	},
 	"display": {
@@ -10,38 +10,38 @@
 	},
 	"elements": [
 		{
-			"from": [6.44681, -7.48165, 6.75636],
-			"to": [9.44681, 8.51835, 9.75636],
+			"from": [6.5, -2, 6.5],
+			"to": [9.5, 8, 9.5],
 			"rotation": {
 				"x": 0,
 				"y": 0,
 				"z": 0,
-				"origin": [7.44681, -22.48165, 7.75636]
+				"origin": [8, 8, 8]
 			},
 			"faces": {
 				"north": {
-					"uv": [7.25, 9.25, 8, 13.25],
-					"texture": "#0"
+					"uv": [9.75, 0, 10.5, 2.5],
+					"texture": "#1"
 				},
 				"east": {
-					"uv": [6.5, 9.25, 7.25, 13.25],
-					"texture": "#0"
+					"uv": [9.75, 2.5, 10.5, 5],
+					"texture": "#1"
 				},
 				"south": {
-					"uv": [8.75, 9.25, 9.5, 13.25],
-					"texture": "#0"
+					"uv": [9.75, 5, 10.5, 7.5],
+					"texture": "#1"
 				},
 				"west": {
-					"uv": [8, 9.25, 8.75, 13.25],
-					"texture": "#0"
+					"uv": [9.75, 7.5, 10.5, 10],
+					"texture": "#1"
 				},
 				"up": {
-					"uv": [8, 9.25, 7.25, 8.5],
-					"texture": "#0"
+					"uv": [11.25, 8.75, 10.5, 8],
+					"texture": "#1"
 				},
 				"down": {
-					"uv": [8.75, 8.5, 8, 9.25],
-					"texture": "#0"
+					"uv": [11.25, 8.75, 10.5, 9.5],
+					"texture": "#1"
 				}
 			}
 		}

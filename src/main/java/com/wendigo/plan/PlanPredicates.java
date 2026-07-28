@@ -68,7 +68,8 @@ final class PlanPredicates {
 	}
 
 	/** Human-readable live snapshot (distance to nearest player + looking state at every band) - used
-	 * purely for debugSay diagnostics, e.g. explaining why a control.while ended after 0 iterations. */
+	 * purely for debugSay diagnostics, e.g. explaining why a control.while ended after 0 iterations.
+	 * Looking state reflects any nearby player (see isLookedAtByAnyone), not just the nearest one. */
 	static String debugSnapshot(WendigoEntity self) {
 		Player player = Targeting.nearestPlayer(self);
 		if (player == null) {
@@ -76,25 +77,36 @@ final class PlanPredicates {
 		}
 		return String.format("distance=%.1f looking(corner_of_eye)=%b looking(in_view)=%b looking(dead_stare)=%b",
 			self.distanceTo(player),
-			isLookingAtSelf(player, self, "corner_of_eye"),
-			isLookingAtSelf(player, self, "in_view"),
-			isLookingAtSelf(player, self, "dead_stare"));
+			isLookedAtByAnyone(self, "corner_of_eye"),
+			isLookedAtByAnyone(self, "in_view"),
+			isLookedAtByAnyone(self, "dead_stare"));
 	}
 
 	private static boolean isDark(Level level, BlockPos pos) {
 		return level.getMaxLocalRawBrightness(pos) <= SemanticBands.DARKNESS_LIGHT_THRESHOLD;
 	}
 
+	/** Global stare FOV for multiplayer: any player within range looking at the wendigo counts,
+	 * regardless of who the wave is actually targeting/chasing - a group member noticing it from the
+	 * side should "spot" it just as much as the one being stalked. */
 	private static boolean playerLookingAtSelf(JsonObject predicate, WendigoEntity self) {
-		Player player = Targeting.nearestPlayer(self);
-		return player != null && isLookingAtSelf(player, self, predicate.get("band").getAsString());
+		return isLookedAtByAnyone(self, predicate.get("band").getAsString());
 	}
 
 	/** Used by PlanRunner's per-tick outcome polling (see EncounterHistory) - independent of whether
-	 * the plan itself ever checks predicate.player_looking_at_self(dead_stare). */
+	 * the plan itself ever checks predicate.player_looking_at_self(dead_stare). Same "any player"
+	 * multiplayer semantics as playerLookingAtSelf. */
 	static boolean isDeadStare(WendigoEntity self) {
-		Player player = Targeting.nearestPlayer(self);
-		return player != null && isLookingAtSelf(player, self, "dead_stare");
+		return isLookedAtByAnyone(self, "dead_stare");
+	}
+
+	private static boolean isLookedAtByAnyone(WendigoEntity self, String band) {
+		for (Player player : Targeting.nearbyPlayers(self)) {
+			if (isLookingAtSelf(player, self, band)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private static boolean isLookingAtSelf(Player player, WendigoEntity self, String band) {
@@ -104,36 +116,47 @@ final class PlanPredicates {
 		return alignment >= cosThreshold && player.hasLineOfSight(self);
 	}
 
-	/** Backs predicate.player_approaching: true once the player has closed at least this band's
-	 * share of the distance-at-loop-start (whileBaselineDistance, capped - see SemanticBands.
-	 * APPROACH_BASELINE_CAP_BLOCKS) toward the wendigo. NaN baseline (no active control.while) or no
-	 * player in range both read as "nothing covered yet". */
+	/** Backs predicate.player_approaching: true once ANY nearby player has closed at least this
+	 * band's share of the distance-at-loop-start (whileBaselineDistance, capped - see SemanticBands.
+	 * APPROACH_BASELINE_CAP_BLOCKS) toward the wendigo - multiplayer-aware, same "any player counts"
+	 * idea as the stare-detection predicates, but the baseline/scaling itself is always anchored to
+	 * whichever player was closest the moment the loop began (whileBaselineDistance's own capture
+	 * point, unchanged), not recomputed per player. NaN baseline (no active control.while) reads as
+	 * "nothing covered yet". */
 	private static boolean playerApproaching(JsonObject predicate, WendigoEntity self, double whileBaselineDistance) {
-		Player player = Targeting.nearestPlayer(self);
-		return player != null && hasApproached(player, self, predicate.get("band").getAsString(), whileBaselineDistance);
+		return hasApproachedByAnyone(self, predicate.get("band").getAsString(), whileBaselineDistance);
 	}
 
-	private static boolean hasApproached(Player player, WendigoEntity self, String band, double whileBaselineDistance) {
+	private static boolean hasApproachedByAnyone(WendigoEntity self, String band, double whileBaselineDistance) {
 		if (Double.isNaN(whileBaselineDistance)) {
 			return false;
 		}
-		double covered = Math.max(0.0, whileBaselineDistance - self.distanceTo(player));
 		double threshold = whileBaselineDistance * SemanticBands.approachCoverageFraction(band);
-		return covered >= threshold;
+		for (Player player : Targeting.nearbyPlayers(self)) {
+			double covered = Math.max(0.0, whileBaselineDistance - self.distanceTo(player));
+			if (covered >= threshold) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Backs predicate.player_undetected: !looking_at_self(band) && !hasApproached(approach_band), as
 	 * one atomic check - see its schema description for why this exists instead of making the model
-	 * hand-compose predicate.and(predicate.not(...), predicate.not(...)) for this idiom. */
+	 * hand-compose predicate.and(predicate.not(...), predicate.not(...)) for this idiom. Both halves
+	 * are multiplayer-global now (any nearby player spotting it, or any nearby player closing in,
+	 * counts) - see isLookedAtByAnyone/hasApproachedByAnyone. The approach half's distance scaling
+	 * still always comes from whileBaselineDistance, captured once from whoever was closest the
+	 * moment the loop began - "any player" only changes who gets checked against that baseline, not
+	 * how it's computed. */
 	private static boolean playerUndetected(JsonObject predicate, WendigoEntity self, double whileBaselineDistance) {
-		Player player = Targeting.nearestPlayer(self);
-		if (player == null) {
+		if (Targeting.nearestPlayer(self) == null) {
 			return false; // nothing to hide from - not the same as "safely undetected", so don't loop forever on this
 		}
-		if (isLookingAtSelf(player, self, predicate.get("band").getAsString())) {
+		if (isLookedAtByAnyone(self, predicate.get("band").getAsString())) {
 			return false;
 		}
-		return !hasApproached(player, self, predicate.get("approach_band").getAsString(), whileBaselineDistance);
+		return !hasApproachedByAnyone(self, predicate.get("approach_band").getAsString(), whileBaselineDistance);
 	}
 
 	private static boolean playerInDarkness(WendigoEntity self) {

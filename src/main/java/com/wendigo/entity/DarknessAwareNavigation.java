@@ -43,4 +43,9 @@ public class DarknessAwareNavigation extends GroundPathNavigation {
 	public void setLightTolerant(boolean lightTolerant) {
 		this.darknessNodeEvaluator.setLightTolerant(lightTolerant);
 	}
+
+	/** See DarknessNodeEvaluator.severityPercent/HARD_BLOCK_MAX_PERCENT. */
+	public void setSeverityPercent(int severityPercent) {
+		this.darknessNodeEvaluator.setSeverityPercent(severityPercent);
+	}
 }

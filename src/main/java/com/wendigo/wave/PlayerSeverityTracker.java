@@ -1,13 +1,18 @@
 package com.wendigo.wave;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -15,13 +20,20 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ambient.Bat;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.monster.Slime;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.debug.WendigoDebug;
-import com.wendigo.entity.WendigoEntity;
+import com.wendigo.sound.WendigoSounds;
 
 /**
  * Tracks cumulative time each player has spent below y=0, world-wide, never resetting when they
@@ -56,6 +68,22 @@ public final class PlayerSeverityTracker {
 	// PlanPredicates.isLookingAtSelf - a mob hidden behind a wall inside the cone is still safe to
 	// discard, since the player can't actually see it happen).
 	private static final double MOB_DESPAWN_VIEW_CONE_DEGREES = 70.0;
+	// A warning sound plays every time cumulative severity crosses one of these - see addSeverity.
+	private static final int WARNING_SOUND_INTERVAL = 1000;
+	// Mining an ore below y=0 adds straight to severity - coal at the bottom, scaling by 10 per tier
+	// up through diamond. Both the stone and deepslate variant of each ore share the same value
+	// (deepslate ore is what's actually common at these depths). First-pass tier ordering, easy to
+	// re-order/re-value later.
+	private static final Map<Block, Integer> ORE_SEVERITY_VALUES = Map.ofEntries(
+		Map.entry(Blocks.COAL_ORE, 10), Map.entry(Blocks.DEEPSLATE_COAL_ORE, 10),
+		Map.entry(Blocks.COPPER_ORE, 20), Map.entry(Blocks.DEEPSLATE_COPPER_ORE, 20),
+		Map.entry(Blocks.IRON_ORE, 30), Map.entry(Blocks.DEEPSLATE_IRON_ORE, 30),
+		Map.entry(Blocks.LAPIS_ORE, 40), Map.entry(Blocks.DEEPSLATE_LAPIS_ORE, 40),
+		Map.entry(Blocks.REDSTONE_ORE, 50), Map.entry(Blocks.DEEPSLATE_REDSTONE_ORE, 50),
+		Map.entry(Blocks.GOLD_ORE, 60), Map.entry(Blocks.DEEPSLATE_GOLD_ORE, 60),
+		Map.entry(Blocks.EMERALD_ORE, 70), Map.entry(Blocks.DEEPSLATE_EMERALD_ORE, 70),
+		Map.entry(Blocks.DIAMOND_ORE, 80), Map.entry(Blocks.DEEPSLATE_DIAMOND_ORE, 80)
+	);
 
 	private final WendigoWaveConfig config;
 	private final Map<UUID, Integer> secondsUnderY0 = new HashMap<>();
@@ -76,21 +104,49 @@ public final class PlayerSeverityTracker {
 		// (re)appearing, not just after freshly crossing y=0.
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> startWarmup(handler.player, server.getTickCount()));
 		ServerEntityEvents.ALLOW_LOAD.register(this::allowLoad);
+		PlayerBlockBreakEvents.AFTER.register(this::onBlockBroken);
+	}
+
+	/** Mining an ore below y=0 adds straight to severity - see ORE_SEVERITY_VALUES. */
+	private void onBlockBroken(Level level, Player player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
+		if (pos.getY() >= 0 || !(player instanceof ServerPlayer serverPlayer)) {
+			return;
+		}
+		Integer value = ORE_SEVERITY_VALUES.get(state.getBlock());
+		if (value != null) {
+			addSeverity(serverPlayer, value);
+		}
+	}
+
+	/** Single place severity actually increases from real (non-debug) progression - passive y&lt;0
+	 * dwell time and ore mining both funnel through this, so the every-WARNING_SOUND_INTERVAL sound
+	 * cue can't miss a crossing regardless of which source pushed it over. Deliberately not used by
+	 * setSeverity (/wendigo aggression set) - a debug jump shouldn't fire a burst of warning sounds
+	 * for every threshold it skips past. */
+	private void addSeverity(ServerPlayer player, int amount) {
+		int before = severityOf(player);
+		int after = Math.min(this.config.severityCap, before + amount);
+		this.secondsUnderY0.put(player.getUUID(), after);
+		if (after / WARNING_SOUND_INTERVAL > before / WARNING_SOUND_INTERVAL) {
+			WendigoSounds.play(player.level(), player.blockPosition(), WendigoSounds.Type.WARNING);
+		}
 	}
 
 	/** Blocks natural hostile-mob (and bat) spawns within MOB_SPAWN_PREVENT_RADIUS of any eligible
 	 * player - see MOB_SPAWN_PREVENT_RADIUS. Only EntitySpawnReason.NATURAL is gated - spawners,
 	 * summons, structures, breeding etc. are all deliberate and left alone; reloading an
 	 * already-existing entity from disk (reason LOAD) is untouched too, so this can't eat a saved
-	 * world's mobs on chunk load. */
+	 * world's mobs on chunk load. The wendigo's own spawn (WendigoManager.spawnWave's
+	 * level.addFreshEntity) is untouched regardless - it's never tagged NATURAL, so it never reaches
+	 * the predicate below at all. */
 	private boolean allowLoad(Entity entity, ServerLevel level, EntitySpawnReason reason, boolean bl) {
-		if (reason != EntitySpawnReason.NATURAL || !isClearableMob(entity)) {
+		if (reason != EntitySpawnReason.NATURAL || !isSpawnPreventableMob(entity)) {
 			return true;
 		}
 		double preventSq = MOB_SPAWN_PREVENT_RADIUS * MOB_SPAWN_PREVENT_RADIUS;
 		int now = level.getServer().getTickCount();
 		for (ServerPlayer player : level.players()) {
-			if (isEligible(player, now) && entity.distanceToSqr(player) <= preventSq) {
+			if (isEligibleForMobClearing(player, now) && entity.distanceToSqr(player) <= preventSq) {
 				return false;
 			}
 		}
@@ -98,12 +154,27 @@ public final class PlayerSeverityTracker {
 	}
 
 	/** Below y=0, past their warmup buffer (or debugging, which bypasses it) - the same condition
-	 * mostSevereEligiblePlayer/onEndServerTick's mob-clearing already use. */
+	 * selectTarget/onEndServerTick's mob-clearing already use. */
 	private boolean isEligible(ServerPlayer player, int now) {
 		if (player.isSpectator() || player.getY() >= 0) {
 			return false;
 		}
 		return now >= this.warmupUntilTick.getOrDefault(player.getUUID(), 0) || WendigoDebug.isEnabled(player);
+	}
+
+	// Below this, the wendigo hasn't established enough of a presence to be "clearing the area" of
+	// other threats yet - mobs actually spawn/exist normally near the player at stage 1, matching its
+	// "barely a presence" framing. Only gates the mob-clearing/prevention mechanics below, not the
+	// wendigo's own targeting eligibility (isEligible) - a stage-1 wave still needs to be able to fire.
+	private static final int MOB_CLEARING_MIN_PERCENT = 20;
+
+	private boolean isEligibleForMobClearing(ServerPlayer player, int now) {
+		if (!isEligible(player, now)) {
+			return false;
+		}
+		int cap = severityCap();
+		int percent = cap > 0 ? 100 * severityOf(player) / cap : 0;
+		return percent >= MOB_CLEARING_MIN_PERCENT;
 	}
 
 	private void onEndServerTick(MinecraftServer server) {
@@ -123,11 +194,11 @@ public final class PlayerSeverityTracker {
 			}
 			boolean underY0 = player.getY() < 0;
 			if (underY0) {
-				this.secondsUnderY0.merge(player.getUUID(), 1, (current, one) -> Math.min(this.config.severityCap, current + one));
+				addSeverity(player, 1);
 				if (!this.wasUnderY0.getOrDefault(player.getUUID(), false)) {
 					startWarmup(player, now); // rising edge - freshly descended below y=0
 				}
-				if (isEligible(player, now)) {
+				if (isEligibleForMobClearing(player, now)) {
 					despawnNearbyHostileMobs(player);
 				}
 			}
@@ -166,12 +237,33 @@ public final class PlayerSeverityTracker {
 		}
 	}
 
-	/** Monster (hostile), Bat, or Slime - never the wendigo itself. Slime extends Mob directly
-	 * (implements the Enemy marker interface rather than extending Monster), so it needs the same
-	 * explicit callout as Bat. Shared by both the spawn-prevention gate and the despawn sweep so the
-	 * two mechanisms can't drift apart on what counts as "clearable". */
+	/** Monster (hostile), Bat, or Slime, EXCEPT real EnderMen - used by the despawn sweep only (see
+	 * despawnNearbyHostileMobs). Checked before the generic Monster case, since EnderMan extends
+	 * Monster - this also naturally covers WendigoEntity, an EnderMan subclass, itself never a target
+	 * of its own sweep anyway. Real Endermen are exempted here because they're already a quiet,
+	 * dark-dwelling presence that fits the same atmosphere as the wendigo instead of competing with
+	 * it, and clearing already-spawned ones was an unintended side effect: their ambient stare/idle
+	 * sounds were vanishing along with them, misread as a sound-system bug when the actual cause was
+	 * every real Enderman near the player being discarded. Deliberately NOT reused by
+	 * isSpawnPreventableMob - see that method's own comment for why the two need to differ. */
 	private static boolean isClearableMob(Entity entity) {
-		return (entity instanceof Monster || entity instanceof Bat || entity instanceof Slime) && !(entity instanceof WendigoEntity);
+		if (entity instanceof EnderMan) {
+			return false;
+		}
+		return entity instanceof Monster || entity instanceof Bat || entity instanceof Slime;
+	}
+
+	/** Monster (hostile), Bat, or Slime - used by natural-spawn prevention (allowLoad) only, and
+	 * deliberately does NOT exempt EnderMan the way isClearableMob does. Real bug: allowLoad and the
+	 * despawn sweep used to share isClearableMob outright, so excluding EnderMan there (to stop
+	 * clearing already-spawned real Endermen) also silently exempted brand-new Endermen from
+	 * natural-spawn prevention as an unavoidable side effect of sharing one predicate - real Endermen
+	 * kept spawning freely within MOB_SPAWN_PREVENT_RADIUS above MOB_CLEARING_MIN_PERCENT even though
+	 * every other hostile type there was correctly blocked. Splitting the two predicates lets each
+	 * mechanism decide independently: don't clear an Enderman that's already there, but still don't
+	 * let a fresh one spawn in either. */
+	private static boolean isSpawnPreventableMob(Entity entity) {
+		return entity instanceof Monster || entity instanceof Bat || entity instanceof Slime;
 	}
 
 	/** Same alignment/line-of-sight idiom as PlanPredicates.isLookingAtSelf - true only if the mob is
@@ -197,20 +289,85 @@ public final class PlayerSeverityTracker {
 		this.secondsUnderY0.put(player.getUUID(), Math.clamp(value, 0, this.config.severityCap));
 	}
 
-	/** Highest-severity player currently below y=0 and past their warmup buffer in this level, or
-	 * null if nobody qualifies right now. */
-	public ServerPlayer mostSevereEligiblePlayer(ServerLevel level) {
+	public record TargetSelection(ServerPlayer target, int severity) {
+	}
+
+	/**
+	 * Multiplayer-aware automatic wave target: eligible players (below y=0, past warmup) are grouped
+	 * by proximity - two players are in the same group if they're within MOB_CLEAR_OUTER_RADIUS of
+	 * each other, transitively (a chain of nearby players all end up in one group even if the two
+	 * ends are out of range of each other directly, same "reads as one crowd" idea the mob-clearing
+	 * radius already uses). The group with the most players wins; ties broken by whichever group's
+	 * average severity is worse (higher). The actual target is picked at random from within that
+	 * group - not necessarily its most severe member - but the severity reported back is the group's
+	 * worst (highest) member regardless of who got picked, so the wendigo shows up at the intensity
+	 * that group as a whole has earned. Null if nobody's eligible right now.
+	 */
+	public TargetSelection selectTarget(ServerLevel level) {
 		int now = level.getServer().getTickCount();
-		ServerPlayer best = null;
-		int bestSeverity = -1;
+		List<ServerPlayer> eligible = new ArrayList<>();
 		for (ServerPlayer player : level.players()) {
-			if (!isEligible(player, now)) {
-				continue;
+			if (isEligible(player, now)) {
+				eligible.add(player);
 			}
-			int severity = severityOf(player);
-			if (severity > bestSeverity) {
-				bestSeverity = severity;
-				best = player;
+		}
+		if (eligible.isEmpty()) {
+			return null;
+		}
+		List<ServerPlayer> group = selectGroup(groupByProximity(eligible));
+		ServerPlayer target = group.get(ThreadLocalRandom.current().nextInt(group.size()));
+		int worstSeverity = group.stream().mapToInt(this::severityOf).max().orElse(0);
+		return new TargetSelection(target, worstSeverity);
+	}
+
+	/** Connected components under "within MOB_CLEAR_OUTER_RADIUS of each other" - simple union-find,
+	 * player counts here are always small enough that the O(n^2) pairwise distance check doesn't matter. */
+	private static List<List<ServerPlayer>> groupByProximity(List<ServerPlayer> players) {
+		double radiusSq = MOB_CLEAR_OUTER_RADIUS * MOB_CLEAR_OUTER_RADIUS;
+		int n = players.size();
+		int[] parent = new int[n];
+		for (int i = 0; i < n; i++) {
+			parent[i] = i;
+		}
+		for (int i = 0; i < n; i++) {
+			for (int j = i + 1; j < n; j++) {
+				if (players.get(i).distanceToSqr(players.get(j)) <= radiusSq) {
+					union(parent, i, j);
+				}
+			}
+		}
+		Map<Integer, List<ServerPlayer>> byRoot = new HashMap<>();
+		for (int i = 0; i < n; i++) {
+			byRoot.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(players.get(i));
+		}
+		return new ArrayList<>(byRoot.values());
+	}
+
+	private static int find(int[] parent, int i) {
+		while (parent[i] != i) {
+			parent[i] = parent[parent[i]];
+			i = parent[i];
+		}
+		return i;
+	}
+
+	private static void union(int[] parent, int a, int b) {
+		int rootA = find(parent, a);
+		int rootB = find(parent, b);
+		if (rootA != rootB) {
+			parent[rootA] = rootB;
+		}
+	}
+
+	/** Most players wins; ties broken by whichever group's average severity is worse (higher). */
+	private List<ServerPlayer> selectGroup(List<List<ServerPlayer>> groups) {
+		List<ServerPlayer> best = null;
+		double bestAverage = -1.0;
+		for (List<ServerPlayer> group : groups) {
+			double average = group.stream().mapToInt(this::severityOf).average().orElse(0.0);
+			if (best == null || group.size() > best.size() || (group.size() == best.size() && average > bestAverage)) {
+				best = group;
+				bestAverage = average;
 			}
 		}
 		return best;
