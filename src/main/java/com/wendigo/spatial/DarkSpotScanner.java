@@ -279,9 +279,56 @@ public final class DarkSpotScanner {
 	 * search upward instead of downward - see their own doc comments). A wall spot isn't a function
 	 * of an XZ column at all, it's a function of a vertical face at a given Y band - see
 	 * findWallSpots' own, deliberately lighter-weight approach for that case instead.
+	 * <p>
+	 * findAttachableSpots' own flood START is found via a single vertical probe directly at origin's
+	 * own (x,z) (attachableColumn's own layered relax search, straight up/down only, no lateral
+	 * movement) - fine for a floor spot, since the player is BY DEFINITION standing on a floor right
+	 * there, but for a ceiling that same probe requires solid rock directly overhead within a narrow
+	 * vertical window, which most cave ceilings simply aren't at any one exact point (live testing
+	 * found ceiling spots showing up far less often than floor ones, even after widening how many
+	 * slots were reserved for them - this, not flood path-cost, turned out to be why: if that one
+	 * probe fails, the WHOLE ceiling flood returns empty immediately, regardless of how good the
+	 * ceiling is 10 blocks to either side). findCeilingSeed below widens that single point into a
+	 * real search before giving up.
 	 */
 	public static WaveSpotScan findCeilingSpots(Level level, BlockPos origin, int count) {
-		return findAttachableSpots(level, origin, count, Direction.DOWN);
+		BlockPos start = attachableColumn(level, origin, Direction.DOWN);
+		if (start == null) {
+			start = findCeilingSeed(level, origin);
+		}
+		if (start == null) {
+			return new WaveSpotScan(List.of(), List.of());
+		}
+		return findAttachableSpots(level, origin, count, Direction.DOWN, start);
+	}
+
+	// How far (ring-sampled, same technique as findDarkest) to search for ANY valid ceiling
+	// attachment point near origin, once the direct straight-up probe above origin itself has
+	// failed - see findCeilingSpots' own comment for why this matters. 30 blocks, not
+	// MAX_SEARCH_RADIUS's own 48 - a ceiling seed this far out already uses up a meaningful chunk of
+	// the flood's own distance-from-origin budget before it's even started exploring.
+	private static final double[] CEILING_SEED_SEARCH_RADII = {6.0, 12.0, 18.0, 24.0, 30.0};
+
+	/** Ring-samples progressively wider radii around origin (shuffled order, see findDarkest) for
+	 * the first XZ column where attachableColumn(DOWN) succeeds - unlike the primary flood-fill,
+	 * this isn't itself reachability-verified (same looseness already accepted for
+	 * findWallSpots/findDimSpots elsewhere in this class) - it only needs to find A valid ceiling
+	 * point to hand off to findAttachableSpots as its flood start, which then explores outward from
+	 * there with the real connected-search guarantee. Returns null if nothing qualifies within 30
+	 * blocks at all. */
+	private static BlockPos findCeilingSeed(Level level, BlockPos origin) {
+		for (double radius : CEILING_SEED_SEARCH_RADII) {
+			for (int i : shuffledRingIndices()) {
+				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
+				int dx = (int) Math.round(Math.cos(angle) * radius);
+				int dz = (int) Math.round(Math.sin(angle) * radius);
+				BlockPos candidate = attachableColumn(level, origin.offset(dx, 0, dz), Direction.DOWN);
+				if (candidate != null) {
+					return candidate;
+				}
+			}
+		}
+		return null;
 	}
 
 	// How far up a wall (from a ring-sampled floor anchor - see findWallSpots) to probe for a dark
@@ -364,10 +411,117 @@ public final class DarkSpotScanner {
 		return null;
 	}
 
+	// How far from the wendigo's own current position an orbit-waypoint flood-fill is allowed to
+	// range - deliberately larger than MAX_SEARCH_RADIUS/MAX_FLOOD_VISITED, since (unlike every
+	// other scan in this class, always seeded at the player) the wendigo orbiting at the edge of
+	// its own band can legitimately already be MAX_SEARCH_RADIUS+ blocks from the player itself, on
+	// top of however far the new waypoint then needs to be from there too.
+	private static final double MAX_ORBIT_SEARCH_RADIUS = 64.0;
+	private static final int MAX_ORBIT_FLOOD_VISITED = 6000;
+
+	/**
+	 * Finds the nearest (by real path cost, not straight-line) standable, dark column reachable from
+	 * the WENDIGO's own current position (self) whose straight-line distance from player falls in
+	 * [minDistanceFromPlayer, maxDistanceFromPlayer] - the orbit behavior's own waypoint picker (see
+	 * PlanRunner.tickOrbit). Every other scan in this class floods outward from the PLAYER and
+	 * guarantees reachability from there; orbit needs the opposite guarantee (reachable from
+	 * wherever the wendigo currently stands, which could itself already be far from the player),
+	 * filtered by a distance band measured from a DIFFERENT point than the flood's own origin - a
+	 * genuinely different shape from findAttachableSpots' cumulative-distance-from-origin threshold
+	 * model below, not reusable from it. Since only one waypoint is needed (not a spread pool), this
+	 * returns the very first in-band match the flood reaches, which - because the frontier is the
+	 * same real-distance-weighted priority queue findAttachableSpots uses - is guaranteed to be the
+	 * cheapest-to-reach one, not just the first visited in some arbitrary order. Returns null if the
+	 * flood exhausts its budget/radius without finding anything in-band.
+	 */
+	public static BlockPos findOrbitWaypoint(Level level, BlockPos self, BlockPos player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer) {
+		BlockPos start = attachableColumn(level, self, Direction.UP);
+		if (start == null) {
+			return null;
+		}
+
+		Queue<FloodNode> frontier = new PriorityQueue<>(Comparator.comparingDouble(FloodNode::cost));
+		Set<Long> visited = new HashSet<>();
+		frontier.add(new FloodNode(start, 0.0));
+		visited.add(start.asLong());
+
+		int visitedCount = 0;
+		while (!frontier.isEmpty() && visitedCount < MAX_ORBIT_FLOOD_VISITED) {
+			FloodNode currentNode = frontier.poll();
+			BlockPos current = currentNode.pos();
+			visitedCount++;
+			boolean isStart = current.equals(start);
+			double distanceFromSelf = Math.sqrt(current.distSqr(self));
+
+			if (!isStart) {
+				double distanceFromPlayer = Math.sqrt(current.distSqr(player));
+				if (distanceFromPlayer >= minDistanceFromPlayer && distanceFromPlayer <= maxDistanceFromPlayer) {
+					int light = level.getMaxLocalRawBrightness(current);
+					if (light <= MAX_DARK_LIGHT) {
+						return current;
+					}
+				}
+			}
+
+			if (distanceFromSelf > MAX_ORBIT_SEARCH_RADIUS) {
+				continue; // don't expand past the search boundary
+			}
+			for (int i : shuffledFloodDirections()) {
+				BlockPos neighbor = nearbyAttachable(level, current.getX() + FLOOD_STEP_DX[i], current.getZ() + FLOOD_STEP_DZ[i], current.getY(), Direction.UP);
+				if (neighbor == null) {
+					continue;
+				}
+				long key = neighbor.asLong();
+				if (!visited.add(key)) {
+					continue;
+				}
+				boolean diagonal = FLOOD_STEP_DX[i] != 0 && FLOOD_STEP_DZ[i] != 0;
+				frontier.add(new FloodNode(neighbor, currentNode.cost() + (diagonal ? DIAGONAL_STEP_COST : 1.0)));
+			}
+		}
+		return null;
+	}
+
+	// Cap on how far above the player orbit's own ceiling-vantage preference (see
+	// PlanRunner.tickOrbit) will look for a ceiling to perch on - a straight-line height limit, not
+	// tied to MAX_ORBIT_SEARCH_RADIUS (that governs the flood-fill's real path-cost budget for the
+	// ordinary floor waypoint search this is an alternative to).
+	private static final double MAX_CEILING_VANTAGE_HEIGHT = 30.0;
+
+	/** Straight vertical probe directly above player, looking for the first ceiling-attachable
+	 * position within MAX_CEILING_VANTAGE_HEIGHT blocks - unlike attachableColumn's own layered relax
+	 * search (built for "the ceiling is roughly near this same Y already", a handful of fixed
+	 * offsets), this checks every block in between, since the whole point here is finding out how far
+	 * up the actual ceiling is, not just confirming one exists somewhere nearby. Not flood-verified
+	 * reachable from the wendigo's own position (same looseness findDarkestAwayFrom already accepts
+	 * for orbit's own fallback) - orbit's stuck/trapped detection already handles a genuinely
+	 * unreachable pick. Returns null if the column is open (no solid ceiling) within range. */
+	public static BlockPos findCeilingVantagePoint(Level level, BlockPos player) {
+		int maxY = (int) Math.min(player.getY() + MAX_CEILING_VANTAGE_HEIGHT, level.getMaxY());
+		for (int y = player.getY() + 1; y <= maxY; y++) {
+			BlockPos candidate = new BlockPos(player.getX(), y, player.getZ());
+			if (isAttachable(level, candidate, Direction.DOWN)) {
+				return candidate;
+			}
+		}
+		return null;
+	}
+
 	private static WaveSpotScan findAttachableSpots(Level level, BlockPos origin, int count, Direction normal) {
+		return findAttachableSpots(level, origin, count, normal, null);
+	}
+
+	/** explicitStart, when given, is used as the flood's own starting point INSTEAD of
+	 * attachableColumn(origin, normal) - see findCeilingSpots' own comment for why a ceiling flood
+	 * needs this (a valid start point found somewhere other than directly at origin's own (x,z)).
+	 * Distance thresholds (spot_a..spot_f's own progressive unlock distances) are still measured
+	 * from origin regardless - only WHERE the flood begins exploring from changes, not what "how far
+	 * from the player" means for an accepted spot. */
+	private static WaveSpotScan findAttachableSpots(Level level, BlockPos origin, int count, Direction normal, BlockPos explicitStart) {
 		List<WaveSpot> spots = new ArrayList<>();
 		List<WaveSpot> torchSpawnCandidates = new ArrayList<>();
-		BlockPos start = attachableColumn(level, origin, normal);
+		BlockPos start = explicitStart != null ? explicitStart : attachableColumn(level, origin, normal);
 		if (start == null) {
 			return new WaveSpotScan(spots, torchSpawnCandidates);
 		}

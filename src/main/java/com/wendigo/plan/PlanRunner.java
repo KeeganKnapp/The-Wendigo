@@ -10,6 +10,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -23,6 +24,8 @@ import com.wendigo.WendigoMod;
 import com.wendigo.debug.WendigoDebug;
 import com.wendigo.entity.WendigoEntity;
 import com.wendigo.sound.WendigoSounds;
+import com.wendigo.spatial.CaveScaleScanner;
+import com.wendigo.spatial.CaveScaleScanner.CaveScale;
 import com.wendigo.spatial.DarkSpotScanner;
 import com.wendigo.spatial.LightSourceScanner;
 
@@ -120,6 +123,45 @@ public class PlanRunner {
 	private int noProgressCheckTicks;
 	private static final int STUCK_NO_PROGRESS_TICKS = 40; // ~2s
 	private static final double STUCK_NO_PROGRESS_DISTANCE_SQR = 0.25; // net displacement under ~0.5 blocks
+	// --- Orbit (no active plan) state ---------------------------------------------------------
+	// See startOrbit/tickOrbit. Mutually exclusive with an active plan - start() always clears
+	// orbiting, startOrbit always clears any in-flight plan state - never concurrent.
+	private boolean orbiting;
+	private boolean orbitTargetLost;
+	private int orbitRecheckTicks;
+	private static final int ORBIT_RECHECK_INTERVAL_TICKS = 20; // ~1s
+	// See updateOrbitAmbient - "occasional" ambient noise while orbiting, independent of the
+	// movement-recheck cadence above (this needs to keep firing on a real-time cadence even on ticks
+	// tickOrbit returns early from, e.g. target briefly null). Tune by feel like everything else here.
+	private int nextOrbitAmbientTick;
+	private static final int ORBIT_AMBIENT_MIN_TICKS = 400; // 20s
+	private static final int ORBIT_AMBIENT_MAX_TICKS = 1200; // 60s
+	// Same windowed snapshot-and-compare technique as isMakingNoProgress above, just tracked over a
+	// much longer fuse and only while actively navigating toward a waypoint (holding position
+	// in-band would otherwise also look "stuck" under a naive displacement check) - orbit isn't
+	// ending an action the instant one window comes up short, it's deciding whether to give up on
+	// the current waypoint attempt entirely and let WendigoManager teleport-relocate instead.
+	private Vec3 orbitStuckCheckPosition;
+	private int orbitStuckCheckTicks;
+	private int orbitStuckWindowsFailed;
+	private static final int ORBIT_STUCK_WINDOW_TICKS = 40; // ~2s per window
+	private static final double ORBIT_STUCK_DISTANCE_SQR = 0.25;
+	private static final int ORBIT_TRAPPED_WINDOWS = 5; // ~10s total across failed windows
+	// See startReturnToOrbit/isReturningToOrbit/tickReturnToOrbit - the post-grab "walk to a fresh
+	// spot before resuming orbit" transition.
+	private boolean returningToOrbit;
+	private ServerPlayer returnToOrbitTarget;
+	// See startWithApproach/isApproachingEngageSpot/tickApproachEngageSpot - the pre-plan "walk to
+	// the chosen engage spot first" transition. pending* just parks start()'s own arguments until
+	// arrival.
+	private boolean approachingEngageSpot;
+	private JsonObject pendingPlan;
+	private List<BlockPos> pendingDespawnCandidates;
+	private List<BlockPos> pendingAllSpots;
+	private int pendingSeverityPercent;
+	private boolean pendingTierGatingBypassed;
+	private CaveScale pendingCaveScale;
+	private List<BlockPos> pendingTorchSpotPerLabel;
 	// combat.chase bookkeeping - see isChaseResolved/maybeDestroyNearbyTorches.
 	private int chaseUnreachableTicks;
 	private static final int CHASE_GIVE_UP_TICKS = 100; // ~5s of sustained unreachability
@@ -170,6 +212,12 @@ public class PlanRunner {
 	// separate flag, a bypassed wavetest plan's control.despawn would get incorrectly redirected to
 	// movement.retreat_with_fallback instead of actually vanishing.
 	private boolean tierGatingBypassed;
+	// This wave's cave scale and per-label torch-spot pairing (see WaveContext.torchSpotForLabel) -
+	// both threaded through start/startWithApproach the same way severityPercent already is, purely
+	// for movement.approach_spot's teleport-unlock gating (see its own handling in startAction/
+	// isActionDone). CaveScale.NORMAL/List.of() for debug/hand-authored plans with no real WaveContext.
+	private CaveScale caveScale = CaveScale.NORMAL;
+	private List<BlockPos> torchSpotPerLabel = List.of();
 
 	// Outcome bookkeeping purely for EncounterHistory (see WendigoManager) - what actually happened
 	// this wave, so the next request can tell the model rather than it re-deriving from a static
@@ -190,10 +238,18 @@ public class PlanRunner {
 	 * before signaling completion via {@link #isWaveComplete()} - the caller (WendigoManager) polls
 	 * that to know when it's safe to remove the entity.
 	 */
-	public void start(JsonObject fullPlan, List<BlockPos> despawnCandidates, List<BlockPos> allSpots, int severityPercent, boolean tierGatingBypassed) {
+	public void start(JsonObject fullPlan, List<BlockPos> despawnCandidates, List<BlockPos> allSpots, int severityPercent,
+			boolean tierGatingBypassed, CaveScale caveScale, List<BlockPos> torchSpotPerLabel) {
+		// Generalizes overrideIntoChaseUntilLight's existing "interrupt whatever's currently running,
+		// reuse the same still-alive entity" idiom to also interrupt orbit, not just an already-active
+		// plan - the one line that lets WendigoManager start a plan on an orbiting entity the exact
+		// same way it already restarts one on a mid-plan entity.
+		this.orbiting = false;
 		this.self.getNavigation().stop();
 		this.self.setNavigationFailed(false);
 		this.self.setSeverityPercent(severityPercent);
+		this.caveScale = caveScale;
+		this.torchSpotPerLabel = torchSpotPerLabel;
 		this.topLevelSteps = fullPlan.getAsJsonArray("plan");
 		this.topIndex = 0;
 		this.severityPercent = severityPercent;
@@ -222,6 +278,121 @@ public class PlanRunner {
 		this.currentDespawnTarget = null;
 		this.allSpots = allSpots;
 		this.waveComplete = false;
+	}
+
+	/** Enters orbit mode: no active plan, just holding roughly SemanticBands.ORBIT_MIN_DISTANCE to
+	 * ORBIT_MAX_DISTANCE from target, dark-pathing only (see tickOrbit). Clears any in-flight plan
+	 * state the same way start() clears orbiting - the two are mutually exclusive. */
+	public void startOrbit(ServerPlayer target) {
+		this.self.getNavigation().stop();
+		this.self.setNavigationFailed(false);
+		this.self.setLockedTarget(target);
+		this.topLevelSteps = null;
+		this.currentAction = null;
+		this.actionQueue.clear();
+		this.activeWhile = null;
+		this.orbiting = true;
+		this.orbitTargetLost = false;
+		this.orbitRecheckTicks = 0;
+		this.orbitStuckCheckPosition = null;
+		this.orbitStuckCheckTicks = 0;
+		this.orbitStuckWindowsFailed = 0;
+		this.nextOrbitAmbientTick = this.self.tickCount + rollOrbitAmbientDelay();
+	}
+
+	public boolean isOrbiting() {
+		return this.orbiting;
+	}
+
+	/** One-shot: walk to destination, then enter orbit around target once arrived (or once giving up
+	 * - stuck/unreachable - orbit's own waypoint-picking sorts out a better position from there
+	 * regardless, no need for this transitional walk to be perfect). This is the "grab landed a hit"
+	 * case's second phase - a plan that never landed a hit just calls startOrbit directly instead,
+	 * since it's already sitting somewhere dark via its own despawn-move fallback chain. Deliberately
+	 * NOT modeled as a synthetic plan/action (unlike internal.despawn_move) - this never touches the
+	 * LLM-facing schema at all, so a small dedicated sub-state (mirroring startOrbit/tickOrbit's own
+	 * shape) is simpler than wiring a new action type through the whole plan machinery for a purely
+	 * engine-internal transition. */
+	public void startReturnToOrbit(BlockPos destination, ServerPlayer target) {
+		this.orbiting = false;
+		this.topLevelSteps = null;
+		this.currentAction = null;
+		this.actionQueue.clear();
+		this.activeWhile = null;
+		this.self.getNavigation().stop();
+		this.self.setNavigationFailed(false);
+		this.self.setLightTolerantPathing(false);
+		this.returningToOrbit = true;
+		this.returnToOrbitTarget = target;
+		this.self.getNavigation().moveTo(destination.getX() + 0.5, destination.getY(), destination.getZ() + 0.5,
+			SemanticBands.speedMultiplier("normal"));
+	}
+
+	/** True while mid-transit toward a post-grab return-to-orbit destination (see
+	 * startReturnToOrbit) - WendigoManager treats this the same as isOrbiting() for dispatch
+	 * purposes (not mid-plan), but doesn't apply orbit's own target-lost/trapped/re-engage-trigger
+	 * checks to it - this is a short, self-contained transition PlanRunner resolves on its own via
+	 * tickReturnToOrbit, not a steady state to supervise. */
+	public boolean isReturningToOrbit() {
+		return this.returningToOrbit;
+	}
+
+	/** Starts a plan, but first walks to engageSpot if not already close (within
+	 * SemanticBands.ARRIVAL_DISTANCE) - a re-engage from orbit already exists somewhere else in the
+	 * cave, so unlike a brand-new entity's spawn_at (still resolved via a plain teleport at
+	 * construction - see WendigoManager.spawnWave, unchanged), the chosen spot now needs to be
+	 * walked to rather than assumed. If already close, or engageSpot is null (unresolvable),
+	 * skips straight to start() with no detour - no pointless in-place shuffling for a spot the
+	 * entity's already standing at or near. Same lightweight one-shot-sub-state shape as
+	 * startReturnToOrbit, for the same reason (this never touches the LLM-facing schema either). */
+	public void startWithApproach(BlockPos engageSpot, JsonObject fullPlan, List<BlockPos> despawnCandidates,
+			List<BlockPos> allSpots, int severityPercent, boolean tierGatingBypassed,
+			CaveScale caveScale, List<BlockPos> torchSpotPerLabel) {
+		if (engageSpot == null || this.self.blockPosition().distSqr(engageSpot) <= SemanticBands.ARRIVAL_DISTANCE * SemanticBands.ARRIVAL_DISTANCE) {
+			start(fullPlan, despawnCandidates, allSpots, severityPercent, tierGatingBypassed, caveScale, torchSpotPerLabel);
+			return;
+		}
+		this.orbiting = false;
+		this.returningToOrbit = false;
+		this.topLevelSteps = null;
+		this.currentAction = null;
+		this.actionQueue.clear();
+		this.activeWhile = null;
+		this.self.getNavigation().stop();
+		this.self.setNavigationFailed(false);
+		this.self.setLightTolerantPathing(false);
+		this.approachingEngageSpot = true;
+		this.pendingPlan = fullPlan;
+		this.pendingDespawnCandidates = despawnCandidates;
+		this.pendingAllSpots = allSpots;
+		this.pendingSeverityPercent = severityPercent;
+		this.pendingTierGatingBypassed = tierGatingBypassed;
+		this.pendingCaveScale = caveScale;
+		this.pendingTorchSpotPerLabel = torchSpotPerLabel;
+		this.self.getNavigation().moveTo(engageSpot.getX() + 0.5, engageSpot.getY(), engageSpot.getZ() + 0.5,
+			SemanticBands.speedMultiplier("normal"));
+	}
+
+	/** True while mid-transit toward a pending plan's engage spot (see startWithApproach) -
+	 * WendigoManager treats this the same as isOrbiting()/isReturningToOrbit() for dispatch purposes
+	 * (not mid-plan yet). */
+	public boolean isApproachingEngageSpot() {
+		return this.approachingEngageSpot;
+	}
+
+	/** True once tickOrbit couldn't resolve a target at all (Targeting.nearestPlayer returned null -
+	 * the locked target went offline/died/changed level, and no fallback nearest-player exists
+	 * either) - WendigoManager polls this to know when to retreat/despawn/re-search rather than
+	 * orbit around nothing. */
+	public boolean isOrbitTargetLost() {
+		return this.orbitTargetLost;
+	}
+
+	/** True once ORBIT_TRAPPED_WINDOWS consecutive stuck-tracking windows have all shown no real
+	 * progress toward the current waypoint - WendigoManager polls this to know when to give up on
+	 * walking there and teleport-relocate instead (the "despawn when trapped/can't move" case). */
+	public boolean isOrbitTrapped() {
+		return this.orbitStuckWindowsFailed >= ORBIT_TRAPPED_WINDOWS;
 	}
 
 	/** True once the plan body (and any despawn move) has fully finished. */
@@ -258,9 +429,9 @@ public class PlanRunner {
 	 * delegate, called from WendigoManager.tickLevel right before it discards the entity). Not "did
 	 * it reach a specific chosen despawn point" - just two live questions, checked right here, right
 	 * now: is the wendigo standing somewhere dark enough (the same MAX_DARK_LIGHT bar spawning/
-	 * despawning already use), and has the ride gone on long enough for a fair escape chance
-	 * (MIN_RIDE_TICKS - see its own comment for the original bug this guards against: catching the
-	 * player and ending the wave the same tick). Both true -> the despawn damage lands; either false
+	 * despawning already use), and has the ride spent long enough actually in darkness for a fair
+	 * escape chance (hasHadFairRideChance - see its own comment for the original bug this guards
+	 * against: catching the player and ending the wave the same tick). Both true -> the despawn damage lands; either false
 	 * -> the rider is just released. No-ops entirely if nobody's currently a forced rider.
 	 */
 	public void resolveRiderOnEnd() {
@@ -284,6 +455,18 @@ public class PlanRunner {
 	}
 
 	public void tick() {
+		if (this.approachingEngageSpot) {
+			tickApproachEngageSpot();
+			return;
+		}
+		if (this.returningToOrbit) {
+			tickReturnToOrbit();
+			return;
+		}
+		if (this.orbiting) {
+			tickOrbit();
+			return;
+		}
 		if (this.topLevelSteps == null) {
 			return;
 		}
@@ -694,8 +877,27 @@ public class PlanRunner {
 				debugMoveTo(type, started);
 			}
 			case "movement.approach_spot" -> {
-				BlockPos dest = resolveSpotLabel(step.get("spot").getAsString());
+				String label = step.get("spot").getAsString();
+				BlockPos dest = resolveSpotLabel(label);
 				if (dest == null) {
+					// The real spot wasn't found this scan - but if its paired torch-spot exists and
+					// aggression clears the same bar combat.chase itself requires, teleport there and
+					// commit to a chase instead of just giving up (landing somewhere lit is inherently
+					// an ambush - see torchSpotForLabel's own comment). Mutating step's own type in
+					// place (rather than building a separate object) means the caller's currentAction
+					// reference (set to this same step right after startAction returns) correctly
+					// reflects the chase, not the original approach_spot.
+					BlockPos torchSpot = torchSpotForLabel(label);
+					if (torchSpot != null && this.severityPercent >= TierGates.minPercentFor("combat.chase")) {
+						debugSay("issue: unresolvable spot label '" + label + "' but its torch-spot is teleport-eligible at this "
+							+ "aggression - teleporting and forcing a chase");
+						teleportSelf(torchSpot);
+						if (this.self.level() instanceof ServerLevel serverLevel) {
+							WendigoSounds.play(serverLevel, this.self.blockPosition(), WendigoSounds.Type.CHASE);
+						}
+						step.addProperty("type", "internal.chase_until_light");
+						return startAction(step);
+					}
 					WendigoMod.LOGGER.debug("Wendigo {} got an unresolvable spot label for approach_spot - skipping", this.self.getId());
 					debugSay("issue: unresolvable spot label - skipping approach_spot");
 					return false;
@@ -855,6 +1057,9 @@ public class PlanRunner {
 		// wedged in a tight/concave DARK gap (stuckInLight only fires when lit) that's still visibly
 		// jittering/bumping against the obstacle tick to tick without making real progress.
 		boolean noProgress = isPlainMovementType(type) && isMakingNoProgress();
+		if ((stuckInLight || noProgress) && "movement.approach_spot".equals(type) && tryTeleportPastStuckApproachSpot()) {
+			return true; // teleported straight to the destination - a clean arrival, not a failure
+		}
 		if (stuckInLight || noProgress) {
 			debugSay("issue: " + (noProgress ? "wedged, making no real progress" : "stuck motionless in a lit area")
 				+ " during " + type + " - giving up on it");
@@ -958,8 +1163,9 @@ public class PlanRunner {
 		return true; // exhausted every option - give up here, same backstop as before
 	}
 
-	/** True once a caught player has been carried long enough (MIN_RIDE_TICKS) for a fair chance to
-	 * escape - always true when nobody's currently a forced rider. Gates BOTH whether completeWave is
+	/** True once a caught player has been carried in actual darkness long enough (rideFairChanceThreshold,
+	 * randomized per grab - see beginForcedRide) for a fair chance to escape - always true when nobody's
+	 * currently a forced rider. Gates BOTH whether completeWave is
 	 * allowed to deal the despawn-damage killing blow (see its own comment for that original bug) AND,
 	 * separately, whether a despawn attempt is even allowed to be considered "arrived" while carrying a
 	 * rider (see isDespawnAttemptResolved) - without the latter, catching the player right as (or just
@@ -968,7 +1174,7 @@ public class PlanRunner {
 	 * attempt to keep dashing on to further candidates until the ride has run long enough gives a real
 	 * "carried off toward the dark" beat instead. */
 	private boolean hasHadFairRideChance() {
-		return !this.forcingRide || (this.self.tickCount - this.rideStartTick >= MIN_RIDE_TICKS);
+		return !this.forcingRide || this.darknessRideTicks >= this.rideFairChanceThreshold;
 	}
 
 	/** Whether it's OK for a despawn attempt to actually conclude right now - either it's dark
@@ -1163,6 +1369,48 @@ public class PlanRunner {
 		return null;
 	}
 
+	/** The nearby torch-spot paired with this label slot (see WaveContext.torchSpotForLabel, the
+	 * WendigoManager-side twin of this lookup) - independent of whether resolveSpotLabel itself
+	 * returns non-null, which is exactly what lets a label whose own dark spot wasn't found this scan
+	 * still have a teleport substitute. */
+	private BlockPos torchSpotForLabel(String label) {
+		for (int i = 0; i < SPOT_LABELS.length; i++) {
+			if (SPOT_LABELS[i].equals(label) && i < this.torchSpotPerLabel.size()) {
+				return this.torchSpotPerLabel.get(i);
+			}
+		}
+		return null;
+	}
+
+	/** Teleport used by movement.approach_spot's two aggression-gated fallbacks (see its own
+	 * startAction/isActionDone handling) - same snap-and-settle idiom WendigoManager's own
+	 * relocateOrDiscard uses for a trapped-orbit teleport, just entity-local instead of manager-side. */
+	private void teleportSelf(BlockPos destination) {
+		this.self.snapTo(destination.getX() + 0.5, destination.getY(), destination.getZ() + 0.5, this.self.getYRot(), 0f);
+		this.self.syncPoseToSpawnPosition();
+		this.self.nudgeTowardAttachedSurface(Direction.UP);
+	}
+
+	/** isActionDone's movement.approach_spot fallback: a spot that IS in this scan (unlike
+	 * torchSpotForLabel's missing-spot case above) but that pathfinding just can't reach teleports
+	 * straight there instead of giving up, gated by the exact same severity ladder that already
+	 * decides whether the model's allowed to spawn there in the first place
+	 * (SchemaBuilder.isSpawnSpotAllowed - "closer spots unlock as aggression climbs"). Returns false
+	 * (no-op, action still ends as a normal failure) if the label isn't unlocked yet. */
+	private boolean tryTeleportPastStuckApproachSpot() {
+		String label = this.currentAction.get("spot").getAsString();
+		BlockPos dest = resolveSpotLabel(label);
+		if (dest == null || !SchemaBuilder.isSpawnSpotAllowed(label, this.severityPercent, this.caveScale, false)) {
+			return false;
+		}
+		debugSay("issue: wedged approaching '" + label + "' but it's teleport-eligible at this aggression - "
+			+ "teleporting there instead of giving up");
+		teleportSelf(dest);
+		this.self.getNavigation().stop();
+		this.self.setNavigationFailed(false);
+		return true;
+	}
+
 	private void debugSay(String message) {
 		if (this.self.level() instanceof ServerLevel serverLevel) {
 			WendigoDebug.say(serverLevel, message);
@@ -1178,20 +1426,15 @@ public class PlanRunner {
 			+ " onGround=" + this.self.onGround() + " inLiquid=" + this.self.isInLiquid());
 	}
 
-	/** All three cues currently play the same vanilla ambient cave sound - distinct sound design per
-	 * cue (a real jumpscare sting, a "caught" reaction, plain ambience) is future work, but the
-	 * labels are meaningful now so plans can be authored against the final shape already. */
 	private void playAmbientCue(String cue) {
 		if (!(this.self.level() instanceof ServerLevel serverLevel)) {
 			return;
 		}
 		WendigoSounds.Type type = switch (cue) {
-			case "caught" -> WendigoSounds.Type.CAUGHT;
-			case "jumpscare" -> WendigoSounds.Type.JUMPSCARE;
-			// Not offered in the model-facing schema's cue enum - only WendigoManager.
-			// buildDarknessAmbushPlan's hardcoded plan ever uses this value.
-			case "danger" -> WendigoSounds.Type.DANGER;
-			default -> WendigoSounds.Type.AMBIENCE;
+			case "chase" -> WendigoSounds.Type.CHASE;
+			case "flee" -> WendigoSounds.Type.FLEE;
+			case "stare" -> WendigoSounds.Type.STARE;
+			default -> WendigoSounds.Type.AMBIENT; // "ambient"
 		};
 		WendigoSounds.play(serverLevel, this.self.blockPosition(), type);
 		debugSay("sound cue played: " + cue);
@@ -1259,6 +1502,164 @@ public class PlanRunner {
 		return noProgress;
 	}
 
+	/** The internal.orbit primitive's own per-tick logic - see startOrbit for entry and
+	 * isOrbiting/isOrbitTargetLost/isOrbitTrapped for what WendigoManager polls. Re-evaluates roughly
+	 * every ORBIT_RECHECK_INTERVAL_TICKS (not every tick - this doesn't need to be as responsive as
+	 * an actual plan action, and re-picking a waypoint every single tick would fight its own
+	 * in-flight navigation). Always prefers a ceiling vantage point directly above the target when
+	 * one's within reach (DarkSpotScanner.findCeilingVantagePoint, capped at 30 blocks up) over
+	 * merely holding position on the floor - the wendigo is always looking for the high ground, not
+	 * just satisfied once it's some acceptable distance away. Only when no such ceiling exists does
+	 * it fall back to the ordinary horizontal cave-scaled band (SemanticBands.orbitMinDistance/
+	 * orbitMaxDistance - tighter in a small cave, see CaveScaleScanner): moving toward a fresh dark
+	 * waypoint if outside it, holding position otherwise. Uses light-averse pathing
+	 * (setLightTolerantPathing(false), same default every other action already uses) - the existing
+	 * DarknessMalus soft-cost/hard-block-below-40%-severity system already gives "prefer dark routes,
+	 * only cross light when severity allows and there's no better option" for free, no separate
+	 * light-crossing mechanism needed here. */
+	private void tickOrbit() {
+		updateOrbitAmbient();
+		Player target = Targeting.nearestPlayer(this.self);
+		if (target == null) {
+			this.orbitTargetLost = true;
+			return;
+		}
+		if (this.self.getNavigation().isInProgress()) {
+			updateOrbitStuckTracking();
+		} else {
+			this.orbitStuckCheckPosition = null;
+			this.orbitStuckCheckTicks = 0;
+			this.orbitStuckWindowsFailed = 0;
+		}
+		this.orbitRecheckTicks++;
+		if (this.orbitRecheckTicks < ORBIT_RECHECK_INTERVAL_TICKS) {
+			return;
+		}
+		this.orbitRecheckTicks = 0;
+		CaveScale caveScale = CaveScaleScanner.classify(this.self.level(), this.self.blockPosition());
+		double minDistance = SemanticBands.orbitMinDistance(caveScale);
+		double maxDistance = SemanticBands.orbitMaxDistance(caveScale);
+		BlockPos selfPos = this.self.blockPosition();
+		BlockPos targetPos = target.blockPosition();
+		// Always worth checking first, regardless of whether the ordinary horizontal band is
+		// currently satisfied - a vantage point directly overhead is preferred over merely holding
+		// position on the floor. minDistance as a floor (not just MAX_CEILING_VANTAGE_HEIGHT as a
+		// ceiling) keeps this from ever fighting checkOrbitTooClose - a ceiling low enough to be
+		// closer than that would just get the orbit immediately knocked back out by that check the
+		// very next tick.
+		BlockPos ceilingVantage = DarkSpotScanner.findCeilingVantagePoint(this.self.level(), targetPos);
+		if (ceilingVantage != null && Math.sqrt(ceilingVantage.distSqr(targetPos)) >= minDistance) {
+			if (Math.sqrt(selfPos.distSqr(ceilingVantage)) <= SemanticBands.ARRIVAL_DISTANCE) {
+				this.self.getNavigation().stop();
+				return;
+			}
+			this.self.setLightTolerantPathing(false);
+			this.self.getNavigation().moveTo(ceilingVantage.getX() + 0.5, ceilingVantage.getY(), ceilingVantage.getZ() + 0.5,
+				SemanticBands.speedMultiplier("normal"));
+			return;
+		}
+		double distance = this.self.distanceTo(target);
+		if (distance >= minDistance && distance <= maxDistance) {
+			this.self.getNavigation().stop();
+			return;
+		}
+		this.self.setLightTolerantPathing(false);
+		BlockPos waypoint = DarkSpotScanner.findOrbitWaypoint(this.self.level(), selfPos, targetPos, minDistance, maxDistance);
+		if (waypoint == null) {
+			// Nothing in-band and flood-reachable from here - fall back to simply heading somewhere
+			// dark and away from the target rather than standing still with no destination at all.
+			waypoint = DarkSpotScanner.findDarkestAwayFrom(this.self.level(), selfPos, maxDistance, targetPos);
+		}
+		if (waypoint != null) {
+			this.self.getNavigation().moveTo(waypoint.getX() + 0.5, waypoint.getY(), waypoint.getZ() + 0.5,
+				SemanticBands.speedMultiplier("normal"));
+		}
+	}
+
+	/** "Occasional" ambient noise while orbiting - a wendigo with no active plan otherwise never makes
+	 * a sound at all between spawning and its next real engagement, which could be minutes. Rolled
+	 * once per play (same roll-then-reschedule pattern as beginForcedRide's escape threshold), not on
+	 * a fixed interval, so it doesn't read as a metronome. */
+	private void updateOrbitAmbient() {
+		if (this.self.tickCount < this.nextOrbitAmbientTick) {
+			return;
+		}
+		if (this.self.level() instanceof ServerLevel serverLevel) {
+			WendigoSounds.play(serverLevel, this.self.blockPosition(), WendigoSounds.Type.AMBIENT);
+		}
+		this.nextOrbitAmbientTick = this.self.tickCount + rollOrbitAmbientDelay();
+	}
+
+	private int rollOrbitAmbientDelay() {
+		return ORBIT_AMBIENT_MIN_TICKS + this.self.getRandom().nextInt(ORBIT_AMBIENT_MAX_TICKS - ORBIT_AMBIENT_MIN_TICKS + 1);
+	}
+
+	/** Same windowed snapshot-and-compare technique as isMakingNoProgress, just accumulated across
+	 * multiple failed windows (see ORBIT_TRAPPED_WINDOWS) rather than acting on the first one -
+	 * orbit isn't ending an action the instant one window comes up short, it's deciding whether to
+	 * give up on the current waypoint attempt entirely. Only called while a waypoint move is
+	 * actually in progress (see tickOrbit) - holding position in-band would otherwise also look
+	 * "stuck" under a naive displacement check. */
+	private void updateOrbitStuckTracking() {
+		Vec3 current = this.self.position();
+		if (this.orbitStuckCheckPosition == null) {
+			this.orbitStuckCheckPosition = current;
+			this.orbitStuckCheckTicks = 0;
+			return;
+		}
+		this.orbitStuckCheckTicks++;
+		if (this.orbitStuckCheckTicks < ORBIT_STUCK_WINDOW_TICKS) {
+			return;
+		}
+		boolean noProgress = current.distanceToSqr(this.orbitStuckCheckPosition) < ORBIT_STUCK_DISTANCE_SQR;
+		this.orbitStuckCheckPosition = current;
+		this.orbitStuckCheckTicks = 0;
+		this.orbitStuckWindowsFailed = noProgress ? this.orbitStuckWindowsFailed + 1 : 0;
+	}
+
+	/** See startReturnToOrbit - waits for the one-shot walk there to either arrive or give up
+	 * (unreachable/stuck), then hands off to startOrbit. Deliberately simple (vanilla's own
+	 * isStuck()/isNavigationFailed, not the windowed tracking tickOrbit's own waypoint-following
+	 * uses) since this is a short, one-time transition, not a steady state that needs to resist
+	 * false positives from a long hold. */
+	private void tickReturnToOrbit() {
+		PathNavigation nav = this.self.getNavigation();
+		boolean arrivedOrGaveUp = (nav.isDone() && !nav.isInProgress()) || this.self.isNavigationFailed() || nav.isStuck();
+		if (arrivedOrGaveUp) {
+			ServerPlayer target = this.returnToOrbitTarget;
+			this.returningToOrbit = false;
+			this.returnToOrbitTarget = null;
+			startOrbit(target);
+		}
+	}
+
+	/** See startWithApproach - waits for the walk to the pending engage spot to either arrive or give
+	 * up (unreachable/stuck), then calls the real start() with whatever arguments were parked.
+	 * Deliberately simple (vanilla's own isStuck()/isNavigationFailed, same as tickReturnToOrbit),
+	 * since this is a short, one-time transition, not a steady state needing to resist false
+	 * positives from a long hold. Giving up mid-walk still starts the plan right where the entity
+	 * happens to be - a plan is always better run from somewhere than never run at all. */
+	private void tickApproachEngageSpot() {
+		PathNavigation nav = this.self.getNavigation();
+		boolean arrivedOrGaveUp = (nav.isDone() && !nav.isInProgress()) || this.self.isNavigationFailed() || nav.isStuck();
+		if (arrivedOrGaveUp) {
+			this.approachingEngageSpot = false;
+			JsonObject plan = this.pendingPlan;
+			List<BlockPos> despawnCandidates = this.pendingDespawnCandidates;
+			List<BlockPos> allSpots = this.pendingAllSpots;
+			int severityPercent = this.pendingSeverityPercent;
+			boolean tierGatingBypassed = this.pendingTierGatingBypassed;
+			CaveScale caveScale = this.pendingCaveScale;
+			List<BlockPos> torchSpotPerLabel = this.pendingTorchSpotPerLabel;
+			this.pendingPlan = null;
+			this.pendingDespawnCandidates = null;
+			this.pendingAllSpots = null;
+			this.pendingCaveScale = null;
+			this.pendingTorchSpotPerLabel = null;
+			start(plan, despawnCandidates, allSpots, severityPercent, tierGatingBypassed, caveScale, torchSpotPerLabel);
+		}
+	}
+
 	private boolean arrivedNearPlayer() {
 		Player player = Targeting.nearestPlayer(this.self);
 		return player != null && this.self.distanceTo(player) <= SemanticBands.ARRIVAL_DISTANCE;
@@ -1301,16 +1702,34 @@ public class PlanRunner {
 	// still forcing the ride - see completeWave.
 	private static final float FORCED_RIDE_DESPAWN_DAMAGE = 20.0F;
 	private static final String RIDE_ESCAPE_HINT = "Spam SHIFT to break free!";
-	// Minimum real time a forced ride has to run before completeWave is allowed to deal the despawn
-	// damage - see completeWave's own comment for the real bug this guards against (catching the
-	// player and completing the wave the same tick, e.g. when combat.chase is the last plan step and
-	// the wendigo is already standing at a despawn candidate the instant it catches them).
-	private static final int MIN_RIDE_TICKS = 100; // 5s
+	// Roll bounds (per-grab, see beginForcedRide) for how long the wendigo has to have actually been
+	// standing in darkness (not just "since the ride started" - see darknessRideTicks) before
+	// completeWave/resolveRiderOnEnd is allowed to deal the despawn damage - see their own comments
+	// for the real bug this originally guarded against (catching the player and completing the wave
+	// the same tick). Randomized rather than a flat duration so the exact moment isn't predictable.
+	private static final int RIDE_FAIR_CHANCE_TICKS_MIN = 60; // 3s
+	private static final int RIDE_FAIR_CHANCE_TICKS_MAX = 140; // 7s
 
 	private boolean forcingRide;
 	private int rideEscapeAttempts;
 	private int rideEscapeThreshold;
-	private int rideStartTick;
+	// Rolled once per grab (see beginForcedRide) - hasHadFairRideChance's own threshold, replacing a
+	// flat MIN_RIDE_TICKS.
+	private int rideFairChanceThreshold;
+	// Cumulative ticks spent in darkness (currentLight() <= DarkSpotScanner.MAX_DARK_LIGHT) while
+	// forcingRide is true - reset in beginForcedRide, incremented in updateForcedRide regardless of
+	// whether the rider is currently mounted or momentarily off getting force-remounted. Measures
+	// "how long has this actually been a fair, in-the-dark hold" rather than raw elapsed ride time,
+	// which could otherwise be satisfied entirely by time spent walking through light on the way to
+	// a dark spot.
+	private int darknessRideTicks;
+	// Set the instant updateForcedRide's own dismount-threshold path releases a rider (a genuine
+	// "spammed shift enough times" escape, as opposed to completeWave's resolveRiderOnEnd path) -
+	// see WendigoManager.checkUnconditionalGrab, which must not immediately re-grab someone who just
+	// escaped while they're still standing right next to the wendigo (they haven't gone anywhere -
+	// only dismounted), or the escape would be undone the very next tick, forever. Consumed (read and
+	// cleared) via consumeFreshEscape rather than polled, so a tick where nobody checks it can't lose it.
+	private boolean freshEscape;
 	// Who's actually being carried - getFirstPassenger() goes empty the instant they dismount, so a
 	// separate reference is needed to know who to force back on.
 	private Player ridingPlayer;
@@ -1321,6 +1740,15 @@ public class PlanRunner {
 	 * and re-rolling a fresh escape/grace-period pair every time it happens). */
 	public boolean isForcingRide() {
 		return this.forcingRide;
+	}
+
+	/** Reads and clears freshEscape in one step - see its own field comment. WendigoManager calls
+	 * this once per tick from checkUnconditionalGrab to know whether a grace period (no re-grab
+	 * until the target has put actual distance between themselves and the wendigo) needs to start. */
+	public boolean consumeFreshEscape() {
+		boolean result = this.freshEscape;
+		this.freshEscape = false;
+		return result;
 	}
 
 	/**
@@ -1334,15 +1762,36 @@ public class PlanRunner {
 	private void beginForcedRide(Player player) {
 		this.forcingRide = true;
 		this.ridingPlayer = player;
-		this.rideStartTick = this.self.tickCount;
 		this.rideEscapeAttempts = 0;
 		int ceiling = RIDE_ESCAPE_ATTEMPTS_MIN
 			+ (int) Math.round((RIDE_ESCAPE_ATTEMPTS_MAX - RIDE_ESCAPE_ATTEMPTS_MIN) * (Math.clamp(this.severityPercent, 0, 100) / 100.0));
 		this.rideEscapeThreshold = RIDE_ESCAPE_ATTEMPTS_MIN + this.self.getRandom().nextInt(ceiling - RIDE_ESCAPE_ATTEMPTS_MIN + 1);
+		this.rideFairChanceThreshold = RIDE_FAIR_CHANCE_TICKS_MIN
+			+ this.self.getRandom().nextInt(RIDE_FAIR_CHANCE_TICKS_MAX - RIDE_FAIR_CHANCE_TICKS_MIN + 1);
+		this.darknessRideTicks = 0;
 		player.startRiding(this.self, true, true);
 		applyRideBlindness(player);
 		sendRideEscapeHint(player);
 		debugSay("picked up the player - forcing a ride (escapes after " + this.rideEscapeThreshold + " dismount attempt(s))");
+	}
+
+	/** WendigoManager's own grab_distance override (checked every tick regardless of current state -
+	 * orbiting or mid-plan, doesn't matter) - unconditionally catches player, bypassing every
+	 * precondition a normal combat.lunge_attack/combat.chase catch would have (the nearby-safe-
+	 * retreat check, travel-to-range requirement, tier gating): the user asked for this to fire "no
+	 * matter what" the instant the target is close enough, not something skippable the way an
+	 * ordinary lunge's own preconditions would make it. No-ops if already forcing a ride (see
+	 * beginForcedRide's own precondition, documented on isForcingRide). Sets hitLanded directly
+	 * since this bypasses isLungeResolved/isChaseResolved/isChaseUntilLightResolved, the only other
+	 * places that normally set it - without this, the grab-aware two-phase return-to-orbit
+	 * (WendigoManager checks outcome().hitLanded()) would wrongly treat this as a clean, no-grab
+	 * completion once the flee that follows finishes. */
+	public void forceGrabNow(ServerPlayer target) {
+		if (this.forcingRide) {
+			return;
+		}
+		beginForcedRide(target);
+		this.hitLanded = true;
 	}
 
 	/**
@@ -1361,6 +1810,9 @@ public class PlanRunner {
 			this.forcingRide = false;
 			return;
 		}
+		if (currentLight() <= DarkSpotScanner.MAX_DARK_LIGHT) {
+			this.darknessRideTicks++;
+		}
 		if (this.ridingPlayer.getVehicle() == this.self) {
 			// Still aboard - keep the blindness topped up (short duration, reapplied every tick, so it
 			// can never outlast the ride if something ends it uncleanly).
@@ -1371,6 +1823,7 @@ public class PlanRunner {
 		if (this.rideEscapeAttempts >= this.rideEscapeThreshold) {
 			debugSay("player escaped the forced ride after " + this.rideEscapeAttempts + " dismount attempt(s)");
 			this.forcingRide = false;
+			this.freshEscape = true;
 			this.ridingPlayer.removeEffect(MobEffects.BLINDNESS);
 			return;
 		}

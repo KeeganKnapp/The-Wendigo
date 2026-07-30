@@ -2,6 +2,7 @@ package com.wendigo.plan;
 
 import java.util.List;
 
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 
 import com.wendigo.entity.WendigoEntity;
@@ -13,7 +14,17 @@ final class Targeting {
 	private Targeting() {
 	}
 
+	/** WendigoEntity.getLockedTarget() (see its own field comment) wins over a plain nearest-player
+	 * lookup whenever it's set and still valid (alive, same level) - this is the single point that
+	 * makes orbit (and, by extension, everything PlanRunner does once a plan starts from orbit)
+	 * commit to whichever player/group it's already locked onto instead of drifting toward whoever
+	 * is physically closest at any given moment. Every existing distance/movement call site already
+	 * goes through this method, so locking behavior falls out for free with no other changes. */
 	static Player nearestPlayer(WendigoEntity self) {
+		ServerPlayer locked = self.getLockedTarget();
+		if (locked != null && locked.isAlive() && locked.level() == self.level()) {
+			return locked;
+		}
 		return self.level().getNearestPlayer(self, SemanticBands.NEAREST_PLAYER_RADIUS);
 	}
 

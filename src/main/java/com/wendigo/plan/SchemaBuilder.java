@@ -154,8 +154,8 @@ public final class SchemaBuilder {
 
 	/** Narrower than a whole-action-type removal - sound.ambient_cue itself may already be gone
 	 * (below its own 20% action-type gate, in which case there's nothing left to narrow here), but
-	 * once it's available, "jumpscare"/"caught" still shouldn't be selectable before their own
-	 * higher thresholds. */
+	 * once it's available, "chase" still shouldn't be selectable before its own higher threshold
+	 * (see TierGates.minPercentForCue). */
 	private static void filterSoundCue(JsonObject defs, int severityPercent) {
 		if (!defs.has("sound_ambient_cue")) {
 			return;

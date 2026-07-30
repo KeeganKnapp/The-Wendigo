@@ -26,6 +26,7 @@ import com.wendigo.WendigoMod;
 import com.wendigo.debug.WendigoDebug;
 import com.wendigo.entity.ModEntities;
 import com.wendigo.entity.WendigoEntity;
+import com.wendigo.plan.ProximityBands;
 import com.wendigo.plan.SchemaBuilder;
 import com.wendigo.sound.WendigoSounds;
 import com.wendigo.spatial.CaveScaleScanner;
@@ -47,11 +48,15 @@ public final class WendigoManager {
 	// all) and lets each stage's guidance be much more specific than fitting all five into one
 	// combined tier table ever allowed.
 	private static final String SYSTEM_PROMPT_GENERIC =
-		"You control a wendigo, a shadow-dwelling stalker creature in Minecraft. You are given a "
+		"You control a wendigo, a shadow-dwelling stalker creature in Minecraft. It's a persistent "
+		+ "presence, not something that spawns fresh every time - usually it's already nearby, "
+		+ "quietly keeping its distance, before you're ever asked for a plan. You are given a "
 		+ "target player, their dweller severity, and a handful of scanned dark spots near them "
 		+ "labeled spot_a through spot_f (nearest to furthest, or fewer if that's all that was "
-		+ "found). Choose which spot to spawn at, a short plan (1-6 steps) of actions/predicates "
-		+ "to run once spawned, and which spot to despawn at once the plan finishes."
+		+ "found). Choose which spot to position at (spawn_at - walked to if it's not already close, "
+		+ "or where it first appears for a genuine fresh encounter) and a short plan (1-6 steps) of "
+		+ "actions/predicates to run from there. Where it withdraws to afterward is not your choice - "
+		+ "the engine always picks the best hiding spot automatically."
 		+ "Each spot also lists a nearby dim-spot count - the number of edge-of-light positions "
 		+ "reachable from it (not fully dark, not fully lit). A spot with several dim spots supports "
 		+ "creeping to the edge of the light to observe (movement.approach_dim_spot); a spot with "
@@ -95,15 +100,17 @@ public final class WendigoManager {
 		+ "that doesn't really exist here. Below 80% severity treat it as an ordinary spawn location choice "
 		+ "like any other - no obligation to immediately chase, plan it however the moment calls for. At "
 		+ "80%+ it means something different: choosing it there is a commitment to a direct hunt, and the "
-		+ "plan needs to follow through on that (danger cue, straight into combat.chase) since there's "
+		+ "plan needs to follow through on that (sound.ambient_cue(chase), straight into combat.chase) since there's "
 		+ "nothing subtle left to do once spawning fully exposed at that range. Never pick it as a "
 		+ "substitute for a genuine dark spot when one's actually available and would fit the moment better. "
-		+ "control.despawn ends the wave by vanishing right where the wendigo stands, instead of "
-		+ "walking to a despawn point - the engine only allows this below 20% severity (or when nothing "
-		+ "else is configured to fall back on) since vanishing suddenly reads as jarring once the "
-		+ "wendigo is established enough to be more than a faint presence; a control.despawn attempted "
-		+ "above that gets automatically redirected into a real flee instead, so don't rely on it for "
-		+ "the ending of a higher-severity plan - use movement.retreat_with_fallback there directly. "
+		+ "control.despawn ends this engagement by vanishing right where the wendigo stands, instead of "
+		+ "walking to a hiding spot first - it still retreats into darkness afterward and keeps watching "
+		+ "from a distance either way, this only changes whether that withdrawal is instant or a visible "
+		+ "walk. The engine only allows the instant version below 20% severity (or when nothing else is "
+		+ "configured to fall back on) since vanishing suddenly reads as jarring once the wendigo is "
+		+ "established enough to be more than a faint presence; a control.despawn attempted above that "
+		+ "gets automatically redirected into a real flee instead, so don't rely on it for the ending of "
+		+ "a higher-severity plan - use movement.retreat_with_fallback there directly. "
 		+ "IMPORTANT - steps do not wait for anything on their own: only control.while (and "
 		+ "timing.wait/movement while it's still resolving) actually consumes time. Every other kind "
 		+ "of step, including posture.stare, runs and then immediately falls through to whatever comes "
@@ -176,31 +183,32 @@ public final class WendigoManager {
 		+ "torch that's right there is worth snuffing out on the way (combat.break_torch just unlocked "
 		+ "this stage - no further threshold above this one, so use it whenever a spot's torch count is "
 		+ "high, every wave that offers the chance, not as an occasional flourish). "
-		+ "sound.ambient_cue(ambience) can accompany the stalking for a low, unplaced presence cue. "
+		+ "sound.ambient_cue(ambient) can accompany the stalking for a low, unplaced presence cue. "
 		+ "movement.retreat_with_fallback (a real, visible flight into darkness) is now available as an "
 		+ "alternative ending to control.despawn (still allowed below 20%, but redirected to a flee "
-		+ "above it) - withdrawing into the dark reads better than vanishing once it's been this bold. "
-		+ "Example: spawn near a light source, combat.break_torch, movement.retreat_with_fallback "
-		+ "before despawning.";
+		+ "above it) - withdrawing into the dark reads better than vanishing once it's been this bold, and "
+		+ "sound.ambient_cue(flee) right beforehand is heavily encouraged to announce the withdrawal. "
+		+ "Example: spawn near a light source, combat.break_torch, sound.ambient_cue(flee), "
+		+ "movement.retreat_with_fallback before despawning.";
 
 	private static final String STAGE_40_59 =
 		"CURRENT STAGE: 40-59%, prey-driven and starting to plan. The wendigo has stopped just "
 		+ "reacting to the player's presence and started treating them as something to be hunted "
 		+ "deliberately - this is the first stage where it sets real traps instead of just observing. "
 		+ "memory.store_dark_location is available for remembering a fallback retreat point before "
-		+ "committing to something riskier. A good trap shape: approach one of a spot's dim spots, then "
+		+ "committing to something riskier. A good trap shape: approach one of a spot's dim spots, "
+		+ "posture.stare(enabled=true) (sound.ambient_cue(stare) is heavily encouraged right here), then "
 		+ "control.while(predicate.player_distance farther_than lunge_distance) to bait them closer "
-		+ "before deciding whether to press on or pull back - sound.ambient_cue(caught) fits the "
-		+ "moment predicate.player_looking_at_self flips true at dead_stare mid-trap. combat.break_torch "
+		+ "before deciding whether to press on or pull back. combat.break_torch "
 		+ "remains a strong opener wherever torch count is high. Example: spawn at a spot with dim "
 		+ "spots, approach one, bait-and-decide via a lunge_distance while loop, retreat or press on "
 		+ "based on how it resolves.";
 
 	private static final String STAGE_60_79 =
 		"CURRENT STAGE: 60-79%, openly aggressive. Subtlety is mostly gone - the wendigo commits now. "
-		+ "combat.lunge_attack (catching the player grabs them - see its own description) and "
-		+ "sound.ambient_cue(jumpscare) are both "
-		+ "available; pair a jumpscare cue with a lunge for the reveal rather than always retreating "
+		+ "combat.lunge_attack (catching the player grabs them - see its own description) is available, "
+		+ "and sound.ambient_cue(chase) unlocks alongside it - pair the two for the reveal (heavily "
+		+ "encouraged right before the lunge) rather than always retreating "
 		+ "the moment the player closes in. combat.chase is not available yet - it's reserved for 80%+ "
 		+ "(see next stage), so a lunge is still the sole point of contact here. What does change within "
 		+ "this stage: how far from real darkness it's willing to commit to that lunge keeps widening as "
@@ -212,8 +220,8 @@ public final class WendigoManager {
 		+ "reveal moment first. A reliable way to guarantee the transition happens the instant it's "
 		+ "spotted, regardless of what step the plan was on: a global_rule with condition "
 		+ "predicate.player_looking_at_self at whichever band fits and action combat.lunge_attack. "
-		+ "Example: stalk while undetected, combat.lunge_attack once close, movement.retreat_with_fallback "
-		+ "afterward.";
+		+ "Example: stalk while undetected, sound.ambient_cue(chase), combat.lunge_attack once close, "
+		+ "sound.ambient_cue(flee), movement.retreat_with_fallback afterward.";
 
 	private static final String STAGE_80_PLUS =
 		"CURRENT STAGE: 80% and up, restless. The wendigo is done pretending to be subtle - it wants "
@@ -278,9 +286,50 @@ public final class WendigoManager {
 	// this tolerance is generous; it's a backstop against a genuinely stuck state, not a normal-play trigger.
 	private static final double EXTREME_PROXIMITY_DISTANCE = 2.0;
 	private static final int EXTREME_PROXIMITY_GIVEUP_TICKS = 400; // 20s sustained
+	// Kept in sync by hand with SemanticBands.orbitMinDistance/orbitMaxDistance (com.wendigo.plan,
+	// package-private there) - same tradeoff already accepted elsewhere in this codebase (see
+	// DarkSpotScanner's own DIM_LIGHT_MIN/MAX comment) rather than widening that class's visibility
+	// just for this.
+	private static double orbitMinDistance(CaveScale caveScale) {
+		return switch (caveScale) {
+			case TIGHT -> 12.0;
+			case MASSIVE -> 28.0;
+			default -> 20.0; // NORMAL
+		};
+	}
+
+	private static double orbitMaxDistance(CaveScale caveScale) {
+		return switch (caveScale) {
+			case TIGHT -> 18.0;
+			case MASSIVE -> 40.0;
+			default -> 30.0; // NORMAL
+		};
+	}
+
+	// Flat performance cap on how far an orbiting wendigo is allowed to be from its target before
+	// just despawning outright instead of continuing to tick/pathfind toward it from very far away -
+	// see tickOrbitingEntity. Comfortably beyond MASSIVE's own 40-block max orbit distance so it never
+	// fights ordinary orbiting, well inside NEAREST_PLAYER_RADIUS (64, SemanticBands).
+	private static final double ORBIT_DESPAWN_DISTANCE = 48.0;
+	// Throttles tryEnterOrbit's own dark-spot search while entity == null - see WaveState.nextRespawnSearchTick.
+	private static final int ORBIT_SPAWN_SEARCH_INTERVAL_TICKS = 20; // ~1s
 
 	private void tickLevel(ServerLevel level, WaveState state) {
 		int now = level.getServer().getTickCount();
+
+		// Unconditional grab_distance override - checked before either dispatch branch below, since
+		// it needs to interrupt orbiting OR mid-plan alike. If it fires, state.entity's own orbiting/
+		// mid-plan status has already changed by the time the checks below run, so they naturally
+		// pick up the right branch for whatever just started.
+		if (state.entity != null && state.entity.isAlive()) {
+			checkUnconditionalGrab(level, state, now);
+		}
+
+		if (state.entity != null && state.entity.isAlive()
+				&& (state.entity.isOrbiting() || state.entity.isReturningToOrbit() || state.entity.isApproachingEngageSpot())) {
+			tickOrbitingEntity(level, state, now);
+			return;
+		}
 
 		if (state.entity != null) {
 			String forcedEndReason = checkForcedWaveEnd(state, now);
@@ -295,10 +344,10 @@ public final class WendigoManager {
 					state.entity.resolveRiderOnEnd();
 					WendigoDebug.say(level, "wave force-ended (" + forcedEndReason + ") after " + elapsedTicks
 						+ " ticks at " + state.entity.blockPosition().toShortString()
-						+ " - discarding wherever it ended up - outcome: " + state.entity.getOutcome());
+						+ " - relocating back into orbit - outcome: " + state.entity.getOutcome());
 				} else {
 					WendigoDebug.say(level, "wave complete after " + elapsedTicks + " ticks at "
-						+ state.entity.blockPosition().toShortString() + " - despawning - outcome: " + state.entity.getOutcome());
+						+ state.entity.blockPosition().toShortString() + " - returning to orbit - outcome: " + state.entity.getOutcome());
 				}
 				// Debug-forced waves (wave/wavetest) never update real encounter history - a showcase
 				// or a debug-triggered test run shouldn't be told back to the model as if it were a
@@ -308,11 +357,6 @@ public final class WendigoManager {
 				}
 				int severityPercent = state.context != null && state.context.severityCap() > 0
 					? 100 * state.context.severity() / state.context.severityCap() : 0;
-				if (state.entity.isAlive()) {
-					state.entity.discard();
-				}
-				state.entity = null;
-				state.context = null;
 				// A debug-forced wave (wave/wavetest) shouldn't leave the automatic system primed to
 				// fire a real LLM wave moments later just because the player is still under y=0 -
 				// exactly the condition someone testing would be standing in. That reads as "the
@@ -320,6 +364,34 @@ public final class WendigoManager {
 				// unrelated wendigo from a genuine severity-triggered wave.
 				state.cooldownUntilTick = now + (state.debugForced ? this.config.debugCooldownTicks : this.config.dynamicCooldownTicks(severityPercent));
 				state.debugForced = false;
+				if (!state.entity.isAlive()) {
+					state.entity = null;
+					state.context = null;
+				} else if (forcedEndReason != null) {
+					// "Despawn when trapped/can't move" - an explicit teleport-relocation, not the
+					// ordinary walked retreat a clean plan completion already resolves through below.
+					relocateOrDiscard(level, state, now);
+				} else if (state.entity.getOutcome().hitLanded()) {
+					// A grab landed this encounter - the drop already happened at the despawn spot
+					// PlanRunner's own fallback chain resolved through (the "harm and drop" spot), but
+					// per the user's own two-spot design that location shouldn't double as the resume
+					// point too - walk to a SECOND, distinct dark spot first (see startReturnToOrbit),
+					// only entering orbit once there (or once giving up trying).
+					ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
+					BlockPos returnSpot = findNearbyDarkSpot(level, state.entity.blockPosition(), target);
+					if (returnSpot != null) {
+						state.entity.startReturnToOrbit(returnSpot, target);
+					} else {
+						// Nothing else dark reachable from here either - same "genuinely nowhere to go"
+						// fallback relocateOrDiscard uses, just already having tried the walked option.
+						relocateOrDiscard(level, state, now);
+					}
+				} else {
+					// No grab this encounter - ordinary completion already parked the entity at a good
+					// dark spot via PlanRunner's own despawn-move fallback chain (unchanged), so it can
+					// just resume orbiting from right here, no extra travel needed.
+					state.entity.startOrbit(state.lockedTarget);
+				}
 			} else if (WendigoDebug.anyEnabled() && state.context != null) {
 				if (now % this.config.debugParticleIntervalTicks == 0) {
 					WendigoDebug.showSpots(level, state.context.spots(), state.context.dimSpotsPerSpot());
@@ -331,14 +403,205 @@ public final class WendigoManager {
 			return;
 		}
 
+		tryEnterOrbit(level, state, now);
+	}
+
+	/** Per-tick supervision while state.entity is alive and orbiting (no active plan) - see
+	 * PlanRunner.tickOrbit for the actual movement logic this just watches over. Handles the two
+	 * conditions PlanRunner can detect but can't resolve on its own (needs WendigoManager's own
+	 * dark-spot search/discard authority): a fully lost target (see clarification: treated the same
+	 * as nowhere-dark-to-go, not held in place) and being genuinely stuck trying to reach a waypoint.
+	 * Once orbit itself is confirmed healthy, checks whether it's time to start a new plan - the
+	 * exact same severity-scaled cooldown that used to be the only way a wendigo ever spawned at all
+	 * now gates starting a plan on the entity that's already here instead. */
+	private void tickOrbitingEntity(ServerLevel level, WaveState state, int now) {
+		WendigoEntity entity = state.entity;
+		if (entity.isReturningToOrbit() || entity.isApproachingEngageSpot()) {
+			return; // mid-transit toward a return point or a pending plan's engage spot - PlanRunner resolves these on its own
+		}
+		if (entity.isOrbitTargetLost()) {
+			WendigoDebug.say(level, "orbiting wendigo lost its target entirely - discarding, will search for a new one");
+			entity.discard();
+			state.entity = null;
+			state.context = null;
+			state.lockedTarget = null;
+			return;
+		}
+		if (entity.isOrbitTrapped()) {
+			WendigoDebug.say(level, "orbiting wendigo stuck trying to reach its waypoint - relocating");
+			relocateOrDiscard(level, state, now);
+			return;
+		}
+		ServerPlayer lockedTarget = state.lockedTarget;
+		if (lockedTarget != null && lockedTarget.isAlive() && entity.distanceTo(lockedTarget) > ORBIT_DESPAWN_DISTANCE) {
+			// Performance cap, not a normal orbit-band condition - comfortably beyond even MASSIVE's
+			// own max orbit distance, so this never fights ordinary in-band/reposition orbiting; it
+			// only fires when something (a long chase, a relocate, the player teleporting/fast-
+			// traveling) has left the wendigo tracking a target from genuinely far away, which isn't
+			// worth continuing to tick/pathfind toward - discard and let tryEnterOrbit pick a fresh,
+			// closer spawn near wherever the target actually is now.
+			WendigoDebug.say(level, "orbiting wendigo too far from its target (" + ORBIT_DESPAWN_DISTANCE
+				+ "+ blocks, performance cap) - discarding, will search for a closer spawn");
+			entity.discard();
+			state.entity = null;
+			state.context = null;
+			return;
+		}
+		if (checkOrbitTooClose(level, state)) {
+			return;
+		}
 		if (state.requestPending || now < state.cooldownUntilTick) {
 			return;
 		}
-
-		PlayerSeverityTracker.TargetSelection selection = this.severityTracker.selectTarget(level);
-		if (selection != null) {
-			beginWave(level, state, selection.target(), selection.severity());
+		ServerPlayer target = state.lockedTarget;
+		if (target == null || !target.isAlive()) {
+			return; // shouldn't happen (isOrbitTargetLost would have already caught it) - defensive only
 		}
+		beginEngagement(level, state, target, this.severityTracker.severityOf(target));
+	}
+
+	// Below this percent, a player getting too close while orbiting just spooks the wendigo off
+	// (real discard + re-search) rather than provoking a lunge - matches DarknessOverstayTracker's
+	// own AMBUSH_MIN_PERCENT-style tiering philosophy, this specific number given directly by the user.
+	private static final int ORBIT_TOO_CLOSE_LUNGE_MIN_PERCENT = 40;
+	// Flat, not cave-scaled or fraction-of-band - the user's own explicit call after the original
+	// "lower quarter of the current band" version was landing too close to (or even inside) typical
+	// spawn distance and reacting the instant a fresh orbit spawn's first tick ran.
+	private static final double ORBIT_TOO_CLOSE_DISTANCE = 10.0;
+
+	/** Reaction to any player (not just state.lockedTarget - whoever's actually closest) coming
+	 * within ORBIT_TOO_CLOSE_DISTANCE - not gated by cooldown, same "this always wins outright"
+	 * philosophy as checkUnconditionalGrab. Below ORBIT_TOO_CLOSE_LUNGE_MIN_PERCENT (that closest
+	 * player's own severity) the wendigo just flees/despawns and re-searches for a new spawn; at/above
+	 * it, it commits to a bounded combat.lunge_attack pursuit of that player instead (retargeting
+	 * lockedTarget to them - overrideIntoLunge does this itself). Deliberately a lunge, not
+	 * overrideIntoChaseUntilLight's internal.chase_until_light - a player actively placing torches
+	 * while backing away can keep the immediate area "not dark enough" just often enough that a
+	 * light-seeking chase never naturally resolves, chasing indefinitely; combat.lunge_attack's own
+	 * resolution is bounded by construction regardless (isLungeResolved ends the instant the pathfind
+	 * either reaches melee range or finishes/gets stuck, see overrideIntoLunge's own comment). Returns
+	 * true if either reaction fired, so the caller knows not to also fall through to the ordinary
+	 * cooldown-gated engagement trigger this tick. */
+	private boolean checkOrbitTooClose(ServerLevel level, WaveState state) {
+		WendigoEntity entity = state.entity;
+		double thresholdSqr = ORBIT_TOO_CLOSE_DISTANCE * ORBIT_TOO_CLOSE_DISTANCE;
+		ServerPlayer closest = null;
+		double closestDistSqr = Double.MAX_VALUE;
+		for (ServerPlayer player : level.players()) {
+			double distSqr = entity.distanceToSqr(player);
+			if (distSqr < thresholdSqr && distSqr < closestDistSqr) {
+				closest = player;
+				closestDistSqr = distSqr;
+			}
+		}
+		if (closest == null) {
+			return false;
+		}
+		int percent = this.severityTracker.severityCap() > 0
+			? 100 * this.severityTracker.severityOf(closest) / this.severityTracker.severityCap() : 0;
+		if (percent < ORBIT_TOO_CLOSE_LUNGE_MIN_PERCENT) {
+			WendigoDebug.say(level, closest.getGameProfile().name() + " got too close while orbiting ("
+				+ percent + "% - below lunge threshold) - discarding, will search for a new spawn spot");
+			entity.discard();
+			state.entity = null;
+			state.context = null;
+			return true;
+		}
+		WendigoDebug.say(level, closest.getGameProfile().name() + " got too close while orbiting ("
+			+ percent + "%) - lunging");
+		overrideIntoLunge(level, closest);
+		return true;
+	}
+
+	/** Relocates an alive entity (currently trapped mid-orbit, or a plan that just force-ended via
+	 * timeout/extreme-proximity) to a fresh dark spot near its own current position, via TELEPORT
+	 * rather than a walked retreat - trapped/can't-move relocation is meant to be instant, not
+	 * something that could itself get stuck trying to walk there. Falls back to a plain
+	 * findDarkestAwayFrom search if nothing in-band is flood-reachable, and to real discard
+	 * (entering the no-entity search state) if genuinely nothing dark is reachable at all - see the
+	 * user's own "if it genuinely cannot find a dark place, it despawns and keeps searching" rule. */
+	private void relocateOrDiscard(ServerLevel level, WaveState state, int now) {
+		WendigoEntity entity = state.entity;
+		BlockPos selfPos = entity.blockPosition();
+		ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
+		BlockPos spot = findNearbyDarkSpot(level, selfPos, target);
+		if (spot == null) {
+			WendigoDebug.say(level, "nowhere dark reachable to relocate to - discarding, will keep searching for a new spawn spot");
+			entity.discard();
+			state.entity = null;
+			state.context = null;
+			return;
+		}
+		entity.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, entity.getYRot(), 0f);
+		entity.syncPoseToSpawnPosition();
+		entity.nudgeTowardAttachedSurface(Direction.UP);
+		entity.startOrbit(target);
+	}
+
+	/** Shared by relocateOrDiscard (teleport case) and the post-grab return-to-orbit case (walked
+	 * case, see the "ordinary completion" branch of tickLevel) - a dark spot reachable from selfPos,
+	 * within the orbit band of target if target is still valid, falling back to a plain
+	 * away-from-target search, or null if genuinely nothing dark is reachable at all. */
+	private static BlockPos findNearbyDarkSpot(ServerLevel level, BlockPos selfPos, ServerPlayer target) {
+		CaveScale caveScale = CaveScaleScanner.classify(level, selfPos);
+		double maxDistance = orbitMaxDistance(caveScale);
+		BlockPos spot = target != null
+			? DarkSpotScanner.findOrbitWaypoint(level, selfPos, target.blockPosition(), orbitMinDistance(caveScale), maxDistance)
+			: null;
+		if (spot == null) {
+			spot = DarkSpotScanner.findDarkestAwayFrom(level, selfPos, maxDistance, target != null ? target.blockPosition() : null);
+		}
+		return spot;
+	}
+
+	/** entity == null: spawn a fresh wendigo directly into orbit - no LLM call, no cooldown consumed
+	 * (only starting a PLAN is cooldown-gated - see the trigger check tickOrbitingEntity will add in
+	 * a later step; spawning/orbiting itself isn't). Retries near the previous target first if one's
+	 * still valid (a relocate/discard cycle keeps state.lockedTarget unless the loss WAS the target
+	 * itself - see tickOrbitingEntity), otherwise runs the normal proximity-group selection fresh.
+	 * Throttled via WaveState.nextRespawnSearchTick - a dark-spot scan isn't free, no need to retry
+	 * every single tick while waiting for somewhere valid to appear. */
+	private void tryEnterOrbit(ServerLevel level, WaveState state, int now) {
+		if (state.requestPending || now < state.nextRespawnSearchTick) {
+			return;
+		}
+		state.nextRespawnSearchTick = now + ORBIT_SPAWN_SEARCH_INTERVAL_TICKS;
+
+		ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
+		if (target == null) {
+			PlayerSeverityTracker.TargetSelection selection = this.severityTracker.selectTarget(level);
+			if (selection == null) {
+				return;
+			}
+			target = selection.target();
+		}
+		// Spawn already inside the orbit band, not just "somewhere dark nearby" - a spawn that
+		// ignores the band (as a flat nearest-dark-spot search would) very often lands inside the
+		// too-close threshold, triggering an immediate despawn/chase the moment orbit's first tick
+		// runs. Falls back to a plain nearest-dark-spot search (within max band distance) if nothing
+		// flood-reachable in-band was found - some darkness beats none at all.
+		CaveScale caveScale = CaveScaleScanner.classify(level, target.blockPosition());
+		double maxDistance = orbitMaxDistance(caveScale);
+		BlockPos spawnPos = DarkSpotScanner.findOrbitWaypoint(level, target.blockPosition(), target.blockPosition(),
+			orbitMinDistance(caveScale), maxDistance);
+		if (spawnPos == null) {
+			spawnPos = DarkSpotScanner.findDarkest(level, target.blockPosition(), maxDistance);
+		}
+		if (spawnPos == null) {
+			return; // nothing dark near this target yet either - try again next throttled search
+		}
+
+		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
+		wendigo.snapTo(spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, 0f, 0f);
+		wendigo.syncPoseToSpawnPosition();
+		wendigo.nudgeTowardAttachedSurface(Direction.UP);
+		level.addFreshEntity(wendigo);
+		WendigoSounds.play(level, spawnPos, WendigoSounds.Type.SPAWN);
+		wendigo.startOrbit(target);
+
+		state.entity = wendigo;
+		state.lockedTarget = target;
+		WendigoDebug.say(level, "spawned into orbit near " + target.getGameProfile().name() + " at " + spawnPos.toShortString());
 	}
 
 	/** Bypasses cooldown/eligibility and calls the real LLM - used by the /wendigo wave debug command.
@@ -347,7 +610,19 @@ public final class WendigoManager {
 	 * second-guessed by who else happens to be nearby. */
 	public void forceWave(ServerLevel level, ServerPlayer target) {
 		WaveState state = this.waves.computeIfAbsent(level, l -> new WaveState());
-		if (state.entity != null || state.requestPending) {
+		if (state.requestPending) {
+			return;
+		}
+		// A persistent, already-orbiting entity doesn't need a fresh spawn - engage it directly
+		// (same as the automatic trigger would) rather than requiring a manual /wendigo reset first.
+		// Still requires a full reset for a MID-PLAN entity, same as before - this debug command
+		// shouldn't interrupt an active plan on its own.
+		if (state.entity != null && state.entity.isAlive() && state.entity.isOrbiting()) {
+			state.debugForced = true;
+			beginEngagement(level, state, target, this.severityTracker.severityOf(target));
+			return;
+		}
+		if (state.entity != null) {
 			return;
 		}
 		state.debugForced = true;
@@ -372,6 +647,7 @@ public final class WendigoManager {
 		}
 		state.entity = null;
 		state.context = null;
+		state.lockedTarget = null;
 		state.requestPending = false;
 		state.cooldownUntilTick = 0;
 		state.debugForced = false;
@@ -385,16 +661,26 @@ public final class WendigoManager {
 	 */
 	public void forceWaveWithPlan(ServerLevel level, ServerPlayer target, JsonObject plan) {
 		WaveState state = this.waves.computeIfAbsent(level, l -> new WaveState());
-		if (state.entity != null || state.requestPending) {
+		if (state.requestPending) {
 			return;
 		}
 		state.debugForced = true;
 		WaveContext context = buildContext(level, target, this.severityTracker.severityOf(target));
-		if (context != null) {
+		if (context == null) {
+			return;
+		}
+		// Same "engage the existing orbiting entity instead of requiring a reset" treatment forceWave
+		// itself gets - still requires a reset for a genuinely mid-plan entity.
+		if (state.entity != null && state.entity.isAlive() && state.entity.isOrbiting()) {
 			// Hand-authored showcase/test plans shouldn't be second-guessed by tier gating meant to
 			// keep an LLM honest - bypass it (severityPercent=100 unlocks everything).
-			spawnWave(level, state, context, plan, true);
+			engageExistingWendigo(level, state, context, plan, true);
+			return;
 		}
+		if (state.entity != null) {
+			return;
+		}
+		spawnWave(level, state, context, plan, true);
 	}
 
 	/**
@@ -413,10 +699,20 @@ public final class WendigoManager {
 		// session after a single debug wave. Its own breathing room already comes from
 		// DarknessOverstayTracker itself: darkTicks/rolledThresholdTicks are cleared right before this
 		// is called, so a fresh multi-second dark stay has to accumulate again before this can fire a
-		// second time regardless. Still guarded on entity/requestPending so it never stacks a second
-		// wendigo on an already-active one.
-		if (state.entity != null || state.requestPending) {
+		// second time regardless.
+		if (state.requestPending) {
 			return;
+		}
+		// A persistent wendigo already exists (orbiting OR mid-plan) - redirect it straight into the
+		// chase instead of trying to spawn a second one. overrideIntoChaseUntilLight already handles
+		// "already forcing a ride" (no-op) and builds its own context if this entity hasn't been
+		// engaged yet (e.g. still on its very first orbit, never yet given a real plan).
+		if (state.entity != null && state.entity.isAlive()) {
+			overrideIntoChaseUntilLight(level, target);
+			return;
+		}
+		if (state.entity != null) {
+			return; // dead, not yet cleaned up this tick - tickLevel will clear it; try again next time
 		}
 		WaveContext context = buildContext(level, target, this.severityTracker.severityOf(target));
 		if (context != null) {
@@ -456,38 +752,113 @@ public final class WendigoManager {
 	 * the withdrawal. Once truly caught, the existing plan (retreat_with_fallback/despawn fallback
 	 * chain) is already exactly "get them out of the dark or get grabbed" playing out - nothing left
 	 * for this trigger to add.
+	 * <p>Also generalizes to interrupt ORBIT, not just an already-active plan - state.entity.startWave
+	 * (via PlanRunner.start's own orbiting=false reset, see that method) already ends orbit mode
+	 * cleanly on its own; the only thing orbit-vs-mid-plan changes here is that a still-orbiting,
+	 * never-yet-engaged entity may not have a state.context yet, so one gets built fresh in that case
+	 * rather than requiring one to already exist.
 	 */
 	public void overrideIntoChaseUntilLight(ServerLevel level, ServerPlayer target) {
 		WaveState state = this.waves.get(level);
-		if (state == null || state.entity == null || !state.entity.isAlive() || state.context == null
-				|| state.entity.isForcingRide()) {
+		if (state == null || state.entity == null || !state.entity.isAlive() || state.entity.isForcingRide()) {
 			return;
 		}
-		List<BlockPos> despawnCandidates = rankDespawnCandidates(state.context.spots(), level.players());
-		state.entity.startWave(buildChaseUntilLightOverridePlan(), despawnCandidates, state.context.spots(), 100, true);
+		WaveContext context = state.context != null ? state.context
+			: buildContext(level, target, this.severityTracker.severityOf(target));
+		if (context == null) {
+			return;
+		}
+		List<BlockPos> despawnCandidates = rankDespawnCandidates(context.spots(), level.players());
+		state.entity.startWave(buildChaseUntilLightOverridePlan(), despawnCandidates, context.spots(), 100, true,
+			context.caveScale(), context.torchSpotPerLabel());
+		state.context = context;
+		state.lockedTarget = target;
 		state.waveStartTick = level.getServer().getTickCount();
 		state.extremeProximityTicks = 0;
 		WendigoDebug.say(level, "darkness overstay while already active - overriding into internal.chase_until_light");
 	}
 
-	/** Shared by both darkness-overstay plans - "play danger sound -> chase until player reaches
-	 * light (or gets caught) -> flee". See PlanRunner's internal.chase_until_light for the one
-	 * genuinely new primitive here; every other step reuses existing action types. */
-	private static JsonArray buildDangerChaseFleeSteps() {
-		JsonObject danger = new JsonObject();
-		danger.addProperty("type", "sound.ambient_cue");
-		danger.addProperty("cue", "danger");
+	/** checkOrbitTooClose's own >=ORBIT_TOO_CLOSE_LUNGE_MIN_PERCENT reaction - same guard/context-
+	 * building shape as overrideIntoChaseUntilLight, just starting a bounded combat.lunge_attack
+	 * pursuit (buildTooCloseLungePlan) instead of an internal.chase_until_light one. Deliberately a
+	 * separate method rather than a parameter on overrideIntoChaseUntilLight - that one stays exactly
+	 * as DarknessOverstayTracker needs it (a genuinely open-ended hunt is the right call for "lingered
+	 * in darkness too long"; "got too close" is a different, more bounded provocation). */
+	private void overrideIntoLunge(ServerLevel level, ServerPlayer target) {
+		WaveState state = this.waves.get(level);
+		if (state == null || state.entity == null || !state.entity.isAlive() || state.entity.isForcingRide()) {
+			return;
+		}
+		WaveContext context = state.context != null ? state.context
+			: buildContext(level, target, this.severityTracker.severityOf(target));
+		if (context == null) {
+			return;
+		}
+		List<BlockPos> despawnCandidates = rankDespawnCandidates(context.spots(), level.players());
+		state.entity.startWave(buildTooCloseLungePlan(), despawnCandidates, context.spots(), 100, true,
+			context.caveScale(), context.torchSpotPerLabel());
+		state.context = context;
+		state.lockedTarget = target;
+		state.waveStartTick = level.getServer().getTickCount();
+		state.extremeProximityTicks = 0;
+		WendigoDebug.say(level, "target got too close while orbiting - overriding into a bounded lunge pursuit");
+	}
 
-		JsonObject chase = new JsonObject();
-		chase.addProperty("type", "internal.chase_until_light");
+	/** "chase cue -> bounded lunge pursuit (catches them, or gives up on its own once the pathfind
+	 * finishes/gets stuck - see PlanRunner.isLungeResolved) -> flee cue -> flee". See
+	 * overrideIntoLunge's own comment for why this is a lunge rather than an
+	 * internal.chase_until_light hunt. */
+	private static JsonObject buildTooCloseLungePlan() {
+		JsonObject chaseCue = new JsonObject();
+		chaseCue.addProperty("type", "sound.ambient_cue");
+		chaseCue.addProperty("cue", "chase");
+
+		JsonObject lunge = new JsonObject();
+		lunge.addProperty("type", "combat.lunge_attack");
+
+		JsonObject fleeCue = new JsonObject();
+		fleeCue.addProperty("type", "sound.ambient_cue");
+		fleeCue.addProperty("cue", "flee");
 
 		JsonObject flee = new JsonObject();
 		flee.addProperty("type", "movement.retreat_with_fallback");
 		flee.addProperty("speed", "fast");
 
 		JsonArray steps = new JsonArray();
-		steps.add(danger);
+		steps.add(chaseCue);
+		steps.add(lunge);
+		steps.add(fleeCue);
+		steps.add(flee);
+
+		JsonObject plan = new JsonObject();
+		plan.add("plan", steps);
+		plan.add("global_rules", new JsonArray());
+		return plan;
+	}
+
+	/** Shared by both darkness-overstay plans - "chase cue -> chase until player reaches light (or
+	 * gets caught) -> flee cue -> flee". See PlanRunner's internal.chase_until_light for the one
+	 * genuinely new primitive here; every other step reuses existing action types. */
+	private static JsonArray buildDangerChaseFleeSteps() {
+		JsonObject chaseCue = new JsonObject();
+		chaseCue.addProperty("type", "sound.ambient_cue");
+		chaseCue.addProperty("cue", "chase");
+
+		JsonObject chase = new JsonObject();
+		chase.addProperty("type", "internal.chase_until_light");
+
+		JsonObject fleeCue = new JsonObject();
+		fleeCue.addProperty("type", "sound.ambient_cue");
+		fleeCue.addProperty("cue", "flee");
+
+		JsonObject flee = new JsonObject();
+		flee.addProperty("type", "movement.retreat_with_fallback");
+		flee.addProperty("speed", "fast");
+
+		JsonArray steps = new JsonArray();
+		steps.add(chaseCue);
 		steps.add(chase);
+		steps.add(fleeCue);
 		steps.add(flee);
 		return steps;
 	}
@@ -510,6 +881,71 @@ public final class WendigoManager {
 	private static JsonObject buildChaseUntilLightOverridePlan() {
 		JsonObject plan = new JsonObject();
 		plan.add("plan", buildDangerChaseFleeSteps());
+		plan.add("global_rules", new JsonArray());
+		return plan;
+	}
+
+	/** Unconditional grab_distance override - the instant the target comes within grab_distance
+	 * (ProximityBands, 4 blocks) of an entity that isn't already forcing a ride, this catches them
+	 * immediately and runs the flee/damage/move-away sequence, interrupting whatever else was
+	 * happening (orbiting OR mid-plan, doesn't matter). Not gated by cooldown/severity/tier at all -
+	 * "in reach" is meant to always win outright, unlike combat.lunge_attack's own gated
+	 * precondition (a nearby safe-retreat-spot check) which this deliberately bypasses by calling
+	 * WendigoEntity.forceGrabNow directly instead of routing through a combat.lunge_attack plan
+	 * step, which could otherwise silently skip the catch and go straight to fleeing empty-handed. */
+	// Flat time floor on top of grabGraceActive's distance-based grace - see WaveState.grabCooldownUntilTick.
+	private static final int GRAB_ESCAPE_COOLDOWN_TICKS = 200; // 10s
+
+	private void checkUnconditionalGrab(ServerLevel level, WaveState state, int now) {
+		WendigoEntity entity = state.entity;
+		if (entity.isForcingRide() || entity.isReturningToOrbit() || entity.isApproachingEngageSpot()) {
+			return; // already caught, or already mid-transit somewhere - let that resolve first
+		}
+		if (entity.consumeFreshEscape()) {
+			state.grabGraceActive = true;
+			state.grabCooldownUntilTick = now + GRAB_ESCAPE_COOLDOWN_TICKS;
+		}
+		ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
+		if (target == null) {
+			return;
+		}
+		double distance = entity.distanceTo(target);
+		if (distance > ProximityBands.blocks("grab_distance")) {
+			state.grabGraceActive = false;
+			return;
+		}
+		if (state.grabGraceActive || now < state.grabCooldownUntilTick) {
+			// Still within grab range - withhold the re-grab until they've actually gotten away at
+			// least once (grabGraceActive, cleared by the branch above once they do) AND the flat
+			// cooldown has elapsed, whichever takes longer.
+			return;
+		}
+		WaveContext context = state.context != null ? state.context
+			: buildContext(level, target, this.severityTracker.severityOf(target));
+		if (context == null) {
+			return;
+		}
+		List<BlockPos> despawnCandidates = rankDespawnCandidates(context.spots(), level.players());
+		entity.forceGrabNow(target);
+		entity.startWave(buildUnconditionalGrabFleePlan(), despawnCandidates, context.spots(), 100, true,
+			context.caveScale(), context.torchSpotPerLabel());
+		state.context = context;
+		state.waveStartTick = now;
+		state.extremeProximityTicks = 0;
+		WendigoDebug.say(level, "target within grab range - grabbing unconditionally");
+	}
+
+	/** Just the flee - the catch itself already happened via WendigoEntity.forceGrabNow before this
+	 * plan ever starts, unlike buildChaseUntilLightOverridePlan/buildDarknessAmbushPlan's own
+	 * chase-until-caught shape. */
+	private static JsonObject buildUnconditionalGrabFleePlan() {
+		JsonObject flee = new JsonObject();
+		flee.addProperty("type", "movement.retreat_with_fallback");
+		flee.addProperty("speed", "fast");
+		JsonArray steps = new JsonArray();
+		steps.add(flee);
+		JsonObject plan = new JsonObject();
+		plan.add("plan", steps);
 		plan.add("global_rules", new JsonArray());
 		return plan;
 	}
@@ -546,6 +982,62 @@ public final class WendigoManager {
 			}));
 	}
 
+	/** The automatic severity-triggered path once a wendigo is already spawned and orbiting - same
+	 * LLM-request plumbing as beginWave, just engaging the entity that's already here
+	 * (engageExistingWendigo) once the plan comes back, instead of constructing a new one via
+	 * spawnWave. Called from tickOrbitingEntity's own cooldown check, mirroring exactly how beginWave
+	 * used to be the only way a wendigo ever came to exist at all. */
+	private void beginEngagement(ServerLevel level, WaveState state, ServerPlayer target, int effectiveSeverity) {
+		WaveContext context = buildContext(level, target, effectiveSeverity);
+		if (context == null) {
+			return; // nowhere sensible found near the player right now - try again next tick
+		}
+		int percent = context.severityCap() > 0 ? 100 * context.severity() / context.severityCap() : 0;
+		boolean torchSpawnAvailable = hasEligibleTorchSpawnCandidate(context, percent);
+
+		state.requestPending = true;
+		MinecraftServer server = level.getServer();
+		WendigoMod.llmClient.requestPlan(buildSystemPrompt(percent), context.toPromptText(),
+				SchemaBuilder.forSeverity(percent, context.caveScale(), torchSpawnAvailable))
+			.whenComplete((plan, error) -> server.execute(() -> {
+				state.requestPending = false;
+				if (error != null) {
+					WendigoMod.LOGGER.error("Wendigo engagement plan request failed", error);
+					state.cooldownUntilTick = level.getServer().getTickCount() + this.config.dynamicCooldownTicks(percent);
+					return;
+				}
+				// Same staleness guard beginWave's own completion handler has, just checking
+				// alive-and-still-orbiting instead of entirely-absent - the entity could have died,
+				// gotten relocated, or already been engaged by something else while this was in flight.
+				if (state.entity == null || !state.entity.isAlive() || !state.entity.isOrbiting()) {
+					WendigoMod.LOGGER.warn("Discarding a stale wendigo engagement plan - no longer a valid orbiting entity: {}", plan);
+					return;
+				}
+				engageExistingWendigo(level, state, context, plan, false);
+			}));
+	}
+
+	/** Starts a plan on an already-alive, already-orbiting entity - the engage-existing-entity
+	 * counterpart to spawnWave (which constructs a brand new one). Unlike a brand-new entity's
+	 * spawn_at (a plain teleport at construction, since there's nothing to walk FROM yet), this
+	 * entity already exists somewhere else in the cave (wherever orbit left it), so the chosen spot
+	 * is walked to instead (see PlanRunner.startWithApproach) - skipped automatically if it's
+	 * already close by. */
+	private void engageExistingWendigo(ServerLevel level, WaveState state, WaveContext context, JsonObject plan, boolean bypassTierGating) {
+		int percent = context.severityCap() > 0 ? 100 * context.severity() / context.severityCap() : 0;
+		int gatingPercent = bypassTierGating ? 100 : percent;
+		List<BlockPos> despawnCandidates = rankDespawnCandidates(context.spots(), level.players());
+		BlockPos engageSpot = resolveSpawnSpot(context, plan, percent, bypassTierGating);
+		state.entity.startWithApproach(engageSpot, plan, despawnCandidates, context.spots(), gatingPercent, bypassTierGating,
+			context.caveScale(), context.torchSpotPerLabel());
+		state.context = context;
+		state.waveStartTick = level.getServer().getTickCount();
+		state.extremeProximityTicks = 0;
+		WendigoDebug.say(level, "engaging existing wendigo - aggression: " + context.severity() + "/" + context.severityCap()
+			+ " (" + percent + "%), caveScale=" + context.caveScale() + ", spots=" + context.spots().size()
+			+ ", plan: " + plan);
+	}
+
 	/**
 	 * effectiveSeverity is what actually drives tier/schema/prompt for this encounter - usually just
 	 * target's own severity, but for an automatically-selected multiplayer target it's the whole
@@ -560,48 +1052,51 @@ public final class WendigoManager {
 	 * budget were each their own source of "engine says unreachable, live wendigo proves otherwise").
 	 * Returns null only if the flood found neither a usable spot nor a torch-spawn candidate at all.
 	 */
-	// How many of the six spot_a..spot_f slots may be non-floor (ceiling or wall - see
-	// DarkSpotScanner.findCeilingSpots/findWallSpots) rather than ordinary floor ones - reserved off
-	// the END of the label list (spot_e/spot_f, the higher-severity-gated slots), so this reuses the
-	// EXISTING tier-gating mechanism unchanged: a non-floor spot only ever gets offered once
-	// severity is already high enough to unlock that slot at all, same as any other far/late spot
-	// (in practice both unlock at 20% - not a particularly high bar, so this isn't the dominant
-	// reason climbing spots were rare; the reserve counts below were). Split evenly between the two
-	// types rather than all-ceiling or all-wall, so both kinds of climbing spot actually show up in
-	// practice. Raised from 1 each - at 1, at most 2 of 6 slots could EVER be non-floor even in the
-	// best case, and live testing found them showing up "here and there" rather than routinely,
-	// which is exactly what a hard 2-of-6 ceiling predicts. Tune by feel - this can go higher still
-	// if climbing spots should dominate rather than just show up regularly.
-	private static final int CEILING_SPOT_RESERVE = 2;
-	private static final int WALL_SPOT_RESERVE = 2;
+	// Floor/ceiling split of the six spot_a..spot_f slots - see DarkSpotScanner.findCeilingSpots'
+	// own comment for the actual root cause of ceiling spots being rare (a single vertical probe
+	// directly above the player, not path-cost bias) and its fix (a wider seed search); this 3/3
+	// split plus the mutual backfill below is the other half - previously a fixed reserve count
+	// (2 ceiling + 2 wall) meant floor got whatever was left over and never had to share evenly.
+	// No dedicated wall reserve anymore (findWallSpots isn't called here at all) - wall attachment
+	// is left to emerge naturally from pathfinding between floor/ceiling spots instead of being a
+	// separately-scanned category; it was always the least rigorous of the three scans anyway (ring-
+	// sampled, not flood-verified reachable, see findWallSpots' own doc comment). Tune by feel.
+	private static final int CEILING_SPOT_TARGET = 3;
 
 	private WaveContext buildContext(ServerLevel level, ServerPlayer target, int effectiveSeverity) {
 		BlockPos playerPos = target.blockPosition();
-		int ceilingSlots = Math.min(CEILING_SPOT_RESERVE, this.config.contextSpotCount);
-		int wallSlots = Math.min(WALL_SPOT_RESERVE, this.config.contextSpotCount - ceilingSlots);
-		int floorSlots = this.config.contextSpotCount - ceilingSlots - wallSlots;
-		// Ceiling/wall spots are appended after floor ones below, not interleaved by distance - a
+		int ceilingTarget = Math.min(CEILING_SPOT_TARGET, this.config.contextSpotCount);
+		int floorTarget = this.config.contextSpotCount - ceilingTarget;
+		// Ceiling/floor spots are appended in scan order below, not interleaved by distance - a
 		// minor, cosmetic looseness in the "nearest to furthest" ordering WaveContext's prompt text
 		// describes, traded for reusing the existing label-index-based tier gating unchanged rather
-		// than needing spot-type-aware gating logic. Their torch-spawn candidates are deliberately
-		// not merged into torchSpawnCandidates below - spawn_on_torch's destroy-on-arrival mechanic
-		// hasn't been designed for a ceiling/wall-attached torch/lantern, out of scope for this pass
-		// (moot for wall spots anyway - findWallSpots never returns any).
-		DarkSpotScanner.WaveSpotScan ceilingScan = ceilingSlots > 0
-			? DarkSpotScanner.findCeilingSpots(level, playerPos, ceilingSlots)
+		// than needing spot-type-aware gating logic. Ceiling's own torch-spawn candidates are
+		// deliberately not merged into torchSpawnCandidates below - spawn_on_torch's destroy-on-
+		// arrival mechanic hasn't been designed for a ceiling-attached torch/lantern, out of scope
+		// for this pass.
+		DarkSpotScanner.WaveSpotScan ceilingScan = ceilingTarget > 0
+			? DarkSpotScanner.findCeilingSpots(level, playerPos, ceilingTarget)
 			: new DarkSpotScanner.WaveSpotScan(List.of(), List.of());
-		DarkSpotScanner.WaveSpotScan wallScan = wallSlots > 0
-			? DarkSpotScanner.findWallSpots(level, playerPos, wallSlots)
-			: new DarkSpotScanner.WaveSpotScan(List.of(), List.of());
-		// A reserved ceiling/wall slot that its own scan couldn't fill (nothing suitable nearby) used
-		// to just sit empty, silently shrinking the total context below contextSpotCount instead of
-		// falling back to an ordinary floor spot - backfilling here means raising the reserves above
-		// doesn't cost overall spot variety on a map where climbing spots happen to be sparse.
-		int unfilledClimbingSlots = (ceilingSlots - ceilingScan.spots().size()) + (wallSlots - wallScan.spots().size());
-		DarkSpotScanner.WaveSpotScan floorScan = DarkSpotScanner.findWaveSpots(level, playerPos, floorSlots + unfilledClimbingSlots);
+		// A ceiling shortfall (nothing suitable within reach at all) gets backfilled by extra floor
+		// slots, same "don't let a reserved category's own scarcity shrink the total context" idea
+		// as before - floor is far more reliably available than ceiling, so this direction covers
+		// the realistic common case.
+		int ceilingShortfall = ceilingTarget - ceilingScan.spots().size();
+		DarkSpotScanner.WaveSpotScan floorScan = DarkSpotScanner.findWaveSpots(level, playerPos, floorTarget + ceilingShortfall);
+		// The rarer opposite case (floor itself came up short too - a genuinely cramped or already
+		// heavily-scanned area) gets one more chance: ask ceiling to make up whatever floor still
+		// couldn't fill, on top of what it already found - a genuinely mutual backfill in EITHER
+		// direction, not just floor rescuing ceiling.
+		int floorShortfall = (floorTarget + ceilingShortfall) - floorScan.spots().size();
+		if (floorShortfall > 0 && ceilingScan.spots().size() < this.config.contextSpotCount) {
+			DarkSpotScanner.WaveSpotScan extraCeiling = DarkSpotScanner.findCeilingSpots(level, playerPos,
+				ceilingScan.spots().size() + floorShortfall);
+			if (extraCeiling.spots().size() > ceilingScan.spots().size()) {
+				ceilingScan = extraCeiling;
+			}
+		}
 		List<DarkSpotScanner.WaveSpot> waveSpots = new ArrayList<>(floorScan.spots());
 		waveSpots.addAll(ceilingScan.spots());
-		waveSpots.addAll(wallScan.spots());
 		List<DarkSpotScanner.WaveSpot> torchSpawnCandidates = floorScan.torchSpawnCandidates();
 		if (waveSpots.isEmpty() && torchSpawnCandidates.isEmpty()) {
 			WendigoDebug.say(level, "issue: no dark spots or torch-adjacent positions found at all near "
@@ -641,8 +1136,22 @@ public final class WendigoManager {
 			torchesPerSpot.add(relevant.lightSources());
 		}
 		CaveScale caveScale = CaveScaleScanner.classify(level, playerPos);
+		// One torch-spot pairing per labeled slot (spot_a..spot_f), independent of whether that same
+		// slot's own dark spot was found this scan - see WaveContext.torchSpotForLabel's own comment
+		// for why (the "spot doesn't exist, but its torch spot does" teleport-substitute case).
+		// Nearest-to-furthest by distanceFromOrigin, same convention spots() itself already uses -
+		// reuses torchSpawnCandidates verbatim, no separate scan needed.
+		List<DarkSpotScanner.WaveSpot> sortedTorchCandidates = new ArrayList<>(torchSpawnCandidates);
+		sortedTorchCandidates.sort(Comparator.comparingDouble(DarkSpotScanner.WaveSpot::distanceFromOrigin));
+		List<BlockPos> torchSpotPerLabel = new ArrayList<>();
+		for (DarkSpotScanner.WaveSpot candidate : sortedTorchCandidates) {
+			if (torchSpotPerLabel.size() >= WaveContext.SPOT_LABEL_COUNT) {
+				break;
+			}
+			torchSpotPerLabel.add(candidate.position());
+		}
 		return new WaveContext(target, effectiveSeverity, this.config.severityCap, spots, spotNormals,
-			dimSpotsPerSpot, torchesPerSpot, torchSpawnCandidates,
+			dimSpotsPerSpot, torchesPerSpot, torchSpawnCandidates, torchSpotPerLabel,
 			this.encounterHistory.of(target), level.getServer().getTickCount(), caveScale, torchLinkedSpots);
 	}
 
@@ -687,14 +1196,20 @@ public final class WendigoManager {
 		// labeled spot_a..spot_f positions, or genuinely is a floor spot).
 		wendigo.nudgeTowardAttachedSurface(context.normalFor(spawnPos));
 		level.addFreshEntity(wendigo);
-		WendigoSounds.play(level, spawnPos, WendigoSounds.Type.SPAWNED);
+		WendigoSounds.play(level, spawnPos, WendigoSounds.Type.SPAWN);
 		if (linkedTorch != null) {
 			LightSourceScanner.destroyByWendigo(level, linkedTorch, wendigo);
 		}
-		wendigo.startWave(plan, despawnCandidates, context.spots(), gatingPercent, bypassTierGating);
+		wendigo.startWave(plan, despawnCandidates, context.spots(), gatingPercent, bypassTierGating,
+			context.caveScale(), context.torchSpotPerLabel());
 
 		state.entity = wendigo;
 		state.context = context;
+		// Keeps every spawnWave-constructed entity (debug/ambush paths - the automatic trigger now
+		// spawns via tryEnterOrbit instead) consistent with the locked-target model too, so if this
+		// entity's plan later completes normally, resuming orbit afterward has a real target to lock
+		// onto instead of null.
+		state.lockedTarget = context.player();
 		state.waveStartTick = level.getServer().getTickCount();
 		state.extremeProximityTicks = 0;
 		WendigoDebug.say(level, "wave started - spawned at " + spawnPos.toShortString()
@@ -719,6 +1234,10 @@ public final class WendigoManager {
 			+ " navFailed=" + entity.isNavigationFailed()
 			+ " navStuck=" + entity.getNavigation().isStuck()
 			+ " onGround=" + entity.onGround()
+			// Always false here in practice (this snapshot only fires from the mid-plan branch of
+			// tickLevel - an orbiting entity takes a different dispatch path entirely, see
+			// tickOrbitingEntity) - included anyway for a consistent, greppable field across both.
+			+ " orbiting=" + entity.isOrbiting()
 			+ " waveElapsedTicks=" + (now - state.waveStartTick));
 	}
 
@@ -869,12 +1388,22 @@ public final class WendigoManager {
 
 	private static final class WaveState {
 		WendigoEntity entity;
-		// Retained for the wave's duration (cleared alongside entity) purely so /wendigo debug can
-		// keep re-drawing its spot/dim-spot particles - not read for any gameplay logic.
+		// Retained across orbit transitions now, not just for one wave's duration - despawn-candidate
+		// ranking data stays available for the next engagement instead of needing a full rescan every
+		// time, and /wendigo debug can keep re-drawing spot/dim-spot particles continuously. Only
+		// cleared when entity itself is genuinely discarded (see relocateOrDiscard/tickOrbitingEntity).
 		WaveContext context;
 		boolean requestPending;
 		int waveStartTick;
 		int cooldownUntilTick;
+		// The single player/group member this level's wendigo is currently committed to - mirrors
+		// WendigoEntity's own lockedTarget (kept in sync whenever a new one is spawned/re-targeted),
+		// but also needed here directly since relocateOrDiscard/tryEnterOrbit run when entity may be
+		// momentarily null (between a discard and the next respawn search).
+		ServerPlayer lockedTarget;
+		// Throttles tryEnterOrbit's own dark-spot search while entity == null - a flood-fill isn't
+		// free, no need to re-run it every single tick while waiting for somewhere valid to appear.
+		int nextRespawnSearchTick;
 		// Set by forceWave/forceWaveWithPlan; makes the completion handler apply
 		// config.debugCooldownTicks instead of the normal cooldown, so a debug/test wave doesn't
 		// leave the automatic severity-triggered spawner armed to fire moments later.
@@ -882,5 +1411,15 @@ public final class WendigoManager {
 		// Consecutive ticks the wendigo has been at extreme close range with the player - see
 		// checkForcedWaveEnd. Reset at the start of each wave and whenever the condition lapses.
 		int extremeProximityTicks;
+		// True from the tick a forced ride ends via a genuine dismount-threshold escape (see
+		// WendigoEntity.consumeFreshEscape) until the target has put actual distance between
+		// themselves and the wendigo - see checkUnconditionalGrab, which must not re-grab someone
+		// who just escaped while they're still standing right where they were caught.
+		boolean grabGraceActive;
+		// Flat time floor on top of grabGraceActive's distance-based grace - covers a player who
+		// escaped but is stuck somewhere (a dead end) they genuinely can't put grab_distance of real
+		// space between themselves and the wendigo. Set alongside grabGraceActive, on the same
+		// consumeFreshEscape() trigger.
+		int grabCooldownUntilTick;
 	}
 }

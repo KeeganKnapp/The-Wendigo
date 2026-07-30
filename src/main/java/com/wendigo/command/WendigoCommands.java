@@ -24,6 +24,8 @@ import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -45,7 +47,8 @@ import com.wendigo.spatial.CaveScaleScanner;
  * spawn/despawn behavior. All bypass the normal cooldown/severity gating, since waiting on real
  * y&lt;0 dwell time isn't practical to test with. {@code debug} toggles the sender's own debug
  * session (see com.wendigo.debug.WendigoDebug) - chat commentary plus scanned-spot/dim-spot/live-
- * path particles for whatever wave is currently active. {@code aggression get/set} reads or
+ * path particles for whatever wave is currently active, plus Night Vision for the duration (removed
+ * when toggled back off). {@code aggression get/set} reads or
  * directly overrides a player's dweller severity, for jumping straight to a given tier instead of
  * grinding real time below y=0. {@code reset} discards the current wave and its cooldown so a fresh
  * {@code wave}/{@code wavetest} can fire right away instead of waiting for the current one to finish.
@@ -107,6 +110,10 @@ public final class WendigoCommands {
 							StringArgumentType.getString(ctx, "file"))))))
 			.then(Commands.literal("debug")
 				.executes(ctx -> toggleDebug(ctx.getSource())))
+			.then(Commands.literal("orbit")
+				.executes(ctx -> forceOrbit(ctx.getSource(), ctx.getSource().getPlayerOrException()))
+				.then(Commands.argument("target", EntityArgument.player())
+					.executes(ctx -> forceOrbit(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))))
 			.then(Commands.literal("headtest")
 				.executes(ctx -> spawnHeadTrackingTest(ctx.getSource())))
 			.then(Commands.literal("reset")
@@ -129,9 +136,18 @@ public final class WendigoCommands {
 	 * spots (colored per spot_a..d), their dim spots (same color, darker), and the wendigo's live
 	 * path (white) - see com.wendigo.debug.WendigoDebug.
 	 */
+	// Far past any realistic debug session length (~14 hours) so it never flicker-warns near
+	// expiring - toggling debug back off removes it explicitly instead of ever letting it run out.
+	private static final int DEBUG_NIGHT_VISION_DURATION_TICKS = 999999;
+
 	private static int toggleDebug(CommandSourceStack source) throws CommandSyntaxException {
 		ServerPlayer player = source.getPlayerOrException();
 		boolean nowEnabled = WendigoDebug.toggle(player);
+		if (nowEnabled) {
+			player.addEffect(new MobEffectInstance(MobEffects.NIGHT_VISION, DEBUG_NIGHT_VISION_DURATION_TICKS, 0, true, true));
+		} else {
+			player.removeEffect(MobEffects.NIGHT_VISION);
+		}
 		source.sendSystemMessage(Component.literal("[wendigo] Debug mode " + (nowEnabled ? "enabled" : "disabled") + "."));
 		return 1;
 	}
@@ -386,6 +402,29 @@ public final class WendigoCommands {
 			Files.writeString(path, DEFAULT_TEST_PLAN_CONTENT);
 		}
 		return JsonParser.parseString(Files.readString(path)).getAsJsonObject();
+	}
+
+	/** Forces the nearest existing WendigoEntity into orbit mode around target (default: the sender)
+	 * - see PlanRunner.startOrbit. Deliberately standalone (doesn't touch WendigoManager/WaveState -
+	 * that persistence/lifecycle wiring is a separate step) so the orbit primitive itself can be
+	 * tested against a manually-spawned entity (e.g. via /wendigo plantest) before the automatic
+	 * spawn/despawn/orbit-transition machinery around it exists. */
+	private static int forceOrbit(CommandSourceStack source, ServerPlayer target) throws CommandSyntaxException {
+		var level = source.getLevel();
+		var pos = source.getPosition();
+		WendigoEntity nearest = level
+			.getEntitiesOfClass(WendigoEntity.class, new AABB(pos, pos).inflate(100))
+			.stream()
+			.findFirst()
+			.orElse(null);
+		if (nearest == null) {
+			source.sendFailure(Component.literal("No WendigoEntity within 100 blocks."));
+			return 0;
+		}
+		nearest.startOrbit(target);
+		source.sendSystemMessage(Component.literal("[wendigo] Entity " + nearest.getId()
+			+ " now orbiting " + target.getGameProfile().name()));
+		return 1;
 	}
 
 	/** Feeds a raw plan JSON straight to the nearest WendigoEntity, e.g. {@code /wendigo plantest {"plan":[{"type":"control.none"}]}}. */

@@ -45,12 +45,15 @@ final class TierGates {
 		};
 	}
 
-	/** Minimum severity percent at which this sound.ambient_cue value is allowed. */
+	/** Minimum severity percent at which this sound.ambient_cue value is allowed - "chase" matches
+	 * combat.lunge_attack's own unlock (the earliest action it could reasonably announce); "flee"/
+	 * "stare"/"ambient" have nothing stricter to match (movement.retreat_with_fallback and
+	 * sound.ambient_cue itself both already unlock at 20%, and posture.stare isn't gated at all), so
+	 * they fall to the same floor sound.ambient_cue's own action-type gate already enforces. */
 	static int minPercentForCue(String cue) {
 		return switch (cue) {
-			case "jumpscare" -> 60;
-			case "caught" -> 40;
-			default -> 20; // "ambience"
+			case "chase" -> 60;
+			default -> 20; // "flee", "stare", "ambient"
 		};
 	}
 

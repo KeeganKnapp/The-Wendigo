@@ -88,7 +88,7 @@ public final class DarknessOverstayTracker {
 			}
 			int ticks = this.darkTicks.merge(id, SAMPLE_INTERVAL_TICKS, Integer::sum);
 			if (ticks % WARNING_NOISE_INTERVAL_TICKS < SAMPLE_INTERVAL_TICKS) {
-				WendigoSounds.play(player.level(), player.blockPosition(), WendigoSounds.Type.DANGER);
+				WendigoSounds.play(player.level(), player.blockPosition(), WendigoSounds.Type.AMBIENT);
 			}
 			int percent = this.severityTracker.severityCap() > 0
 				? 100 * this.severityTracker.severityOf(player) / this.severityTracker.severityCap() : 0;

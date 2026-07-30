@@ -19,7 +19,7 @@ public final class ProximityBands {
 	/** Upper bound of each band, in blocks - used as the threshold for predicate.player_distance. */
 	public static double blocks(String band) {
 		return switch (band) {
-			case "grab_distance" -> 4.0;
+			case "grab_distance" -> 3.0;
 			case "lunge_distance" -> 9.0;
 			case "close_quarters" -> 14.0;
 			case "far" -> 35.0;
@@ -29,7 +29,7 @@ public final class ProximityBands {
 
 	/** Which band a raw distance falls into - used to label spot distances in the wave prompt. */
 	public static String labelFor(double distanceBlocks) {
-		if (distanceBlocks <= 4.0) {
+		if (distanceBlocks <= 3.0) {
 			return "grab_distance";
 		}
 		if (distanceBlocks <= 9.0) {

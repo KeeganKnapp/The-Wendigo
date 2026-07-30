@@ -128,7 +128,7 @@ public final class PlayerSeverityTracker {
 		int after = Math.min(this.config.severityCap, before + amount);
 		this.secondsUnderY0.put(player.getUUID(), after);
 		if (after / WARNING_SOUND_INTERVAL > before / WARNING_SOUND_INTERVAL) {
-			WendigoSounds.play(player.level(), player.blockPosition(), WendigoSounds.Type.WARNING);
+			WendigoSounds.play(player.level(), player.blockPosition(), WendigoSounds.Type.AMBIENT);
 		}
 	}
 

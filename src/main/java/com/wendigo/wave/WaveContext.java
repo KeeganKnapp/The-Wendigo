@@ -15,6 +15,10 @@ import com.wendigo.spatial.DarkSpotScanner;
 /** Engine-scanned context for one wave: the target player, their severity, and labeled dark-spot candidates. */
 public final class WaveContext {
 	private static final String[] SPOT_LABELS = {"spot_a", "spot_b", "spot_c", "spot_d", "spot_e", "spot_f"};
+	/** Number of labeled spot slots (spot_a..spot_f) - public so callers building index-aligned
+	 * parallel lists (see WendigoManager.buildContext's torchSpotPerLabel) know how many slots to fill
+	 * without duplicating the label array itself. */
+	public static final int SPOT_LABEL_COUNT = SPOT_LABELS.length;
 
 	private final ServerPlayer player;
 	private final int severity;
@@ -51,10 +55,17 @@ public final class WaveContext {
 	// Invisible to the model entirely (spawn_at just offers the label like any other spot); only
 	// WendigoManager.spawnWave reads this, to know whether to destroy a torch on arrival there.
 	private final Map<BlockPos, BlockPos> torchLinkedSpots;
+	// Index-aligned with SPOT_LABELS (same nullable-by-short-list convention as spots) - a nearby,
+	// already-reachable torch-spot for that label slot, independent of whether spots filled that same
+	// index. Lets PlanRunner substitute a teleport-to-torch-and-chase for a label whose real dark spot
+	// wasn't found this scan (see PlanRunner's movement.approach_spot handling) - see
+	// torchSpotForLabel.
+	private final List<BlockPos> torchSpotPerLabel;
 
 	public WaveContext(ServerPlayer player, int severity, int severityCap, List<BlockPos> spots, List<Direction> spotNormals,
 			List<List<BlockPos>> dimSpotsPerSpot, List<List<BlockPos>> torchesPerSpot,
-			List<DarkSpotScanner.WaveSpot> torchSpawnCandidates, EncounterHistory.Entry previousEncounter, int nowTick,
+			List<DarkSpotScanner.WaveSpot> torchSpawnCandidates, List<BlockPos> torchSpotPerLabel,
+			EncounterHistory.Entry previousEncounter, int nowTick,
 			CaveScale caveScale, Map<BlockPos, BlockPos> torchLinkedSpots) {
 		this.player = player;
 		this.severity = severity;
@@ -64,6 +75,7 @@ public final class WaveContext {
 		this.dimSpotsPerSpot = dimSpotsPerSpot;
 		this.torchesPerSpot = torchesPerSpot;
 		this.torchSpawnCandidates = torchSpawnCandidates;
+		this.torchSpotPerLabel = torchSpotPerLabel;
 		this.previousEncounter = previousEncounter;
 		this.nowTick = nowTick;
 		this.caveScale = caveScale;
@@ -124,6 +136,17 @@ public final class WaveContext {
 		return null;
 	}
 
+	/** Nearby torch-spot pairings, index-aligned with SPOT_LABELS (same nullable-by-short-list
+	 * convention as spots()) - threaded through PlanRunner.start/startWithApproach the same way
+	 * spots() itself is (see WendigoManager's various startWave/startWithApproach call sites), for
+	 * movement.approach_spot's own per-label lookup (PlanRunner.torchSpotForLabel). Independent of
+	 * whether resolve(label) itself returns non-null: a label can have a torch-spot pairing even when
+	 * its own dark spot wasn't found this scan (that mismatch is exactly what the teleport-substitute
+	 * case looks for). */
+	public List<BlockPos> torchSpotPerLabel() {
+		return this.torchSpotPerLabel;
+	}
+
 	/** Renders this context as the user-prompt text the LLM sees alongside the action schema. */
 	public String toPromptText() {
 		ServerLevel level = this.player.level();
@@ -135,7 +158,7 @@ public final class WaveContext {
 			.append(" (cumulative time spent below y=0 - higher means this has been going on longer). ");
 		sb.append("Current caving scenario: ").append(describeCaveScale())
 			.append(" - how tight or open the space around the player is right now. ");
-		sb.append("Distance bands, nearest to furthest: grab_distance (0-4 blocks), lunge_distance (5-9), "
+		sb.append("Distance bands, nearest to furthest: grab_distance (0-3 blocks), lunge_distance (4-9), "
 			+ "close_quarters (10-14), medium (15-24), far (25+) - the same bands predicate.player_distance "
 			+ "compares against, so you can tell before picking spawn_at whether a spot already sits inside "
 			+ "combat/flee range of the player. ");

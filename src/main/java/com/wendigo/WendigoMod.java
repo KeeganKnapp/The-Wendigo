@@ -14,6 +14,7 @@ import com.wendigo.entity.WendigoEntity;
 import com.wendigo.entity.WendigoVisual;
 import com.wendigo.llm.LlmClient;
 import com.wendigo.llm.LlmConfig;
+import com.wendigo.sound.WendigoSounds;
 import com.wendigo.wave.DarknessOverstayTracker;
 import com.wendigo.wave.EncounterHistory;
 import com.wendigo.wave.PlayerSeverityTracker;
@@ -44,6 +45,7 @@ public class WendigoMod implements ModInitializer {
 	public void onInitialize() {
 		LOGGER.info("Wendigo mod initializing");
 		ModEntities.init();
+		WendigoSounds.init();
 
 		// Marks this mod's own src/main/resources/assets/wendigo (the unpacked AJ resource
 		// pack export) as resource-pack asset source, so Polymer's AutoHost merges and pushes

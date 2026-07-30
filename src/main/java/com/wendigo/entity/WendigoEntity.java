@@ -18,6 +18,7 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.monster.EnderMan;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
@@ -30,6 +31,7 @@ import com.nyfaria.awcapi.entity.IAdvancedClimber;
 
 import com.wendigo.WendigoMod;
 import com.wendigo.plan.PlanRunner;
+import com.wendigo.spatial.CaveScaleScanner.CaveScale;
 import com.wendigo.spatial.DarkSpotScanner;
 
 /**
@@ -120,6 +122,13 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     private final PlanRunner planRunner = new PlanRunner(this);
     private BlockPos storedDarkLocation;
     private boolean navigationFailed;
+    // The single player/group member this wendigo is currently committed to - set once by
+    // WendigoManager (on spawn, or when re-targeting after a fully lost target) and read by
+    // Targeting.nearestPlayer, which checks this before falling back to a plain nearest-player
+    // lookup. Locking here rather than continuously re-resolving "nearest player" is what makes
+    // orbit (see PlanRunner.startOrbit) commit to one target instead of drifting toward whoever's
+    // physically closest at any given moment - a deliberate design choice, not an oversight.
+    private ServerPlayer lockedTarget;
 
     // AWCAPI climbing state - see the class doc comment. Wired exactly as verified via javap
     // against Nyf's Spiders' own SpiderMixin (the reference implementation): a single always-on
@@ -199,6 +208,27 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * it's no longer being punished for being in water at all). */
     @Override
     public boolean isSensitiveToWater() {
+        return false;
+    }
+
+    /** This entity is a WendigoManager-owned singleton (one per level, spawned/relocated/discarded
+     * entirely under its own explicit control - see WaveState.entity) - never written to chunk NBT,
+     * so a server restart never reloads a stale copy WendigoManager's own in-memory WaveState (reset
+     * on restart) has no idea exists. Without this, a wendigo present in a loaded chunk at save time
+     * would come back as an untracked duplicate alongside whatever the manager spawns fresh, since
+     * vanilla persistence and this mod's own lifecycle management would then be running in parallel,
+     * unaware of each other. Verified via javap: Entity.shouldBeSaved() (Mob doesn't override it). */
+    @Override
+    public boolean shouldBeSaved() {
+        return false;
+    }
+
+    /** Same reasoning as shouldBeSaved - this entity's removal is meant to be entirely deliberate
+     * (WendigoManager's own distance/trapped/target-lost checks, not vanilla's own distance-based
+     * despawn-when-far heuristic running in parallel and unpredictably discarding it out from under
+     * the manager's WaveState). Verified via javap: Mob.removeWhenFarAway(double). */
+    @Override
+    public boolean removeWhenFarAway(double distanceToClosestPlayer) {
         return false;
     }
 
@@ -498,13 +528,54 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * labeled spot_a..spot_f list (not just the despawn candidates) so movement.approach_spot can
      * resolve a label mid-plan.
      */
-    public void startWave(JsonObject plan, List<BlockPos> despawnCandidates, List<BlockPos> allSpots, int severityPercent, boolean tierGatingBypassed) {
-        this.planRunner.start(plan, despawnCandidates, allSpots, severityPercent, tierGatingBypassed);
+    public void startWave(JsonObject plan, List<BlockPos> despawnCandidates, List<BlockPos> allSpots, int severityPercent,
+            boolean tierGatingBypassed, CaveScale caveScale, List<BlockPos> torchSpotPerLabel) {
+        this.planRunner.start(plan, despawnCandidates, allSpots, severityPercent, tierGatingBypassed, caveScale, torchSpotPerLabel);
     }
 
     /** True once the current wave's plan body and despawn move have both finished. */
     public boolean isWaveComplete() {
         return this.planRunner.isWaveComplete();
+    }
+
+    /** Enters orbit mode (no active plan - see PlanRunner.startOrbit) around target. */
+    public void startOrbit(ServerPlayer target) {
+        this.planRunner.startOrbit(target);
+    }
+
+    public boolean isOrbiting() {
+        return this.planRunner.isOrbiting();
+    }
+
+    public boolean isOrbitTargetLost() {
+        return this.planRunner.isOrbitTargetLost();
+    }
+
+    public boolean isOrbitTrapped() {
+        return this.planRunner.isOrbitTrapped();
+    }
+
+    /** Post-grab second phase: walk to destination, then enter orbit around target - see
+     * PlanRunner.startReturnToOrbit. */
+    public void startReturnToOrbit(BlockPos destination, ServerPlayer target) {
+        this.planRunner.startReturnToOrbit(destination, target);
+    }
+
+    public boolean isReturningToOrbit() {
+        return this.planRunner.isReturningToOrbit();
+    }
+
+    /** Starts a plan, walking to engageSpot first if not already close - see
+     * PlanRunner.startWithApproach. */
+    public void startWithApproach(BlockPos engageSpot, JsonObject plan, List<BlockPos> despawnCandidates,
+            List<BlockPos> allSpots, int severityPercent, boolean tierGatingBypassed,
+            CaveScale caveScale, List<BlockPos> torchSpotPerLabel) {
+        this.planRunner.startWithApproach(engageSpot, plan, despawnCandidates, allSpots, severityPercent, tierGatingBypassed,
+            caveScale, torchSpotPerLabel);
+    }
+
+    public boolean isApproachingEngageSpot() {
+        return this.planRunner.isApproachingEngageSpot();
     }
 
     /** What actually happened this wave so far - see PlanRunner.EncounterOutcome/EncounterHistory. */
@@ -515,6 +586,16 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     /** True while a player is currently a forced rider - see PlanRunner.isForcingRide. */
     public boolean isForcingRide() {
         return this.planRunner.isForcingRide();
+    }
+
+    /** WendigoManager's grab_distance override - see PlanRunner.forceGrabNow. */
+    public void forceGrabNow(ServerPlayer target) {
+        this.planRunner.forceGrabNow(target);
+    }
+
+    /** See PlanRunner.consumeFreshEscape. */
+    public boolean consumeFreshEscape() {
+        return this.planRunner.consumeFreshEscape();
     }
 
     /** Resolves a still-forced rider (damage or a clean release) before this entity is discarded -
@@ -528,7 +609,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * body with no despawn phase, independent of the wave system. Tier gating bypassed since this
      * is a raw debug tool, not a real wave. */
     public void debugInjectPlan(JsonObject plan) {
-        this.planRunner.start(plan, null, null, 100, true);
+        this.planRunner.start(plan, null, null, 100, true, CaveScale.NORMAL, List.of());
     }
 
     public boolean isCrawling() {
@@ -591,6 +672,15 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
 
     public boolean isStaring() {
         return this.staring;
+    }
+
+    /** See lockedTarget's own field comment. Set by WendigoManager, read by Targeting. */
+    public void setLockedTarget(ServerPlayer target) {
+        this.lockedTarget = target;
+    }
+
+    public ServerPlayer getLockedTarget() {
+        return this.lockedTarget;
     }
 
     // Set only by /wendigo headtest - forces isChasing() true without a real plan/chase action, so a
