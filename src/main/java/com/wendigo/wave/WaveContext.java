@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Map;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
@@ -19,6 +20,13 @@ public final class WaveContext {
 	private final int severity;
 	private final int severityCap;
 	private final List<BlockPos> spots; // nearest -> furthest, index-aligned with SPOT_LABELS
+	// Index-aligned with spots - UP for an ordinary floor spot, DOWN for a ceiling spot (see
+	// DarkSpotScanner.findCeilingSpots/WendigoManager.buildContext's CEILING_SPOT_RESERVE). Purely
+	// descriptive - PlanRunner/resolve(label) don't need it, since a labeled spot's BlockPos paths
+	// and resolves identically either way (DarknessAwareClimberNavigation already routes onto
+	// walls/ceilings as needed) - only toPromptText reads this, to tell the model when a spot isn't
+	// on the floor.
+	private final List<Direction> spotNormals;
 	// Both index-aligned with spots - positions (not just counts) so /wendigo debug can draw them,
 	// not just report a number in the prompt.
 	private final List<List<BlockPos>> dimSpotsPerSpot;
@@ -44,7 +52,7 @@ public final class WaveContext {
 	// WendigoManager.spawnWave reads this, to know whether to destroy a torch on arrival there.
 	private final Map<BlockPos, BlockPos> torchLinkedSpots;
 
-	public WaveContext(ServerPlayer player, int severity, int severityCap, List<BlockPos> spots,
+	public WaveContext(ServerPlayer player, int severity, int severityCap, List<BlockPos> spots, List<Direction> spotNormals,
 			List<List<BlockPos>> dimSpotsPerSpot, List<List<BlockPos>> torchesPerSpot,
 			List<DarkSpotScanner.WaveSpot> torchSpawnCandidates, EncounterHistory.Entry previousEncounter, int nowTick,
 			CaveScale caveScale, Map<BlockPos, BlockPos> torchLinkedSpots) {
@@ -52,6 +60,7 @@ public final class WaveContext {
 		this.severity = severity;
 		this.severityCap = severityCap;
 		this.spots = spots;
+		this.spotNormals = spotNormals;
 		this.dimSpotsPerSpot = dimSpotsPerSpot;
 		this.torchesPerSpot = torchesPerSpot;
 		this.torchSpawnCandidates = torchSpawnCandidates;
@@ -69,6 +78,14 @@ public final class WaveContext {
 	/** The torch this spot is linked to, or null if it's a genuinely dark spot with nothing to break. */
 	public BlockPos linkedTorchFor(BlockPos spot) {
 		return this.torchLinkedSpots.get(spot);
+	}
+
+	/** The surface this spot is attached to (UP for an ordinary floor spot, DOWN for a ceiling spot -
+	 * see DarkSpotScanner.findCeilingSpots) - UP if spot isn't one of the labeled spot_a..spot_f
+	 * positions at all (a torch-spawn/fallback resolution, always floor-only today). */
+	public Direction normalFor(BlockPos spot) {
+		int index = this.spots.indexOf(spot);
+		return index >= 0 && index < this.spotNormals.size() ? this.spotNormals.get(index) : Direction.UP;
 	}
 
 	public CaveScale caveScale() {
@@ -135,9 +152,11 @@ public final class WaveContext {
 				int light = level.getMaxLocalRawBrightness(spot);
 				int dimSpots = i < this.dimSpotsPerSpot.size() ? this.dimSpotsPerSpot.get(i).size() : 0;
 				int torches = i < this.torchesPerSpot.size() ? this.torchesPerSpot.get(i).size() : 0;
+				Direction normal = i < this.spotNormals.size() ? this.spotNormals.get(i) : Direction.UP;
 				sb.append(String.format(
-					"- %s: %.0f blocks away (%s), light level %d, %d nearby dim spots (edge-of-light positions reachable from here), %d nearby torches%n",
-					SPOT_LABELS[i], distance, ProximityBands.labelFor(distance), light, dimSpots, torches));
+					"- %s: %.0f blocks away (%s), light level %d, %d nearby dim spots (edge-of-light positions reachable from here), %d nearby torches%s%n",
+					SPOT_LABELS[i], distance, ProximityBands.labelFor(distance), light, dimSpots, torches,
+					describeSurface(normal)));
 			}
 			sb.append("This is how to reach a spot's dim spots when it isn't the one you spawned at: "
 				+ "movement.approach_spot to get there, then movement.approach_dim_spot (which always searches from "
@@ -157,6 +176,15 @@ public final class WaveContext {
 		}
 		sb.append(describePreviousEncounter());
 		return sb.toString();
+	}
+
+	/** Appended to a spot's prompt line when it isn't an ordinary floor spot - see spotNormals. */
+	private String describeSurface(Direction normal) {
+		return switch (normal) {
+			case DOWN -> ", clinging to the ceiling above";
+			case UP -> "";
+			default -> ", clinging to a wall";
+		};
 	}
 
 	private String describeCaveScale() {

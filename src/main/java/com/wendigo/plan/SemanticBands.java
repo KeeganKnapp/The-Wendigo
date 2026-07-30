@@ -12,7 +12,7 @@ final class SemanticBands {
 	static double speedMultiplier(String speed) {
 		return switch (speed) {
 			case "slow" -> 1.25;
-			case "fast" -> 2.0;
+			case "fast" -> 1.75;
 			default -> 1.5; // "normal"
 		};
 	}

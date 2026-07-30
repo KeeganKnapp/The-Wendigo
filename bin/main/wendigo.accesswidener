@@ -1,0 +1,19 @@
+accessWidener	v1	official
+
+# Widens the vanilla members AWCAPI's ClimberComponent/ClimberHelper need direct access to for
+# wall/ceiling climbing physics (moveControl/lookControl/jumpControl, raw xRot/yRot) - copied
+# verbatim from awcapi-fabric-26.1-1.0.1.jar's own bundled awcapi.accesswidener. AWCAPI's own
+# fabric.mod.json doesn't reference that file itself (confirmed - no "accessWidener" key present),
+# so Fabric Loader never applies it on its own; declaring the same widenings here is what actually
+# makes them take effect. Without this, WendigoEntity's constructor throws IllegalAccessError from
+# ClimberHelper.initClimber the moment a wendigo is spawned (confirmed via a dev-server smoke test).
+accessible field net/minecraft/world/entity/Mob moveControl Lnet/minecraft/world/entity/ai/control/MoveControl;
+accessible field net/minecraft/world/entity/Mob lookControl Lnet/minecraft/world/entity/ai/control/LookControl;
+accessible field net/minecraft/world/entity/Mob jumpControl Lnet/minecraft/world/entity/ai/control/JumpControl;
+accessible field net/minecraft/world/entity/Entity xRot F
+accessible field net/minecraft/world/entity/Entity yRot F
+accessible class net/minecraft/server/level/ChunkMap$TrackedEntity
+accessible field net/minecraft/server/level/ChunkMap entityMap Lit/unimi/dsi/fastutil/ints/Int2ObjectMap;
+accessible field net/minecraft/server/level/ChunkMap$TrackedEntity serverEntity Lnet/minecraft/server/level/ServerEntity;
+accessible field net/minecraft/server/level/ServerEntity tickCount I
+accessible field net/minecraft/server/level/ServerEntity updateInterval I

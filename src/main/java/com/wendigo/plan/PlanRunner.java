@@ -17,6 +17,7 @@ import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.WendigoMod;
 import com.wendigo.debug.WendigoDebug;
@@ -107,6 +108,18 @@ public class PlanRunner {
 	private int stuckInLightTicks;
 	private static final int STUCK_IN_LIGHT_GIVEUP_TICKS = 100; // ~5s motionless and exposed
 	private static final int STUCK_IN_LIGHT_THRESHOLD = 8; // genuinely lit, not just borderline-dark
+	// General-purpose "wedged, no net progress" detector - unlike isStuckMotionlessInLight above
+	// (light-gated, and exact per-tick block-position equality only), this works in the dark too and
+	// catches a mob that's still visibly jittering/bumping tick to tick (e.g. wedged in a tight or
+	// concave gap, repeatedly colliding and re-turning) without ever sitting perfectly still - see
+	// isMakingNoProgress's own comment. Much shorter fuse than either isStuckMotionlessInLight or
+	// vanilla's own isStuck() (which only re-evaluates internally every ~100 ticks, confirmed via
+	// javap against PathNavigation) - sitting visibly wedged in a dark cave for 5+ seconds before
+	// anything reacted was the actual "looks dumb" complaint this exists to fix.
+	private Vec3 noProgressCheckPosition;
+	private int noProgressCheckTicks;
+	private static final int STUCK_NO_PROGRESS_TICKS = 40; // ~2s
+	private static final double STUCK_NO_PROGRESS_DISTANCE_SQR = 0.25; // net displacement under ~0.5 blocks
 	// combat.chase bookkeeping - see isChaseResolved/maybeDestroyNearbyTorches.
 	private int chaseUnreachableTicks;
 	private static final int CHASE_GIVE_UP_TICKS = 100; // ~5s of sustained unreachability
@@ -120,7 +133,7 @@ public class PlanRunner {
 	private static final double LUNGE_SAFE_LIGHT_RADIUS_MIN = 6.0; // at lunge's own unlock threshold
 	private static final double LUNGE_SAFE_LIGHT_RADIUS_MAX = 15.0; // at 100% severity
 	// Forced speed for both combat.lunge_attack and combat.chase, regardless of whatever the model's
-	// plan specified - SemanticBands' fastest tier ("fast" = 2.0).
+	// plan specified - SemanticBands' fastest tier ("fast" = 1.75).
 	private static final double LUNGE_CHASE_SPEED_MULTIPLIER = SemanticBands.speedMultiplier("fast");
 	// How far away the player has to wander before a held stare gives up on being noticed - see
 	// isPlayerTooFarAwayToKeepStaring.
@@ -466,6 +479,13 @@ public class PlanRunner {
 		return "combat.chase".equals(type) || "internal.chase_until_light".equals(type);
 	}
 
+	/** True while the currently-executing action is combat.chase or internal.chase_until_light -
+	 * WendigoVisual reads this (via WendigoEntity.isChasing) to keep the face glowing/head tracking
+	 * the target during an active chase, the same visual treatment a held stare already gets. */
+	public boolean isChasing() {
+		return this.currentAction != null && isChaseType(this.currentAction.get("type").getAsString());
+	}
+
 	/**
 	 * Picks the next despawn target to try - the next pre-scanned candidate, or (once that list is
 	 * exhausted) one live rescan from wherever the entity currently is - and kicks off movement
@@ -633,6 +653,9 @@ public class PlanRunner {
 		// from whatever ran before this can't immediately misfire against a brand new action.
 		this.lastStuckCheckPosition = null;
 		this.stuckInLightTicks = 0;
+		// Same reasoning for isMakingNoProgress's own tracking.
+		this.noProgressCheckPosition = null;
+		this.noProgressCheckTicks = 0;
 		// Only combat.lunge_attack/combat.break_torch re-enable this below - every other action
 		// should stay light-averse, and resetting here (rather than only after those two) covers
 		// every path back to "averse" without needing a matching reset in each other branch.
@@ -826,10 +849,17 @@ public class PlanRunner {
 		String type = this.currentAction.get("type").getAsString();
 		boolean timedOut = this.self.tickCount >= this.actionDeadlineTick;
 		boolean stuckInLight = isMovementType(type) && isStuckMotionlessInLight();
-		if (stuckInLight) {
-			debugSay("issue: stuck motionless in a lit area during " + type + " - giving up on it");
+		// Broader still than stuckInLight - see isMakingNoProgress's own comment for why NET
+		// displacement (not stuckInLight's exact per-tick block-position equality, or vanilla's own
+		// isStuck(), which only re-evaluates internally every ~100 ticks) is needed to catch a mob
+		// wedged in a tight/concave DARK gap (stuckInLight only fires when lit) that's still visibly
+		// jittering/bumping against the obstacle tick to tick without making real progress.
+		boolean noProgress = isPlainMovementType(type) && isMakingNoProgress();
+		if (stuckInLight || noProgress) {
+			debugSay("issue: " + (noProgress ? "wedged, making no real progress" : "stuck motionless in a lit area")
+				+ " during " + type + " - giving up on it");
 		}
-		if (timedOut || stuckInLight) {
+		if (timedOut || stuckInLight || noProgress) {
 			this.self.getNavigation().stop();
 			if (isMovementType(type)) {
 				// A movement action that only ends via timeout/stuck-detection didn't actually arrive -
@@ -842,8 +872,8 @@ public class PlanRunner {
 		}
 		boolean resolved;
 		if (isDespawnAttemptType(type)) {
-			resolved = isDespawnAttemptResolved(timedOut || stuckInLight);
-		} else if (timedOut || stuckInLight) {
+			resolved = isDespawnAttemptResolved(timedOut || stuckInLight || noProgress);
+		} else if (timedOut || stuckInLight || noProgress) {
 			resolved = true;
 		} else {
 			resolved = switch (type) {
@@ -1117,6 +1147,7 @@ public class PlanRunner {
 		};
 	}
 
+
 	/** Resolves a schema spot label (e.g. "spot_c") against the full spot_a..spot_f list handed to
 	 * start() - same label order as WaveContext.resolve, kept in sync by hand. Null if allSpots
 	 * wasn't provided (e.g. a raw debug-injected plan) or the label/index doesn't exist. */
@@ -1201,6 +1232,31 @@ public class PlanRunner {
 			return true;
 		}
 		return false;
+	}
+
+	/** True once NET displacement over the last STUCK_NO_PROGRESS_TICKS has stayed under
+	 * STUCK_NO_PROGRESS_DISTANCE_SQR - unlike isStuckMotionlessInLight's exact per-tick block-position
+	 * equality, this catches a mob that's still moving SOME each tick (bumping/jittering against a
+	 * tight or concave gap it can't actually get through, repeatedly colliding and re-turning -
+	 * exactly what reads as chaotic yaw on the visual side too) without ever registering as literally
+	 * stationary on any single tick. Checked as a snapshot-and-compare over a real window (not a
+	 * rolling average) - simpler, and fine here since a genuinely wedged mob won't suddenly start
+	 * making progress mid-window either way. */
+	private boolean isMakingNoProgress() {
+		Vec3 current = this.self.position();
+		if (this.noProgressCheckPosition == null) {
+			this.noProgressCheckPosition = current;
+			this.noProgressCheckTicks = 0;
+			return false;
+		}
+		this.noProgressCheckTicks++;
+		if (this.noProgressCheckTicks < STUCK_NO_PROGRESS_TICKS) {
+			return false;
+		}
+		boolean noProgress = current.distanceToSqr(this.noProgressCheckPosition) < STUCK_NO_PROGRESS_DISTANCE_SQR;
+		this.noProgressCheckPosition = current;
+		this.noProgressCheckTicks = 0;
+		return noProgress;
 	}
 
 	private boolean arrivedNearPlayer() {

@@ -11,6 +11,7 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 
 /**
@@ -48,7 +49,7 @@ public final class DarkSpotScanner {
 	// SemanticBands.DARKNESS_LIGHT_THRESHOLD (self_in_darkness) - this is "acceptable to spawn/
 	// despawn/hide at", not "fully hidden". Public so PlanRunner can reuse it as the exact same bar
 	// for "is it OK to actually finish despawning here" - see PlanRunner.readyToVanish.
-	public static final int MAX_DARK_LIGHT = 5;
+	public static final int MAX_DARK_LIGHT = 4;
 
 	/**
 	 * Samples a ring of points around origin at the given radius and returns the darkest standable
@@ -142,8 +143,12 @@ public final class DarkSpotScanner {
 	 * torch on arrival. Also reused for spawn_on_torch candidates, where linkedTorch is always
 	 * non-null by definition - distanceFromOrigin there is what SchemaBuilder.minTorchSpawnDistance
 	 * filters against, mirroring spot_b..spot_f's own progressive distance unlock but for this
-	 * separate candidate pool instead of a labeled spot. */
-	public record WaveSpot(BlockPos position, BlockPos linkedTorch, double distanceFromOrigin) {
+	 * separate candidate pool instead of a labeled spot.
+	 *
+	 * <p>surfaceNormal is UP for every ordinary floor spot, DOWN for a ceiling spot (see
+	 * findCeilingSpots), and EAST/WEST/NORTH/SOUTH for a wall spot (see findWallSpots) - the
+	 * direction away from whatever solid surface the position is attached to. */
+	public record WaveSpot(BlockPos position, BlockPos linkedTorch, double distanceFromOrigin, Direction surfaceNormal) {
 		public boolean isTorchLinked() {
 			return linkedTorch != null;
 		}
@@ -163,7 +168,7 @@ public final class DarkSpotScanner {
 	// spot_a itself - the very first, closest spot - is never allowed closer than this to the player,
 	// even if genuinely dark ground exists nearer than that. Spawning right on top of the player
 	// defeats the point of the whole scan regardless of how dark it is there.
-	private static final double MIN_FIRST_SPOT_DISTANCE = 8.0;
+	private static final double MIN_FIRST_SPOT_DISTANCE = 6.0;
 	// Each accepted wave spot must be at least this much farther from the player (straight-line, not
 	// path-length) than the previous one, cumulative from MIN_FIRST_SPOT_DISTANCE (8, 16, 24, 32, 40,
 	// 48) - same "proper distance spread" as before, just now satisfied by a real connected search
@@ -259,9 +264,110 @@ public final class DarkSpotScanner {
 	 * (MAX_FLOOD_VISITED) or its radius (MAX_SEARCH_RADIUS), or there's simply nowhere left to expand.
 	 */
 	public static WaveSpotScan findWaveSpots(Level level, BlockPos origin, int count) {
+		return findAttachableSpots(level, origin, count, Direction.UP);
+	}
+
+	/**
+	 * Same flood-fill as findWaveSpots, searching for ceiling attachment points (normal DOWN -
+	 * solid rock above, open space below) instead of floor ones - lets the wendigo spawn/hide on a
+	 * dark patch of cave ceiling via AWCAPI's climbing (see WendigoEntity), staring down at the
+	 * player from above instead of always being at floor level.
+	 * <p>
+	 * Not extended to wall spots (normal EAST/WEST/NORTH/SOUTH) - a ceiling spot, like a floor spot,
+	 * is still naturally "one XZ column has one ceiling/floor", so it reuses this flood-fill's
+	 * existing column-based data model unchanged (just walking attachableColumn/nearbyAttachable's
+	 * search upward instead of downward - see their own doc comments). A wall spot isn't a function
+	 * of an XZ column at all, it's a function of a vertical face at a given Y band - see
+	 * findWallSpots' own, deliberately lighter-weight approach for that case instead.
+	 */
+	public static WaveSpotScan findCeilingSpots(Level level, BlockPos origin, int count) {
+		return findAttachableSpots(level, origin, count, Direction.DOWN);
+	}
+
+	// How far up a wall (from a ring-sampled floor anchor - see findWallSpots) to probe for a dark
+	// attachment point - first pass, tune by feel.
+	private static final int MAX_WALL_CLIMB_HEIGHT = 32;
+	// Same ring-sampling technique as findDimSpots/findDarkest - NOT the flood-fill's real-
+	// connected-search guarantee findWaveSpots/findCeilingSpots rely on (see findWallSpots' own doc
+	// comment for why that tradeoff is acceptable here) - progressively farther, mirroring the
+	// flood-fill's own distance spread (spotDistanceThreshold's 8/16/24/32/40/48).
+	private static final double[] WALL_SEARCH_RADII = {8.0, 16.0, 24.0, 32.0, 40.0, 48.0};
+	private static final Direction[] HORIZONTAL_DIRECTIONS =
+		{Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST};
+
+	/**
+	 * Wall spots (normal EAST/WEST/NORTH/SOUTH) aren't naturally "one XZ column has one wall" the
+	 * way floor/ceiling spots are - a wall spans a whole range of Y at a fixed XZ edge, not a single
+	 * point per column - so rather than forcing them into findWaveSpots/findCeilingSpots' flood-fill
+	 * data model, this uses the same ring-sampling technique findDimSpots/findDarkest already use
+	 * for a lighter-weight secondary spot type: ring-sample floor anchors around origin (standable,
+	 * but NOT flood-verified reachable the way the primary spot pool is), then from each anchor,
+	 * probe straight up whichever of its 4 horizontal neighbors is solid, requiring every block of
+	 * the climb to be genuinely open-and-wall-backed (isAttachable, no gaps) before accepting a
+	 * position. Reachability here is "walk to this known-standable anchor, then climb this one
+	 * contiguous wall face straight up" - a real path AWCAPI's climbing navigation can always take
+	 * once at the anchor, just not flood-verified the same rigorous way the primary pool is (the
+	 * same looseness already accepted for findDimSpots/torch candidates elsewhere in this class).
+	 */
+	public static WaveSpotScan findWallSpots(Level level, BlockPos origin, int count) {
+		List<WaveSpot> found = new ArrayList<>();
+		for (double radius : WALL_SEARCH_RADII) {
+			if (found.size() >= count) {
+				break;
+			}
+			for (int i : shuffledRingIndices()) {
+				if (found.size() >= count) {
+					break;
+				}
+				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
+				int dx = (int) Math.round(Math.cos(angle) * radius);
+				int dz = (int) Math.round(Math.sin(angle) * radius);
+				BlockPos anchor = standableColumn(level, origin.offset(dx, 0, dz));
+				if (anchor == null) {
+					continue;
+				}
+				WaveSpot wallSpot = findWallSpotAbove(level, anchor, Math.sqrt(anchor.distSqr(origin)), found);
+				if (wallSpot != null) {
+					found.add(wallSpot);
+				}
+			}
+		}
+		return new WaveSpotScan(found, List.of());
+	}
+
+	/** Checks each of the 4 horizontal directions (shuffled, to avoid the same directional bias
+	 * findDarkest's own ring-sampling once had) for a wall right at anchor's own height, then climbs
+	 * straight up that one face (if found) up to MAX_WALL_CLIMB_HEIGHT blocks looking for a dark
+	 * attachment point - stops climbing the instant a gap breaks the wall's continuity. Never
+	 * offers anchor itself (dy=0) as a wall spot - that's just standing on the floor next to a wall,
+	 * not a meaningfully different, elevated attachment point. */
+	private static WaveSpot findWallSpotAbove(Level level, BlockPos anchor, double distance, List<WaveSpot> alreadyFound) {
+		List<Direction> directions = new ArrayList<>(HORIZONTAL_DIRECTIONS.length);
+		Collections.addAll(directions, HORIZONTAL_DIRECTIONS);
+		Collections.shuffle(directions, ThreadLocalRandom.current());
+		for (Direction normal : directions) {
+			if (!isAttachable(level, anchor, normal)) {
+				continue; // no wall in this direction at anchor's own height
+			}
+			for (int dy = 1; dy <= MAX_WALL_CLIMB_HEIGHT; dy++) {
+				BlockPos candidate = anchor.above(dy);
+				if (!isAttachable(level, candidate, normal)) {
+					break; // wall face ended (opening/gap) - stop climbing this one
+				}
+				int light = level.getMaxLocalRawBrightness(candidate);
+				if (light <= MAX_DARK_LIGHT
+						&& alreadyFound.stream().noneMatch(w -> w.position().distSqr(candidate) < MIN_SPOT_SEPARATION_SQR)) {
+					return new WaveSpot(candidate, null, distance, normal);
+				}
+			}
+		}
+		return null;
+	}
+
+	private static WaveSpotScan findAttachableSpots(Level level, BlockPos origin, int count, Direction normal) {
 		List<WaveSpot> spots = new ArrayList<>();
 		List<WaveSpot> torchSpawnCandidates = new ArrayList<>();
-		BlockPos start = standableColumn(level, origin);
+		BlockPos start = attachableColumn(level, origin, normal);
 		if (start == null) {
 			return new WaveSpotScan(spots, torchSpawnCandidates);
 		}
@@ -304,9 +410,9 @@ public final class DarkSpotScanner {
 					int light = level.getMaxLocalRawBrightness(current);
 					WaveSpot accepted = null;
 					if (light <= MAX_DARK_LIGHT) {
-						accepted = new WaveSpot(current, null, distance);
+						accepted = new WaveSpot(current, null, distance, normal);
 					} else if (nearbyTorch != null && !nearbyTorch.isEmpty()) {
-						accepted = new WaveSpot(current, nearbyTorch.get(0), distance);
+						accepted = new WaveSpot(current, nearbyTorch.get(0), distance, normal);
 					}
 					boolean tooCloseToAccepted = accepted != null
 						&& spots.stream().anyMatch(w -> w.position().distSqr(current) < MIN_SPOT_SEPARATION_SQR);
@@ -319,7 +425,7 @@ public final class DarkSpotScanner {
 				}
 				if (nearbyTorch != null && !nearbyTorch.isEmpty() && torchSpawnCandidates.size() < MAX_TORCH_SPAWN_CANDIDATES
 						&& torchSpawnCandidates.stream().noneMatch(w -> w.position().distSqr(current) < MIN_SPOT_SEPARATION_SQR)) {
-					torchSpawnCandidates.add(new WaveSpot(current, nearbyTorch.get(0), distance));
+					torchSpawnCandidates.add(new WaveSpot(current, nearbyTorch.get(0), distance, normal));
 				}
 			}
 
@@ -327,7 +433,7 @@ public final class DarkSpotScanner {
 				continue; // don't expand past the search boundary
 			}
 			for (int i : shuffledFloodDirections()) {
-				BlockPos neighbor = nearbyStandable(level, current.getX() + FLOOD_STEP_DX[i], current.getZ() + FLOOD_STEP_DZ[i], current.getY());
+				BlockPos neighbor = nearbyAttachable(level, current.getX() + FLOOD_STEP_DX[i], current.getZ() + FLOOD_STEP_DZ[i], current.getY(), normal);
 				if (neighbor == null) {
 					continue;
 				}
@@ -355,14 +461,19 @@ public final class DarkSpotScanner {
 	private record FloodNode(BlockPos pos, double cost) {
 	}
 
-	/** Finds the standable floor at (x,z) nearest to referenceY - up to FLOOD_MAX_STEP_UP above it,
-	 * down to FLOOD_MAX_STEP_DOWN below - for flood-fill neighbor expansion (a small window relative
-	 * to the CURRENT node, unlike standableColumn's several-fixed-layers scheme meant for locating an
-	 * unknown column from far away). */
-	private static BlockPos nearbyStandable(Level level, int x, int z, int referenceY) {
+	/** Finds the floor (normal UP) or ceiling (normal DOWN) attachment point at (x,z) nearest to
+	 * referenceY - up to FLOOD_MAX_STEP_UP above it, down to FLOOD_MAX_STEP_DOWN below - for
+	 * flood-fill neighbor expansion (a small window relative to the CURRENT node, unlike
+	 * attachableColumn's several-fixed-layers scheme meant for locating an unknown column from far
+	 * away). The window itself isn't mirrored for ceiling search (same absolute up/down reach either
+	 * way, not "generous toward the ceiling instead of the floor") - unlike attachableColumn's own
+	 * relax direction (which has to invert to find a ceiling at all), this window is just a
+	 * reachability-heuristic tuning knob with no strong physical reasoning either way; first pass,
+	 * adjust by feel once ceiling spots are actually visible in a live client. */
+	private static BlockPos nearbyAttachable(Level level, int x, int z, int referenceY, Direction normal) {
 		for (int dy = FLOOD_MAX_STEP_UP; dy >= -FLOOD_MAX_STEP_DOWN; dy--) {
 			BlockPos pos = new BlockPos(x, referenceY + dy, z);
-			if (isPassable(level, pos) && !isPassable(level, pos.below())) {
+			if (isAttachable(level, pos, normal)) {
 				return pos;
 			}
 		}
@@ -540,16 +651,29 @@ public final class DarkSpotScanner {
 	 * above to be passable, so a single-block-tall crevice qualifies too, not just a full 2-block
 	 * standing space. WendigoEntity's own dynamic pose switch shrinks it into its crawl hitbox
 	 * wherever standing clearance isn't actually there (including right on spawn), and
-	 * DarknessNodeEvaluator lets pathfinding route through a gap this tight in the first place - this
-	 * scan just needs to agree that the spot exists at all. Returns null if every layer's relax
-	 * search comes up solid/empty-handed (e.g. the whole column is inside rock).
+	 * DarknessAwareClimberNodeEvaluator lets pathfinding route through a gap this tight in the first
+	 * place - this scan just needs to agree that the spot exists at all. Returns null if every
+	 * layer's relax search comes up solid/empty-handed (e.g. the whole column is inside rock).
 	 */
 	private static BlockPos standableColumn(Level level, BlockPos column) {
+		return attachableColumn(level, column, Direction.UP);
+	}
+
+	/**
+	 * Generalizes standableColumn to an arbitrary attachment surface - normal UP is exactly
+	 * standableColumn's own floor search (relaxes downward from each layer, looking for solid
+	 * ground below an open block); normal DOWN mirrors it for a ceiling (relaxes upward instead,
+	 * looking for solid rock above an open block) - see findCeilingSpots. The relax direction has to
+	 * invert for correctness (searching downward can never find a ceiling), unlike
+	 * nearbyAttachable's own window, which stays unmirrored on purpose (see that method's comment).
+	 */
+	private static BlockPos attachableColumn(Level level, BlockPos column, Direction normal) {
+		int relaxSign = normal == Direction.UP ? -1 : 1;
 		for (int layerOffset : LAYER_Y_OFFSETS) {
 			BlockPos layerStart = column.offset(0, layerOffset, 0);
-			for (int dy = 0; dy >= -RELAX_DEPTH; dy--) {
-				BlockPos pos = layerStart.offset(0, dy, 0);
-				if (isPassable(level, pos) && !isPassable(level, pos.below())) {
+			for (int step = 0; step <= RELAX_DEPTH; step++) {
+				BlockPos pos = layerStart.offset(0, step * relaxSign, 0);
+				if (isAttachable(level, pos, normal)) {
 					return pos;
 				}
 			}
@@ -563,6 +687,14 @@ public final class DarkSpotScanner {
 	 * and force its crawl pose/hitbox when it doesn't - see the entity's own tick(). */
 	public static boolean hasStandingClearance(Level level, BlockPos pos) {
 		return isPassable(level, pos) && isPassable(level, pos.above()) && isPassable(level, pos.above(2));
+	}
+
+	/** True if pos itself is open and the block behind it (relative to normal - the direction the
+	 * attached mob faces AWAY from the surface) is solid: normal UP is an ordinary floor check
+	 * (solid ground below, matching the old isPassable(pos) && !isPassable(pos.below())), normal
+	 * DOWN is its ceiling mirror (solid rock above). */
+	private static boolean isAttachable(Level level, BlockPos pos, Direction normal) {
+		return isPassable(level, pos) && !isPassable(level, pos.relative(normal.getOpposite()));
 	}
 
 	private static boolean isPassable(Level level, BlockPos pos) {

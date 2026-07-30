@@ -23,6 +23,7 @@
 	"mixins": [
 		"wendigo.mixins.json"
 	],
+	"accessWidener": "wendigo.accesswidener",
 	"depends": {
 		"fabricloader": ">=0.19.3",
 		"minecraft": "~26.1.2",
@@ -30,6 +31,7 @@
 		"fabric-api": "*",
 		"polymer-core": "*",
 		"polymer-virtual-entity": "*",
-		"polymer-resource-pack": "*"
+		"polymer-resource-pack": "*",
+		"awcapi": "*"
 	}
 }

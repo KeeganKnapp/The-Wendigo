@@ -22,6 +22,12 @@ repositories {
 loom {
 	splitEnvironmentSourceSets()
 
+	// Widens a handful of protected vanilla fields (Mob.moveControl/lookControl/jumpControl,
+	// Entity.xRot/yRot) that AWCAPI's ClimberComponent needs direct access to - see
+	// wendigo.accesswidener's own comment for why this has to live here rather than coming
+	// for free from AWCAPI's own jar.
+	accessWidenerPath = file("src/main/resources/wendigo.accesswidener")
+
 	mods {
 		"wendigo" {
 			sourceSet sourceSets.main
@@ -53,6 +59,20 @@ dependencies {
 	// (runServer/runClient) right now. Shade/include the full dependency graph before
 	// distributing this mod as a standalone jar to other server admins.
 	implementation "com.anthropic:anthropic-java:2.34.0"
+
+	// Advanced Wall Climber API (AWCAPI, by Nyfaria: https://nyfaria.com/docs) - real spider-style
+	// wall/ceiling climbing physics + pathfinding, used by WendigoEntity for wall/ceiling movement.
+	// Deliberately NOT include()'d: AWCAPI's license explicitly forbids embedding its jar - it must
+	// stay a real, separately-installed server-side mod dependency (see fabric.mod.json's "awcapi"
+	// entry in `depends`), same as any server admin installing two mods side by side.
+	// This is a local jar, not a Maven coordinate: AWCAPI's public repo (maven.100media.dev) only
+	// publishes builds up to MC 1.21.1 - nothing for this project's 26.1.2 line yet. The jar in
+	// libs/ was extracted (unmodified) from the awcapi-fabric-26.1-1.0.1.jar nested inside
+	// nyfsspiders-fabric-26.1-3.0.0.jar (which itself ships awcapi as a Fabric nested jar) -
+	// already mapped to Mojang "official" names (verified via its own META-INF/MANIFEST.MF), so no
+	// remapping step is needed. Swap this for a real Maven coordinate once AWCAPI publishes a
+	// 26.1.2 build.
+	implementation files('libs/awcapi-fabric-26.1-1.0.1.jar')
 }
 
 processResources {

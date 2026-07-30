@@ -4,33 +4,52 @@ import java.util.List;
 
 import com.google.gson.JsonObject;
 
+import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.Pose;
+import net.minecraft.world.entity.ai.attributes.AttributeModifier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.monster.EnderMan;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
+import com.nyfaria.awcapi.ClimberHelper;
+import com.nyfaria.awcapi.entity.ClimberComponent;
+import com.nyfaria.awcapi.entity.IAdvancedClimber;
+
+import com.wendigo.WendigoMod;
 import com.wendigo.plan.PlanRunner;
 import com.wendigo.spatial.DarkSpotScanner;
 
 /**
  * Reuses vanilla Enderman for its class (attributes, teleport/fall-damage immunity etc.), but is
  * always invisible, has no AI Goals of its own beyond basic swim/float safety, and swaps in a low
- * horizontal "crawling" hitbox/pose whenever it's moving, or whenever its current position simply
- * doesn't have room to stand (see updatePose) - which, combined with DarkSpotScanner's spawn scan
- * and DarknessNodeEvaluator's pathfinding, lets it spawn in and route through single-block
- * crevices a standing hitbox never could. All visuals come from the {@link WendigoVisual} rig
- * attached in {@code WendigoMod}'s ServerEntityEvents hooks, not from this entity's own
- * (suppressed) model.
+ * horizontal "crawling" hitbox/pose whenever it's moving, whenever its current position simply
+ * doesn't have room to stand, or whenever it isn't resting on a horizontal floor at all (see
+ * updatePose) - which, combined with DarkSpotScanner's spawn scan and
+ * DarknessAwareClimberNodeEvaluator's pathfinding, lets it spawn in and route through single-block
+ * crevices (and, via AWCAPI, up walls and across ceilings) a standing hitbox never could. All
+ * visuals come from the {@link WendigoVisual} rig attached in {@code WendigoMod}'s
+ * ServerEntityEvents hooks, not from this entity's own (suppressed) model.
+ *
+ * <p>Also implements {@link IAdvancedClimber} (from the AWCAPI mod dependency - see build.gradle)
+ * for spider-style wall/ceiling climbing physics, always-on rather than a toggled mode (mirrors
+ * how vanilla Spider is wired - a ClimberComponent decides ground vs. attached travel per tick on
+ * its own; there's no separate "climbing mode" to switch into). See
+ * DarknessAwareClimberNavigation's own doc comment for the pathfinding side.
  */
-public class WendigoEntity extends EnderMan {
+public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     // Enderman's own tall/narrow hitbox doesn't suit a low horizontal crawl -- swap to a low
     // profile while crawling. Reuses Pose.SWIMMING as the "crawling" signal since Enderman never
     // naturally enters it (no swim/sneak AI), rather than trying to swap the entity's actual Java
@@ -68,14 +87,51 @@ public class WendigoEntity extends EnderMan {
     // pose to be stable for a few consecutive ticks before actually committing to it damps that
     // flicker.
     private static final int POSE_SWITCH_DEBOUNCE_TICKS = 5;
+    // A fast, jittery corner transition (e.g. an outside/convex ceiling-to-wall corner) can read as
+    // briefly resting on a horizontal floor for a tick or two before AWCAPI's own attachment
+    // settles onto the new surface - see isRestingOnFloor's own doc comment for why that's worth
+    // debouncing here, not just smoothing downstream.
+    private static final int RESTING_ON_FLOOR_DEBOUNCE_TICKS = 5;
+    // Mirrors SpiderMixin's own FOLLOW_RANGE_INCREASE exactly (verified via javap: an ADD_VALUE +8.0
+    // permanent modifier, applied once at construction) - a climbing route up/around a wall or
+    // ceiling covers more real distance than a straight-line target-tracking check accounts for, so
+    // without this a wendigo could lose track of a target it's genuinely still capable of reaching.
+    private static final AttributeModifier FOLLOW_RANGE_CLIMB_BONUS = new AttributeModifier(
+        WendigoMod.id("climb_follow_range_bonus"), 8.0, AttributeModifier.Operation.ADD_VALUE);
+    // Attributes.WATER_MOVEMENT_EFFICIENCY (verified via javap against LivingEntity#travelInWater in
+    // this MC version's own mapped jar - the modern, data-driven replacement for the old "override
+    // getWaterSlowDown()" approach) blends water movement toward full out-of-water speed as it
+    // approaches 1.0 - already part of every LivingEntity's base attribute set (createLivingAttributes,
+    // confirmed via javap - EnderMan.createAttributes() builds on it, so no separate registration is
+    // needed here), just defaulted to 0 (normal water drag) for a generic mob. A permanent +1.0
+    // modifier, same pattern/timing as FOLLOW_RANGE_CLIMB_BONUS above, makes the wendigo swim at
+    // essentially full speed instead of the usual heavy water slowdown - see isSensitiveToWater() for
+    // the other half of "don't act like vanilla Enderman in water" (that one stops it taking damage
+    // and being knocked into a panic-teleport by water contact; this one is the actual swim speed).
+    private static final AttributeModifier FAST_SWIM_BONUS = new AttributeModifier(
+        WendigoMod.id("fast_swim_bonus"), 1.0, AttributeModifier.Operation.ADD_VALUE);
 
     private WendigoVisual visual;
     private boolean staring;
     private Pose desiredPose = Pose.STANDING;
     private int desiredPoseStableTicks;
+    private boolean restingOnFloorDebounced = true;
+    private int restingOnFloorStableTicks;
     private final PlanRunner planRunner = new PlanRunner(this);
     private BlockPos storedDarkLocation;
     private boolean navigationFailed;
+
+    // AWCAPI climbing state - see the class doc comment. Wired exactly as verified via javap
+    // against Nyf's Spiders' own SpiderMixin (the reference implementation): a single always-on
+    // ClimberComponent, physics overrides below delegating to ClimberHelper's static glue methods
+    // in the same call order/pre-post-super pattern the mixin uses, and four lerp fields AWCAPI's
+    // own internal smoothing writes through setLerp*() - not rendering-visible here since this
+    // entity is always invisible (see isInvisible()), but still required to implement the interface.
+    private final ClimberComponent climberComponent = new ClimberComponent(this);
+    private Float lerpYRot;
+    private Float lerpXRot;
+    private Float lerpYHeadRot;
+    private int lerpHeadSteps;
 
     public WendigoEntity(EntityType<? extends EnderMan> entityType, Level level) {
         super(entityType, level);
@@ -86,11 +142,35 @@ public class WendigoEntity extends EnderMan {
         // getAmbientSound() to a custom value, since WendigoSounds.play() goes through
         // ServerLevel.playSound directly - unaffected by isSilent() either way.
         this.setSilent(true);
+        ClimberHelper.initClimber(this);
+        this.getAttribute(Attributes.FOLLOW_RANGE).addPermanentModifier(FOLLOW_RANGE_CLIMB_BONUS);
+        this.getAttribute(Attributes.WATER_MOVEMENT_EFFICIENCY).addPermanentModifier(FAST_SWIM_BONUS);
+        // Tried raising STEP_HEIGHT here (initClimber sets it to 0.1) to speed up ordinary floor
+        // ledge-crossing - reverted. It's the one thing that changed between a live test where wall/
+        // ceiling attachment tilt worked and a later one where the rig stayed flat everywhere, and
+        // AWCAPI's own walking-side probe (ClimberComponent.updateWalkingSide, which getGroundSide()
+        // reads) scans nearby collision boxes relative to the mob's own bounding box - a much taller
+        // allowed step plausibly changes how that geometry reads near a wall. Left at AWCAPI's own
+        // default rather than guessing a "safer" intermediate value blind; the original "feels slow
+        // climbing a block at a time" complaint needs revisiting only once attachment itself is
+        // confirmed working correctly again.
+        //
+        // Widened from AWCAPI's own defaults (2.0/1.25, verified via javap against ClimberComponent's
+        // constructor) - live testing found the wendigo sometimes losing its wall/ceiling attachment
+        // entirely (falling) specifically crossing an outside/convex corner (e.g. ceiling wrapping
+        // onto a wall around a protruding edge). These are exactly the search-range parameters
+        // ClimberComponent.updateOffsetsAndOrientation uses (via CollisionSmoothingUtil.findClosestPoint)
+        // to find a nearby surface to refine attachment against each tick - a convex corner is
+        // precisely the geometry where a short search radius can come up empty on both adjoining
+        // faces at once. First pass, adjust by feel - this is a genuine AWCAPI-side edge case being
+        // mitigated, not something confirmed fixed outright (no way to test this live from here).
+        this.setCollisionsInclusionRange(4.0F);
+        this.setCollisionsSmoothingRange(2.5F);
     }
 
     @Override
     protected PathNavigation createNavigation(Level level) {
-        return new DarknessAwareNavigation(this, level);
+        return new DarknessAwareClimberNavigation(this, level);
     }
 
     /** Cobwebs shouldn't slow this thing down any more than they slow down a spider - a cave-horror
@@ -106,18 +186,132 @@ public class WendigoEntity extends EnderMan {
         }
     }
 
-    /** See DarknessNodeEvaluator.lightTolerant - PlanRunner toggles this around the two primitives
+    /** Vanilla Enderman returns true here (verified via javap), which is what actually drives the
+     * "teleports away in water" behavior the user asked to remove - it's not a dedicated water-avoid
+     * goal (this entity has none, see the class doc comment), it's LivingEntity's own baseTick
+     * calling hurtServer(damageSources().drown(), 1.0F) every tick this is true while in water or
+     * rain (confirmed via javap against LivingEntity), and EnderMan's own hurtServer override
+     * (verified via javap) has a 1-in-10 chance to call teleport() on any hurtServer call whose
+     * damage source isn't from a LivingEntity - which environmental drown damage always qualifies
+     * as. Repeated water-damage ticks compound that into "teleports away almost immediately on
+     * touching water". Returning false here removes the damage entirely, and with it this whole
+     * teleport pathway - see FAST_SWIM_BONUS for the other half (making it actually swim well once
+     * it's no longer being punished for being in water at all). */
+    @Override
+    public boolean isSensitiveToWater() {
+        return false;
+    }
+
+    // --- IAdvancedClimber physics wiring -----------------------------------------------------
+    // Every override below mirrors SpiderMixin's exact call order (verified via javap -c
+    // disassembly of the actual compiled mixin, not guessed from documentation): ClimberHelper
+    // decides per tick whether the mob is attached to a climbable surface and, if so, substitutes
+    // its own surface-relative physics in place of (or alongside) the vanilla gravity-based path.
+
+    @Override
+    public void aiStep() {
+        ClimberHelper.livingTickClimber(this);
+        super.aiStep();
+    }
+
+    @Override
+    public void move(MoverType type, Vec3 delta) {
+        ClimberHelper.handleMove(this, type, delta, true);
+        super.move(type, delta);
+        ClimberHelper.handleMove(this, type, delta, false);
+    }
+
+    @Override
+    public BlockPos getOnPos() {
+        return ClimberHelper.getAdjustedOnPosition(this, super.getOnPos());
+    }
+
+    @Override
+    public void travel(Vec3 relative) {
+        if (!ClimberHelper.handleTravel(this, relative)) {
+            super.travel(relative);
+        }
+        ClimberHelper.postTravel(this, relative);
+    }
+
+    @Override
+    public void jumpFromGround() {
+        if (!ClimberHelper.handleJump(this)) {
+            super.jumpFromGround();
+        }
+    }
+
+    @Override
+    public void lookAt(EntityAnchorArgument.Anchor anchor, Vec3 target) {
+        Vec3 relative = target.subtract(this.position());
+        Vec3 local = this.getOrientation().getLocal(relative);
+        super.lookAt(anchor, this.position().add(local));
+    }
+
+    @Override
+    public ClimberComponent getClimberComponent() {
+        return this.climberComponent;
+    }
+
+    /** AWCAPI's own default (true unless a deny-list tag is set - see IAdvancedClimber's own doc
+     * comment, verified via javap) treats a fence post as just another climbable vertical surface,
+     * the same as a real wall - reads wrong for a large creature climbing on a thin, spindly fence.
+     * Excluded explicitly rather than via a deny-list tag since this is the only exclusion needed
+     * so far - extends rather than replaces whatever the default already covers. */
+    @Override
+    public boolean canClimbOnBlock(BlockState state, BlockPos pos) {
+        return IAdvancedClimber.super.canClimbOnBlock(state, pos) && !state.is(BlockTags.FENCES);
+    }
+
+    @Override
+    public Mob asMob() {
+        return this;
+    }
+
+    @Override
+    public float getMovementSpeed() {
+        return (float) this.getAttributeValue(Attributes.MOVEMENT_SPEED);
+    }
+
+    @Override
+    public float getBlockSlipperiness(BlockPos pos) {
+        return this.level().getBlockState(pos).getBlock().getFriction();
+    }
+
+    @Override
+    public void setLerpYRot(Float lerpYRot) {
+        this.lerpYRot = lerpYRot;
+    }
+
+    @Override
+    public void setLerpXRot(Float lerpXRot) {
+        this.lerpXRot = lerpXRot;
+    }
+
+    @Override
+    public void setLerpYHeadRot(Float lerpYHeadRot) {
+        this.lerpYHeadRot = lerpYHeadRot;
+    }
+
+    @Override
+    public void setLerpHeadSteps(int lerpHeadSteps) {
+        this.lerpHeadSteps = lerpHeadSteps;
+    }
+
+    // --- end IAdvancedClimber physics wiring --------------------------------------------------
+
+    /** See DarknessMalus.lightTolerant - PlanRunner toggles this around the two primitives
      * (combat.lunge_attack, combat.break_torch) that are meant to cross into light on purpose. */
     public void setLightTolerantPathing(boolean tolerant) {
-        if (this.getNavigation() instanceof DarknessAwareNavigation navigation) {
+        if (this.getNavigation() instanceof DarknessAwareClimberNavigation navigation) {
             navigation.setLightTolerant(tolerant);
         }
     }
 
-    /** See DarknessNodeEvaluator.severityPercent - PlanRunner.start calls this with the current
+    /** See DarknessMalus.severityPercent - PlanRunner.start calls this with the current
      * wave's severity so early-stage pathfinding can hard-refuse routes through real light. */
     public void setSeverityPercent(int severityPercent) {
-        if (this.getNavigation() instanceof DarknessAwareNavigation navigation) {
+        if (this.getNavigation() instanceof DarknessAwareClimberNavigation navigation) {
             navigation.setSeverityPercent(severityPercent);
         }
     }
@@ -133,6 +327,11 @@ public class WendigoEntity extends EnderMan {
     @Override
     public void tick() {
         super.tick();
+        // Matches SpiderMixin's own injection point (verified via javap -v: @Inject(method="tick",
+        // at=@At("RETURN"))) - ClimberHelper.tickClimber updates attachment/orientation state once
+        // per tick, after the rest of this tick's physics have already run.
+        ClimberHelper.tickClimber(this);
+        updateRestingOnFloorDebounce();
         updatePose();
 
         if (!this.level().isClientSide()) {
@@ -147,14 +346,68 @@ public class WendigoEntity extends EnderMan {
         return DarkSpotScanner.hasStandingClearance(this.level(), this.blockPosition());
     }
 
-    /** Crawl pose is forced by two independent triggers - moving (the original mechanic) or simply
-     * not having room to stand at all right now (new: DarknessNodeEvaluator's entityHeight override
-     * lets pathfinding route through a 1-block gap, and the spawn scan can now place it in one - so
-     * physically fitting there has to be automatic, not just a byproduct of already moving). */
+    /** True only while resting on a genuine horizontal floor - false while attached to a wall or
+     * ceiling. A 2.0F-tall standing hitbox only makes physical sense flat on the floor; off a wall it
+     * would jut straight out into open air, so climbing forces the same low crawl hitbox a floor
+     * crevice does (see updatePose). Also read by WendigoVisual to decide whether the rig needs a
+     * wall/ceiling-tilted orientation this tick - deliberately reads getOrientation().normal (the
+     * same signal WendigoVisual's own tilt composition is built from), not
+     * ClimberComponent.getGroundSide(). Those two aren't the same thing (verified via javap):
+     * getGroundSide() reads a separate "nearest walking surface" probe (updateWalkingSide) with only
+     * a 0.1-block reach while not actively moving, which can disagree with the actual render-driving
+     * attachment normal - using the same signal for both the pose switch and the tilt makes them
+     * provably consistent with each other instead of two independent guesses that could drift apart.
+     *
+     * <p>Debounced (see updateRestingOnFloorDebounce), not the raw per-tick reading - this gates a
+     * whole different WendigoVisual rendering codepath (plain standing/crawling vs. the tilted-rig
+     * composition), not just a smoothed value, so a single noisy tick reading "on floor" mid-climb
+     * (live testing: happens crossing certain outside/convex corners, e.g. ceiling to wall) would
+     * otherwise cause a visible one-tick snap all the way back to plain floor rendering instead of a
+     * smooth continuation of the climb. */
+    public boolean isRestingOnFloor() {
+        return this.restingOnFloorDebounced;
+    }
+
+    private boolean restingOnFloorRaw() {
+        return this.getOrientation().normal.y > 0.9;
+    }
+
+    /** Symmetric: either direction only commits after RESTING_ON_FLOOR_DEBOUNCE_TICKS consecutive
+     * readings that disagree with the currently-committed value - see isRestingOnFloor's own doc
+     * comment for why a noisy blip shouldn't count. Used to be asymmetric (leaving the floor
+     * committed instantly, on the theory that a genuine "just started climbing" transition should
+     * never be delayed) - but a genuinely sloped floor sits right at the restingOnFloorRaw threshold
+     * (normal.y just above/below 0.9) and AWCAPI's own collision-smoothing search jitters around it
+     * tick to tick (the same noise WendigoVisual's ORIENTATION_LERP_FACTOR comment documents), so an
+     * instant-leave reacted to every one of those jitters - which, combined with WendigoVisual
+     * reading this same flag directly for its tilted-vs-flat rendering choice, produced a visible
+     * three-way cycle while walking a slope (tilted crawl -> flat crawl -> standing -> back to
+     * tilted) tracking the jitter far faster than a real wall/ceiling transition ever needs to be
+     * caught. A few ticks of delay on a genuine climb-onto-a-wall transition is an acceptable
+     * tradeoff for that no longer happening. */
+    private void updateRestingOnFloorDebounce() {
+        boolean raw = restingOnFloorRaw();
+        if (raw == this.restingOnFloorDebounced) {
+            this.restingOnFloorStableTicks = 0;
+        } else {
+            this.restingOnFloorStableTicks++;
+            if (this.restingOnFloorStableTicks >= RESTING_ON_FLOOR_DEBOUNCE_TICKS) {
+                this.restingOnFloorDebounced = raw;
+                this.restingOnFloorStableTicks = 0;
+            }
+        }
+    }
+
+    /** Crawl pose is forced by three independent triggers - moving (the original mechanic), simply
+     * not having room to stand at all right now (DarknessAwareClimberNodeEvaluator's entityHeight
+     * override lets pathfinding route through a 1-block gap, and the spawn scan can now place it in one - so
+     * physically fitting there has to be automatic, not just a byproduct of already moving), or not
+     * resting on a horizontal floor at all (climbing a wall/ceiling - see isRestingOnFloor). */
     private void updatePose() {
         boolean moving = isMoving();
         boolean noRoomToStand = !hasStandingClearanceHere();
-        Pose desired = (moving || noRoomToStand) ? Pose.SWIMMING : Pose.STANDING;
+        boolean climbing = !isRestingOnFloor();
+        Pose desired = (moving || noRoomToStand || climbing) ? Pose.SWIMMING : Pose.STANDING;
         if (desired == this.desiredPose) {
             this.desiredPoseStableTicks++;
         } else {
@@ -168,7 +421,18 @@ public class WendigoEntity extends EnderMan {
         // few ticks before the crawl animation caught up - switch to it immediately instead. A
         // sudden loss of standing room (arriving at a crevice) gets the same instant treatment, for
         // the same reason - waiting out a debounce while physically wedged makes no sense either.
-        boolean startingToCrawl = desired == Pose.SWIMMING && this.getPose() == Pose.STANDING;
+        //
+        // "climbing" deliberately does NOT get that same instant treatment, unlike the other two -
+        // on a sloped or naturally bumpy floor, isRestingOnFloor's underlying attachment-normal
+        // reading is inherently noisy tick to tick (the same AWCAPI collision-smoothing noise
+        // WendigoVisual's ORIENTATION_LERP_FACTOR comment documents), and letting a single noisy tick
+        // instantly snap to crawl - while recovery back to standing still needed a full multi-tick
+        // debounce - compounded into visible rapid flicker walking a slope. There's no real urgency
+        // to react to "climbing" instantly the way there is for an actual lunge or a genuine crevice,
+        // so debouncing it in both directions just makes it stop flickering, without giving up
+        // standing pose in genuinely open, flat areas.
+        boolean urgentCrawlTrigger = moving || noRoomToStand;
+        boolean startingToCrawl = desired == Pose.SWIMMING && this.getPose() == Pose.STANDING && urgentCrawlTrigger;
         boolean debounceSatisfied = this.desiredPoseStableTicks >= POSE_SWITCH_DEBOUNCE_TICKS;
         if ((startingToCrawl || debounceSatisfied) && this.getPose() != desired) {
             this.setPose(desired);
@@ -188,6 +452,44 @@ public class WendigoEntity extends EnderMan {
         this.desiredPoseStableTicks = 0;
         this.setPose(desired);
         this.refreshDimensions();
+    }
+
+    // How hard to nudge toward a ceiling/wall spawn spot's surface, in blocks/tick - just enough to
+    // guarantee a real collision against it within the first tick or two, not a meaningful shove.
+    private static final double SPAWN_SURFACE_NUDGE_SPEED = 0.1;
+
+    /** Best-effort mitigation for a real, still only partly understood problem: a wendigo spawned
+     * (teleported, not walked/climbed into place) directly onto a ceiling spot (see
+     * DarkSpotScanner.findCeilingSpots) falls straight off it instead of sticking - live testing
+     * confirmed this. AWCAPI's own per-tick travel logic (ClimberComponent.travelOnGround, verified
+     * via javap to run every tick regardless of any cached attachment state - ClimberHelper always
+     * passes isControlled=true) is genuinely reachable from tick one, but a freshly-spawned,
+     * motionless entity has nothing to move toward yet - no plan step has issued a moveTo(), so
+     * there's no real collision for its own surface-detection to react to before ordinary gravity
+     * (which runs whenever ClimberComponent doesn't recognize an attachment) has already pulled it
+     * away. A small, one-tick velocity straight into the surface (normal.getOpposite() - away from
+     * the surface is normal's own direction, so toward it is the opposite) forces a genuine
+     * collision on the very next physics step regardless of what the plan does first, giving AWCAPI
+     * something concrete to react to. Called once, right after snapTo/addFreshEntity, same timing as
+     * syncPoseToSpawnPosition - a no-op (normal.getOpposite() of UP is DOWN, and ordinary gravity
+     * already provides that) for every ordinary floor spawn, so this can't regress the already-
+     * working case. Unverified beyond that reasoning - flagged clearly as experimental, unlike this
+     * feature's other, live-confirmed fixes. */
+    public void nudgeTowardAttachedSurface(Direction normal) {
+        if (normal == Direction.UP) {
+            return;
+        }
+        nudgeTowardAttachedSurface(new Vec3(normal.getStepX(), normal.getStepY(), normal.getStepZ()));
+    }
+
+    /** Diagonal-normal overload of the above, for a test spawn deliberately placed at a convex block
+     * corner (see /wendigo headtest's incline slot) where no single {@link Direction} describes the
+     * attachment - AWCAPI's own collision smoothing (see the constructor's
+     * setCollisionsInclusionRange/setCollisionsSmoothingRange comment) is what actually resolves the
+     * blended corner normal from real geometry once nudged toward it; this just has to aim the nudge
+     * roughly at the corner instead of a single face. */
+    public void nudgeTowardAttachedSurface(Vec3 normal) {
+        this.setDeltaMovement(normal.normalize().scale(-SPAWN_SURFACE_NUDGE_SPEED));
     }
 
     /**
@@ -233,20 +535,22 @@ public class WendigoEntity extends EnderMan {
         return this.getPose() == Pose.SWIMMING;
     }
 
-    /** Real horizontal-velocity movement check, independent of pose - see WendigoVisual's three-way
-     * animation pick (crawl while moving, a held crawl-idle pose while crawling but stopped, or the
-     * plain rest pose while standing and stopped). Same threshold updatePose() itself uses to decide
-     * whether to force the crawl hitbox. */
+    /** Real movement check, independent of pose - see WendigoVisual's three-way animation pick
+     * (crawl while moving, a held crawl-idle pose while crawling but stopped, or the plain rest
+     * pose while standing and stopped). Same threshold updatePose() itself uses to decide whether
+     * to force the crawl hitbox. Full 3D, not horizontal-only - a wendigo climbing straight up a
+     * shaft has near-zero horizontal velocity but real vertical velocity, and horizontal-only would
+     * misread that as "not moving," freezing the animation mid-climb. */
     public boolean isMoving() {
-        return this.getDeltaMovement().horizontalDistanceSqr() > CRAWL_SPEED_THRESHOLD_SQR;
+        return this.getDeltaMovement().lengthSqr() > CRAWL_SPEED_THRESHOLD_SQR;
     }
 
-    /** Real horizontal speed in blocks/tick - see WendigoVisual's movement-speed-scaled crawl
-     * playback, which buckets this against the entity's own base MOVEMENT_SPEED attribute rather
-     * than tracking which PlanRunner call site (or semantic speed band) requested the current move,
-     * so it stays correct regardless of which movement primitive is driving it. */
-    public double horizontalSpeed() {
-        return Math.sqrt(this.getDeltaMovement().horizontalDistanceSqr());
+    /** Real speed in blocks/tick - see WendigoVisual's movement-speed-scaled crawl playback, which
+     * buckets this against the entity's own base MOVEMENT_SPEED attribute rather than tracking
+     * which PlanRunner call site (or semantic speed band) requested the current move, so it stays
+     * correct regardless of which movement primitive is driving it. Full 3D - see isMoving(). */
+    public double currentSpeed() {
+        return Math.sqrt(this.getDeltaMovement().lengthSqr());
     }
 
     @Override
@@ -287,6 +591,22 @@ public class WendigoEntity extends EnderMan {
 
     public boolean isStaring() {
         return this.staring;
+    }
+
+    // Set only by /wendigo headtest - forces isChasing() true without a real plan/chase action, so a
+    // stationary lineup can exercise WendigoVisual's chase-tracking codepath (which only cares about
+    // isChasing()'s boolean value, not how it got set) without the wendigo actually running at anyone.
+    private boolean debugForceChasing;
+
+    public void setDebugForceChasing(boolean forced) {
+        this.debugForceChasing = forced;
+    }
+
+    /** True while the currently-executing plan action is combat.chase or internal.chase_until_light -
+     * see PlanRunner.isChasing. WendigoVisual reads this to keep the face glowing and the head
+     * tracking the target during an active chase, the same visual treatment a held stare gets. */
+    public boolean isChasing() {
+        return this.debugForceChasing || this.planRunner.isChasing();
     }
 
     /** Set by memory.store_dark_location, read by predicate.dark_location_stored and retreat_to_dark(source=stored). */

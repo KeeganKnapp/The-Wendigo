@@ -32,6 +32,10 @@ public final class DarknessOverstayTracker {
 	// Each 20%-band gets a random threshold within its own shrinking 5-second window, counting down
 	// as severity climbs: 20-39% -> 15-20s, 40-59% -> 10-15s, 60-79% -> 5-10s, 80%+ -> 0-5s. Rolled
 	// once per continuous darkness stay (see rolledThresholdTicks), not re-rolled while already dark.
+	// Explicit design call: this scaling is meant to stay (unlike per-step tier gating on the
+	// hardcoded plan's own content, e.g. spawn spot eligibility, which is NOT severity-scaled here -
+	// see triggerDarknessAmbush's bypassTierGating=true) - this is "the rule for when it's allowed
+	// to run", not a limitation on the plan itself, and severity is meant to affect it.
 	private static final int THRESHOLD_BAND_SECONDS = 5;
 	private static final int THRESHOLD_MAX_SECONDS = 20;
 	// How often the "get out of the dark" noise repeats while continuously in darkness - at every

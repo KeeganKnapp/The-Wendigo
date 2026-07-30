@@ -2,6 +2,8 @@ package com.wendigo.entity;
 
 import org.joml.Matrix4f;
 
+import com.nyfaria.awcapi.entity.Orientation;
+
 /**
  * {@link WendigoAnimationData} stores each bone transform as the same row-major 16-float layout
  * the reference datapack used ({@code [r00,r01,r02,tx, r10,r11,r12,ty, r20,r21,r22,tz, 0,0,0,1]}),
@@ -19,6 +21,69 @@ final class RigMatrices {
                 m[1], m[5], m[9], m[13],
                 m[2], m[6], m[10], m[14],
                 m[3], m[7], m[11], m[15]
+        );
+    }
+
+    /**
+     * A pure-rotation matrix (no translation) representing an AWCAPI surface attachment
+     * orientation, WITH the entity's own local-frame yaw (see WendigoEntity.isRestingOnFloor's own
+     * doc comment - owner.getYRot() while climbing is a yaw relative to this same attachment frame,
+     * not a world-absolute angle) already composed in - lets {@link WendigoVisual} tilt the whole
+     * rig to lay flush against a wall or ceiling instead of always standing upright (Polymer's
+     * {@code ItemDisplayElement} only exposes yaw/pitch, not roll - confirmed via javap against
+     * GenericEntityElement - so an arbitrary attachment orientation has to be composed directly into
+     * each bone's matrix instead).
+     *
+     * <p>{@link Orientation#getGlobal} (verified via javap: {@code localX.scale(local.x) +
+     * localY.scale(local.y) + localZ.scale(local.z)}) is exactly {@code M * local} for a matrix M
+     * whose columns are localX/localY/localZ - column0/1/2 below are exactly
+     * {@code getGlobal(Ry(yaw)*(1,0,0))}/{@code getGlobal(Ry(yaw)*(0,1,0))}/
+     * {@code getGlobal(Ry(yaw)*(0,0,1))} for a standard right-handed rotation-around-Y Ry(yaw)
+     * (verified against JOML's own Matrix4f.rotateY empirically), computed directly via the linear
+     * combination rather than by literally constructing Ry(yaw) and multiplying - same result,
+     * avoids a redundant matrix multiply.
+     *
+     * <p>Yaw has to be baked in here, before any quaternion conversion, not composed afterward via a
+     * separate rotation call on the un-rotated basis. AWCAPI's own ClimberComponent.calculateOrientation
+     * (verified via javap) builds localZ as {@code M * (0,0,-1)}, not {@code M * (0,0,1)}, for a
+     * proper-rotation M - so (localX, localY, localZ) as AWCAPI hands them out is always a
+     * LEFT-handed basis (determinant -1, a reflection, not a rotation): harmless everywhere AWCAPI
+     * itself uses these vectors (getGlobal only ever combines them linearly - direction math doesn't
+     * care about handedness), but fatal for {@code Quaternionf.setFromUnnormalized}, which assumes a
+     * proper rotation matrix and silently produces a near-degenerate, non-unit quaternion for a
+     * reflection instead of erroring. Restoring right-handedness by negating one column has to
+     * happen on the FINAL (yaw-inclusive) basis, computed here, not on the pre-yaw basis alone - an
+     * earlier version of this fix negated localZ before ever touching yaw, which (confirmed via a
+     * live test comparing real east-wall and south-wall data by hand) only happens to cancel out
+     * near yaw=+/-90 degrees and leaves a ~180 degree residual error at yaw=0/180, since the
+     * negated column's own contribution to the composed result is itself yaw-dependent.
+     */
+    static Matrix4f fromOrientationAndYaw(Orientation orientation, float yawDegrees) {
+        double yawRad = Math.toRadians(yawDegrees);
+        float cy = (float) Math.cos(yawRad);
+        float sy = (float) Math.sin(yawRad);
+        double lxx = orientation.localX.x, lxy = orientation.localX.y, lxz = orientation.localX.z;
+        double lyx = orientation.localY.x, lyy = orientation.localY.y, lyz = orientation.localY.z;
+        double lzx = orientation.localZ.x, lzy = orientation.localZ.y, lzz = orientation.localZ.z;
+
+        float c0x = (float) (lxx * cy - lzx * sy);
+        float c0y = (float) (lxy * cy - lzy * sy);
+        float c0z = (float) (lxz * cy - lzz * sy);
+        float c1x = (float) lyx;
+        float c1y = (float) lyy;
+        float c1z = (float) lyz;
+        float c2x = (float) (lxx * sy + lzx * cy);
+        float c2y = (float) (lxy * sy + lzy * cy);
+        float c2z = (float) (lxz * sy + lzz * cy);
+
+        double det = c0x * (c1y * c2z - c1z * c2y) - c0y * (c1x * c2z - c1z * c2x) + c0z * (c1x * c2y - c1y * c2x);
+        float sign = det < 0 ? -1f : 1f;
+
+        return new Matrix4f(
+                c0x, c0y, c0z, 0f,
+                c1x, c1y, c1z, 0f,
+                c2x * sign, c2y * sign, c2z * sign, 0f,
+                0f, 0f, 0f, 1f
         );
     }
 }

@@ -3,6 +3,7 @@ package com.wendigo.command;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
@@ -18,12 +19,18 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.WendigoMod;
 import com.wendigo.debug.WendigoDebug;
+import com.wendigo.entity.ModEntities;
 import com.wendigo.entity.WendigoEntity;
 import com.wendigo.plan.SchemaBuilder;
 import com.wendigo.spatial.CaveScaleScanner;
@@ -100,6 +107,8 @@ public final class WendigoCommands {
 							StringArgumentType.getString(ctx, "file"))))))
 			.then(Commands.literal("debug")
 				.executes(ctx -> toggleDebug(ctx.getSource())))
+			.then(Commands.literal("headtest")
+				.executes(ctx -> spawnHeadTrackingTest(ctx.getSource())))
 			.then(Commands.literal("reset")
 				.executes(ctx -> resetForTesting(ctx.getSource())))
 			.then(Commands.literal("aggression")
@@ -125,6 +134,171 @@ public final class WendigoCommands {
 		boolean nowEnabled = WendigoDebug.toggle(player);
 		source.sendSystemMessage(Component.literal("[wendigo] Debug mode " + (nowEnabled ? "enabled" : "disabled") + "."));
 		return 1;
+	}
+
+	// headtest's tunnel: floor (y-1), one wall (z-1, 5 tall), ceiling (y+5) - open corridor at z=baseZ
+	// (where the lineup stands) plus a second open column at z=baseZ+1 (where the tester walks past,
+	// so both floor and wall/ceiling attachments are visible from the same walk-through) - both
+	// forcibly cleared to air first in case the rig lands inside existing terrain.
+	private static final int HEADTEST_SLOT_SPACING = 3;
+	private static final int HEADTEST_TUNNEL_HEIGHT = 5;
+	// Standard Minecraft yaw convention (verified against WendigoVisual.lookAtPlayerYaw's own -90
+	// offset): 0=south, 90=west, 180=north, 270=east.
+	private static final float YAW_SOUTH = 0f;
+	private static final float YAW_WEST = 90f;
+	private static final float YAW_NORTH = 180f;
+	private static final float YAW_EAST = 270f;
+
+	/** One lineup slot's spawn parameters - see spawnHeadTrackingTest's own comment for why the yaw
+	 * sweep matters (it's exactly the axis the E/W head-flip bug turned out to depend on). */
+	private record HeadTestSlot(String label, Direction normal, boolean chasing, float yaw, boolean lowCeiling) {}
+
+	private static final List<HeadTestSlot> HEADTEST_SLOTS = List.of(
+		// Open headroom, standing - the REST_POSE whole-body-turn codepath (only reachable when NOT
+		// crawling), kept as a baseline distinct from every other slot below.
+		new HeadTestSlot("floor, standing, staring", Direction.UP, false, YAW_SOUTH, false),
+		// Forced into a 2-tall alcove (see buildHeadTestTunnel) so these actually exercise the
+		// crawl-pose headLookExtra codepath instead of standing pose ignoring it - a stationary,
+		// zero-velocity, open-headroom "chasing" dummy would otherwise never leave Pose.STANDING and
+		// silently test nothing (isMoving() reads false, and normal open floor headroom means
+		// hasStandingClearanceHere() reads true - see updatePose).
+		new HeadTestSlot("floor, crawling, chasing, facing south", Direction.UP, true, YAW_SOUTH, true),
+		new HeadTestSlot("floor, crawling, chasing, facing west", Direction.UP, true, YAW_WEST, true),
+		new HeadTestSlot("floor, crawling, chasing, facing north", Direction.UP, true, YAW_NORTH, true),
+		new HeadTestSlot("floor, crawling, chasing, facing east", Direction.UP, true, YAW_EAST, true),
+		// Wall/ceiling attachment already forces crawl pose unconditionally (isRestingOnFloor()
+		// false), so no low-ceiling carving is needed for these - every yaw here is the body's own
+		// rotation while stuck to the SAME wall/ceiling face, not a different compass wall.
+		new HeadTestSlot("wall, chasing, facing south", Direction.SOUTH, true, YAW_SOUTH, false),
+		new HeadTestSlot("wall, chasing, facing west", Direction.SOUTH, true, YAW_WEST, false),
+		new HeadTestSlot("wall, chasing, facing north", Direction.SOUTH, true, YAW_NORTH, false),
+		new HeadTestSlot("wall, chasing, facing east", Direction.SOUTH, true, YAW_EAST, false),
+		new HeadTestSlot("ceiling, chasing, facing south", Direction.DOWN, true, YAW_SOUTH, false),
+		new HeadTestSlot("ceiling, chasing, facing west", Direction.DOWN, true, YAW_WEST, false),
+		new HeadTestSlot("ceiling, chasing, facing north", Direction.DOWN, true, YAW_NORTH, false),
+		new HeadTestSlot("ceiling, chasing, facing east", Direction.DOWN, true, YAW_EAST, false)
+	);
+
+	/** Spawns a stationary lineup of wendigos (floor/wall/ceiling, every compass yaw, plus one
+	 * diagonal-corner incline) so head-tracking can be inspected directly by walking past them,
+	 * instead of reasoning about it from code alone - see WendigoEntity.setDebugForceChasing for how
+	 * "chasing" is faked without a real plan/target. Builds its own small tunnel a few blocks in
+	 * front of the caller so it works regardless of nearby terrain.
+	 *
+	 * <p>The yaw sweep (south/west/north/east) per surface exists because the reported bug ("head
+	 * tracks correctly facing north/south, flips 180 facing east/west") turned out to depend on
+	 * exactly that axis - see computeClimbingHeadLookYaw's own doc comment for the root cause
+	 * (fromOrientationAndYaw's handedness fix inverts the effective yaw direction, which happens to
+	 * be a no-op at yaw 0/180 and a full flip at yaw +/-90). The one incline slot is a genuinely
+	 * diagonal attachment normal (not achievable via nudgeTowardAttachedSurface's Direction overload)
+	 * - see spawnHeadTestWendigoOnCorner. */
+	private static int spawnHeadTrackingTest(CommandSourceStack source) throws CommandSyntaxException {
+		ServerPlayer player = source.getPlayerOrException();
+		ServerLevel level = source.getLevel();
+
+		BlockPos playerPos = player.blockPosition();
+		int baseX = playerPos.getX() + 3;
+		int baseY = playerPos.getY();
+		int baseZ = playerPos.getZ();
+		int inclineSlotIndex = HEADTEST_SLOTS.size();
+		int length = HEADTEST_SLOT_SPACING * inclineSlotIndex + 2;
+
+		buildHeadTestTunnel(level, baseX, baseY, baseZ, length);
+		carveLowCeiling(level, baseX, baseY, baseZ, HEADTEST_SLOTS);
+		int inclineX = baseX + HEADTEST_SLOT_SPACING * inclineSlotIndex;
+		buildInclineCorner(level, inclineX, baseY, baseZ);
+
+		for (int i = 0; i < HEADTEST_SLOTS.size(); i++) {
+			HeadTestSlot slot = HEADTEST_SLOTS.get(i);
+			int x = baseX + HEADTEST_SLOT_SPACING * i;
+			int y = switch (slot.normal()) {
+				case SOUTH -> baseY + 2;
+				case DOWN -> baseY + 4;
+				default -> baseY;
+			};
+			spawnHeadTestWendigo(level, x, y, baseZ, slot.yaw(), slot.normal(), slot.chasing(), slot.label());
+		}
+		spawnHeadTestWendigoOnCorner(level, inclineX, baseY, baseZ, "incline corner, chasing");
+
+		player.teleportTo(baseX - 2 + 0.5, baseY, baseZ + 1.5);
+
+		source.sendSystemMessage(Component.literal("[wendigo] Head-tracking test rig built at "
+			+ baseX + "," + baseY + "," + baseZ + " - walk down the open column at z=" + (baseZ + 1)
+			+ " (+X direction) past " + (HEADTEST_SLOTS.size() + 1) + " dummies: a standing floor "
+			+ "baseline, four crawling-floor/wall/ceiling groups each swept through south/west/north/"
+			+ "east facing, and one diagonal incline corner at the far end. Every head should turn to "
+			+ "track you as you pass, regardless of which way its body is facing."));
+		return 1;
+	}
+
+	private static void buildHeadTestTunnel(ServerLevel level, int baseX, int baseY, int baseZ, int length) {
+		for (int x = baseX - 1; x <= baseX + length; x++) {
+			level.setBlockAndUpdate(new BlockPos(x, baseY - 1, baseZ), Blocks.STONE.defaultBlockState());
+			level.setBlockAndUpdate(new BlockPos(x, baseY + HEADTEST_TUNNEL_HEIGHT, baseZ), Blocks.STONE.defaultBlockState());
+			for (int y = baseY; y < baseY + HEADTEST_TUNNEL_HEIGHT; y++) {
+				level.setBlockAndUpdate(new BlockPos(x, y, baseZ - 1), Blocks.STONE.defaultBlockState());
+				level.setBlockAndUpdate(new BlockPos(x, y, baseZ), Blocks.AIR.defaultBlockState());
+				level.setBlockAndUpdate(new BlockPos(x, y, baseZ + 1), Blocks.AIR.defaultBlockState());
+			}
+		}
+	}
+
+	/** Drops a solid ceiling to baseY+2 (a genuine 2-tall gap - short of the 3-tall clearance
+	 * DarkSpotScanner.hasStandingClearance requires) directly above every slot marked lowCeiling, but
+	 * only over the lineup column (z=baseZ, where each dummy's own blockPosition actually sits) -
+	 * the tester's walking column (baseZ+1) stays the full 5 tall throughout so nobody has to crouch
+	 * through the whole rig just to reach the later slots. */
+	private static void carveLowCeiling(ServerLevel level, int baseX, int baseY, int baseZ, List<HeadTestSlot> slots) {
+		for (int i = 0; i < slots.size(); i++) {
+			if (!slots.get(i).lowCeiling()) {
+				continue;
+			}
+			int x = baseX + HEADTEST_SLOT_SPACING * i;
+			level.setBlockAndUpdate(new BlockPos(x, baseY + 2, baseZ), Blocks.STONE.defaultBlockState());
+		}
+	}
+
+	/** A single step block whose top face and south face meet in a convex, outward-facing corner -
+	 * see spawnHeadTestWendigoOnCorner. The rest of that column was already cleared to air by
+	 * buildHeadTestTunnel, so placing just this one block is enough to expose the corner. */
+	private static void buildInclineCorner(ServerLevel level, int x, int baseY, int baseZ) {
+		level.setBlockAndUpdate(new BlockPos(x, baseY, baseZ), Blocks.STONE.defaultBlockState());
+	}
+
+	private static void spawnHeadTestWendigo(ServerLevel level, int x, int y, int z, float yaw, Direction normal,
+			boolean chasing, String label) {
+		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
+		wendigo.snapTo(x + 0.5, y, z + 0.5, yaw, 0f);
+		wendigo.syncPoseToSpawnPosition();
+		wendigo.nudgeTowardAttachedSurface(normal);
+		if (chasing) {
+			wendigo.setDebugForceChasing(true);
+		} else {
+			wendigo.setStaring(true);
+		}
+		level.addFreshEntity(wendigo);
+		WendigoMod.LOGGER.info("[wendigo] headtest spawned {} at {},{},{} yaw={}", label, x, y, z, yaw);
+	}
+
+	/** Spawns on the outward top/south corner of buildInclineCorner's step block - a genuinely
+	 * diagonal attachment (normal roughly halfway between UP and SOUTH, an "ascending incline" rather
+	 * than the ceiling-side diagonal WendigoVisual's CLIMB_SURFACE_OFFSET_BLOCKS comment already
+	 * describes live-testing on, e.g. an overhang's underside). No Direction value describes that, so
+	 * this positions the dummy just outside the corner and nudges it diagonally (down-and-north, into
+	 * the corner) instead - AWCAPI's own collision smoothing (see the constructor's
+	 * setCollisionsInclusionRange/setCollisionsSmoothingRange) resolves the blended normal from the
+	 * real block geometry, the same mechanism a live convex-corner climb would go through. */
+	private static void spawnHeadTestWendigoOnCorner(ServerLevel level, int stepX, int baseY, int baseZ, String label) {
+		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
+		double x = stepX + 0.5;
+		double y = baseY + 1.0;
+		double z = baseZ + 1.3;
+		wendigo.snapTo(x, y, z, YAW_SOUTH, 0f);
+		wendigo.syncPoseToSpawnPosition();
+		wendigo.nudgeTowardAttachedSurface(new Vec3(0.0, -1.0, -1.0));
+		wendigo.setDebugForceChasing(true);
+		level.addFreshEntity(wendigo);
+		WendigoMod.LOGGER.info("[wendigo] headtest spawned {} at {},{},{}", label, x, y, z);
 	}
 
 	/** Reports a player's current dweller severity ("aggression") - the same number/cap the LLM sees each request. */

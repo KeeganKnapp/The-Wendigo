@@ -13,6 +13,7 @@ import com.google.gson.JsonObject;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -559,20 +560,60 @@ public final class WendigoManager {
 	 * budget were each their own source of "engine says unreachable, live wendigo proves otherwise").
 	 * Returns null only if the flood found neither a usable spot nor a torch-spawn candidate at all.
 	 */
+	// How many of the six spot_a..spot_f slots may be non-floor (ceiling or wall - see
+	// DarkSpotScanner.findCeilingSpots/findWallSpots) rather than ordinary floor ones - reserved off
+	// the END of the label list (spot_e/spot_f, the higher-severity-gated slots), so this reuses the
+	// EXISTING tier-gating mechanism unchanged: a non-floor spot only ever gets offered once
+	// severity is already high enough to unlock that slot at all, same as any other far/late spot
+	// (in practice both unlock at 20% - not a particularly high bar, so this isn't the dominant
+	// reason climbing spots were rare; the reserve counts below were). Split evenly between the two
+	// types rather than all-ceiling or all-wall, so both kinds of climbing spot actually show up in
+	// practice. Raised from 1 each - at 1, at most 2 of 6 slots could EVER be non-floor even in the
+	// best case, and live testing found them showing up "here and there" rather than routinely,
+	// which is exactly what a hard 2-of-6 ceiling predicts. Tune by feel - this can go higher still
+	// if climbing spots should dominate rather than just show up regularly.
+	private static final int CEILING_SPOT_RESERVE = 2;
+	private static final int WALL_SPOT_RESERVE = 2;
+
 	private WaveContext buildContext(ServerLevel level, ServerPlayer target, int effectiveSeverity) {
 		BlockPos playerPos = target.blockPosition();
-		DarkSpotScanner.WaveSpotScan scan = DarkSpotScanner.findWaveSpots(level, playerPos, this.config.contextSpotCount);
-		List<DarkSpotScanner.WaveSpot> waveSpots = scan.spots();
-		List<DarkSpotScanner.WaveSpot> torchSpawnCandidates = scan.torchSpawnCandidates();
+		int ceilingSlots = Math.min(CEILING_SPOT_RESERVE, this.config.contextSpotCount);
+		int wallSlots = Math.min(WALL_SPOT_RESERVE, this.config.contextSpotCount - ceilingSlots);
+		int floorSlots = this.config.contextSpotCount - ceilingSlots - wallSlots;
+		// Ceiling/wall spots are appended after floor ones below, not interleaved by distance - a
+		// minor, cosmetic looseness in the "nearest to furthest" ordering WaveContext's prompt text
+		// describes, traded for reusing the existing label-index-based tier gating unchanged rather
+		// than needing spot-type-aware gating logic. Their torch-spawn candidates are deliberately
+		// not merged into torchSpawnCandidates below - spawn_on_torch's destroy-on-arrival mechanic
+		// hasn't been designed for a ceiling/wall-attached torch/lantern, out of scope for this pass
+		// (moot for wall spots anyway - findWallSpots never returns any).
+		DarkSpotScanner.WaveSpotScan ceilingScan = ceilingSlots > 0
+			? DarkSpotScanner.findCeilingSpots(level, playerPos, ceilingSlots)
+			: new DarkSpotScanner.WaveSpotScan(List.of(), List.of());
+		DarkSpotScanner.WaveSpotScan wallScan = wallSlots > 0
+			? DarkSpotScanner.findWallSpots(level, playerPos, wallSlots)
+			: new DarkSpotScanner.WaveSpotScan(List.of(), List.of());
+		// A reserved ceiling/wall slot that its own scan couldn't fill (nothing suitable nearby) used
+		// to just sit empty, silently shrinking the total context below contextSpotCount instead of
+		// falling back to an ordinary floor spot - backfilling here means raising the reserves above
+		// doesn't cost overall spot variety on a map where climbing spots happen to be sparse.
+		int unfilledClimbingSlots = (ceilingSlots - ceilingScan.spots().size()) + (wallSlots - wallScan.spots().size());
+		DarkSpotScanner.WaveSpotScan floorScan = DarkSpotScanner.findWaveSpots(level, playerPos, floorSlots + unfilledClimbingSlots);
+		List<DarkSpotScanner.WaveSpot> waveSpots = new ArrayList<>(floorScan.spots());
+		waveSpots.addAll(ceilingScan.spots());
+		waveSpots.addAll(wallScan.spots());
+		List<DarkSpotScanner.WaveSpot> torchSpawnCandidates = floorScan.torchSpawnCandidates();
 		if (waveSpots.isEmpty() && torchSpawnCandidates.isEmpty()) {
 			WendigoDebug.say(level, "issue: no dark spots or torch-adjacent positions found at all near "
 				+ target.getName().getString() + " - can't build a wave context");
 			return null;
 		}
 		List<BlockPos> spots = new ArrayList<>();
+		List<Direction> spotNormals = new ArrayList<>();
 		Map<BlockPos, BlockPos> torchLinkedSpots = new HashMap<>();
 		for (DarkSpotScanner.WaveSpot spot : waveSpots) {
 			spots.add(spot.position());
+			spotNormals.add(spot.surfaceNormal());
 			if (spot.isTorchLinked()) {
 				torchLinkedSpots.put(spot.position(), spot.linkedTorch());
 			}
@@ -591,13 +632,16 @@ public final class WendigoManager {
 			// precisely because some light source is nearby, so this reuses the one ring-sampling
 			// pass instead of running a second scan. Omnidirectional and multi-radius around the dark
 			// spot itself, not biased toward the player - a far spot (e.g. spot_d) gets credit for
-			// its own nearby torches regardless of which side of it they're on.
+			// its own nearby torches regardless of which side of it they're on. Still floor-oriented
+			// (ring-samples for standable positions) even for a ceiling spot - not generalized this
+			// pass, so results near a ceiling spot may be sparser/less meaningful, but degrade
+			// gracefully (empty lists) rather than breaking.
 			DarkSpotScanner.RelevantSpots relevant = DarkSpotScanner.findSpotDimSpots(level, spot);
 			dimSpotsPerSpot.add(relevant.dimSpots());
 			torchesPerSpot.add(relevant.lightSources());
 		}
 		CaveScale caveScale = CaveScaleScanner.classify(level, playerPos);
-		return new WaveContext(target, effectiveSeverity, this.config.severityCap, spots,
+		return new WaveContext(target, effectiveSeverity, this.config.severityCap, spots, spotNormals,
 			dimSpotsPerSpot, torchesPerSpot, torchSpawnCandidates,
 			this.encounterHistory.of(target), level.getServer().getTickCount(), caveScale, torchLinkedSpots);
 	}
@@ -637,6 +681,11 @@ public final class WendigoManager {
 		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
 		wendigo.snapTo(spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, 0f, 0f);
 		wendigo.syncPoseToSpawnPosition();
+		// See WendigoEntity.nudgeTowardAttachedSurface's own doc comment - mitigates a live-confirmed
+		// bug where spawning directly onto a ceiling spot falls straight off it instead of sticking.
+		// A no-op for every ordinary floor spawn (normalFor defaults to UP when spot isn't one of the
+		// labeled spot_a..spot_f positions, or genuinely is a floor spot).
+		wendigo.nudgeTowardAttachedSurface(context.normalFor(spawnPos));
 		level.addFreshEntity(wendigo);
 		WendigoSounds.play(level, spawnPos, WendigoSounds.Type.SPAWNED);
 		if (linkedTorch != null) {
