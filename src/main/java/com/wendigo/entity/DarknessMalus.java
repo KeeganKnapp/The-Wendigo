@@ -4,7 +4,9 @@ import it.unimi.dsi.fastutil.longs.Long2FloatOpenHashMap;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.pathfinder.Node;
 
 /**
@@ -39,6 +41,20 @@ final class DarknessMalus {
 	// Cobwebs get an even heavier flat penalty than the worst light case - getting physically stuck
 	// is a worse outcome than being briefly lit, so this should almost always lose to any detour.
 	private static final float COBWEB_MALUS = 150.0F;
+	// The user's own explicit "40% penalty" request for ceiling pathfinding specifically (walls are
+	// deliberately exempt - see apply's own check - matching WendigoEntity's own pitch-ramped speed
+	// penalty, which likewise only applies past a dead-on wall toward a ceiling), so the wendigo
+	// still climbs when it has to (unreachable from the floor, or the floor route is a much longer
+	// detour) but slowly settles back onto the floor to gain speed whenever a floor route is
+	// comparably direct. Sized against PathFinder's own real cost formula (confirmed via decompiling
+	// vanilla's PathFinder.class: tentativeGScore = current.g + distance + neighbor.costMalus - a
+	// FLAT addition on top of the per-step geometric distance, which is ~1.0 for a cardinal step and
+	// ~1.414 for a diagonal one, the same scale DarkSpotScanner's own flood-cost model uses) - 0.5 is
+	// roughly 40% of that per-step distance, not a percentage of the light/cobweb malus scale above
+	// (those are large deliberately, to all but forbid crossing genuinely lit ground; this is meant
+	// to be a soft, easily-outweighed tiebreaker instead, since a whole climbing ROUTE accumulates
+	// this once per step, not once total).
+	private static final float CLIMBING_MALUS = 0.5F;
 
 	// Below this severity, a route through anything brighter than EDGE_LIGHT (5, the same "spawn
 	// limit" DarkSpotScanner.MAX_DARK_LIGHT uses) doesn't exist as far as pathfinding is concerned at
@@ -127,6 +143,24 @@ final class DarknessMalus {
 			if (hardBlockLight && light > EDGE_LIGHT) {
 				continue; // excluded entirely below HARD_BLOCK_MAX_PERCENT - this route doesn't exist
 			}
+			// The user's own explicit rule: fast, free movement through flowing water (a stream, a
+			// shin-deep puddle - PathType.WATER's own malus is already 0.0F for these, see
+			// WendigoEntity's constructor) but never PATH OVER a genuine source block (a still cave
+			// lake/pond) - unconditional exclusion, not just a heavy malus like cobwebs get, since
+			// this is also the proactive half of the drowning-bailout fix (WendigoManager's own
+			// air-supply check): staying out of deep still water in the first place beats discarding
+			// and re-searching after the fact once it's already mid-lake taking damage. Not gated on
+			// severityPercent/lightTolerant the way the light hard-block above is - there's no "last
+			// resort, swim the lake anyway" tier this should ever fall back to. getFluidState().is
+			// (not getBlockState().is(Blocks.WATER)) also correctly excludes waterlogged blocks whose
+			// fluid layer is a genuine source, not just plain water blocks.
+			// Fluids.WATER is specifically the source-water singleton (Fluids.FLOWING_WATER is the
+			// separate flowing one) - a direct identity check against it, rather than going through
+			// FluidTags.WATER, since both Fluid.is(TagKey) and Fluid.builtInRegistryHolder() are
+			// deprecated in this MC version (confirmed via javac -Xlint:deprecation).
+			if (mob.level().getFluidState(pos).getType() == Fluids.WATER) {
+				continue;
+			}
 			long key = BlockPos.asLong(neighbor.x, neighbor.y, neighbor.z);
 			if (!this.nodeMalusApplied.containsKey(key)) {
 				float malus = 0.0F;
@@ -135,6 +169,18 @@ final class DarknessMalus {
 				}
 				if (mob.level().getBlockState(pos).is(Blocks.COBWEB)) {
 					malus += COBWEB_MALUS;
+				}
+				// Solid ground directly beneath is a genuine floor node (or a legitimate multi-block
+				// drop's own landing spot, which always resolves to one of these too - see
+				// AdvancedWalkNodeProcessor.getSafePoints) - no penalty. Of what's left (already passed
+				// AWCAPI's own attachability check to exist as a neighbor at all, so no floor below
+				// reliably means wall or ceiling), only a ceiling attachment (solid directly ABOVE) gets
+				// the malus now - the user's own explicit follow-up to WendigoEntity's own pitch-ramped
+				// speed penalty, which also only ever applies past a dead-on wall (pitch 90) toward a
+				// ceiling (pitch 180): walls should path at full, unpenalized cost too, not just move at
+				// full speed once already chosen.
+				if (isPassable(mob.level(), pos.below()) && !isPassable(mob.level(), pos.above())) {
+					malus += CLIMBING_MALUS;
 				}
 				neighbor.costMalus += malus;
 				this.nodeMalusApplied.put(key, malus);
@@ -156,5 +202,12 @@ final class DarknessMalus {
 			return EDGE_MALUS;
 		}
 		return AVOID_BASE_MALUS + (light - EDGE_LIGHT) * AVOID_MALUS_PER_LEVEL;
+	}
+
+	/** Same collision-shape-empty check DarkSpotScanner's own isPassable/isAttachable use for exactly
+	 * this purpose (different package, private there - not worth widening its visibility just for
+	 * this one reuse, same tradeoff already accepted elsewhere in this codebase). */
+	private static boolean isPassable(Level level, BlockPos pos) {
+		return level.getBlockState(pos).getCollisionShape(level, pos).isEmpty();
 	}
 }

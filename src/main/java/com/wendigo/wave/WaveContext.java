@@ -1,47 +1,37 @@
 package com.wendigo.wave;
 
-import java.util.List;
 import java.util.Map;
 
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
-import com.wendigo.plan.ProximityBands;
 import com.wendigo.spatial.CaveScaleScanner.CaveScale;
-import com.wendigo.spatial.DarkSpotScanner;
 
-/** Engine-scanned context for one wave: the target player, their severity, and labeled dark-spot candidates. */
+/** Engine-built context for one wave: the target player, their severity, and a live snapshot of
+ * torch counts per distance band - NOT pre-scanned positions. Every actual position a plan resolves
+ * against (spawn_at, movement.approach_band, despawn/retreat) is looked up fresh, live, at the
+ * moment it's needed (see DarkSpotScanner.findLiveBandPosition) - this class only carries what the
+ * PROMPT needs to know at request time (necessarily a snapshot, since there's exactly one LLM call
+ * per plan), never a stored position a later step would resolve against. */
 public final class WaveContext {
-	private static final String[] SPOT_LABELS = {"spot_a", "spot_b", "spot_c", "spot_d", "spot_e", "spot_f"};
-	/** Number of labeled spot slots (spot_a..spot_f) - public so callers building index-aligned
-	 * parallel lists (see WendigoManager.buildContext's torchSpotPerLabel) know how many slots to fill
-	 * without duplicating the label array itself. */
-	public static final int SPOT_LABEL_COUNT = SPOT_LABELS.length;
+	/** The 6 live distance bands, nearest to furthest - see SemanticBands.bandDistanceMin/Max. Public
+	 * so WendigoManager's torch-count scan and this class's own prompt text share one label list. */
+	public static final String[] BAND_LABELS =
+		{"close_as_possible", "close", "medium", "far", "farther", "farthest"};
 
 	private final ServerPlayer player;
 	private final int severity;
 	private final int severityCap;
-	private final List<BlockPos> spots; // nearest -> furthest, index-aligned with SPOT_LABELS
-	// Index-aligned with spots - UP for an ordinary floor spot, DOWN for a ceiling spot (see
-	// DarkSpotScanner.findCeilingSpots/WendigoManager.buildContext's CEILING_SPOT_RESERVE). Purely
-	// descriptive - PlanRunner/resolve(label) don't need it, since a labeled spot's BlockPos paths
-	// and resolves identically either way (DarknessAwareClimberNavigation already routes onto
-	// walls/ceilings as needed) - only toPromptText reads this, to tell the model when a spot isn't
-	// on the floor.
-	private final List<Direction> spotNormals;
-	// Both index-aligned with spots - positions (not just counts) so /wendigo debug can draw them,
-	// not just report a number in the prompt.
-	private final List<List<BlockPos>> dimSpotsPerSpot;
-	private final List<List<BlockPos>> torchesPerSpot;
-	// Torch-adjacent positions DarkSpotScanner.findWaveSpots' flood found along the way, separate from
-	// spots() - the spawn_on_torch fallback candidate pool (see WendigoManager). All reachable from
-	// the player by the same construction as spots() itself, no separate verification needed - moot
-	// once nothing is offered in the schema anyway (SchemaBuilder gates spawn_on_torch on at least one
-	// of these clearing the current severity's distance floor - see minTorchSpawnDistance - not simply
-	// on this list being non-empty).
-	private final List<DarkSpotScanner.WaveSpot> torchSpawnCandidates;
+	// Live torch count per band (see BAND_LABELS), captured once at buildContext time - purely
+	// informational for the prompt ("torches_at_medium_distance: 10"), not something later resolution
+	// reads from; combat.break_torch's own band-constrained lookup and spawn_on_torch's own
+	// eligibility/position resolution both re-scan live at the moment they're actually needed instead
+	// of trusting this snapshot, which could already be stale by then.
+	private final Map<String, Integer> torchCountsByBand;
+	// Only set when engaging an already-alive, already-orbiting entity (not a fresh spawn, where
+	// there's no current wendigo position to report yet) - lets the prompt tell the model "you're
+	// already at X, decide for yourself whether that's good enough" instead of always assuming a
+	// fresh appearance.
+	private final CurrentPosition currentPosition;
 	// Null if this is the wendigo's first real encounter with this player this session (see
 	// EncounterHistory) - never populated for debug-forced waves.
 	private final EncounterHistory.Entry previousEncounter;
@@ -49,55 +39,23 @@ public final class WaveContext {
 	// Rough classification of the open space around the player right now (see CaveScaleScanner) -
 	// meant as general-purpose context, not tied to any one use.
 	private final CaveScale caveScale;
-	// Spot position -> the torch it's linked to, for spots DarkSpotScanner.findWaveSpots accepted as
-	// too-lit-but-torch-adjacent rather than genuinely dark (see DarkSpotScanner.WaveSpot) - only
-	// entries for spots that ARE torch-linked, so absence means "genuinely dark, nothing to break".
-	// Invisible to the model entirely (spawn_at just offers the label like any other spot); only
-	// WendigoManager.spawnWave reads this, to know whether to destroy a torch on arrival there.
-	private final Map<BlockPos, BlockPos> torchLinkedSpots;
-	// Index-aligned with SPOT_LABELS (same nullable-by-short-list convention as spots) - a nearby,
-	// already-reachable torch-spot for that label slot, independent of whether spots filled that same
-	// index. Lets PlanRunner substitute a teleport-to-torch-and-chase for a label whose real dark spot
-	// wasn't found this scan (see PlanRunner's movement.approach_spot handling) - see
-	// torchSpotForLabel.
-	private final List<BlockPos> torchSpotPerLabel;
 
-	public WaveContext(ServerPlayer player, int severity, int severityCap, List<BlockPos> spots, List<Direction> spotNormals,
-			List<List<BlockPos>> dimSpotsPerSpot, List<List<BlockPos>> torchesPerSpot,
-			List<DarkSpotScanner.WaveSpot> torchSpawnCandidates, List<BlockPos> torchSpotPerLabel,
-			EncounterHistory.Entry previousEncounter, int nowTick,
-			CaveScale caveScale, Map<BlockPos, BlockPos> torchLinkedSpots) {
+	/** The wendigo's own live distance from the player and whether it's currently perched on a
+	 * ceiling roughly above them (see DarkSpotScanner.findCeilingVantagePoint) - only meaningful for
+	 * an already-alive entity being engaged, see WaveContext's own currentPosition field. */
+	public record CurrentPosition(double distanceFromPlayer, boolean isOnTopPlayer) {
+	}
+
+	public WaveContext(ServerPlayer player, int severity, int severityCap, Map<String, Integer> torchCountsByBand,
+			CurrentPosition currentPosition, EncounterHistory.Entry previousEncounter, int nowTick, CaveScale caveScale) {
 		this.player = player;
 		this.severity = severity;
 		this.severityCap = severityCap;
-		this.spots = spots;
-		this.spotNormals = spotNormals;
-		this.dimSpotsPerSpot = dimSpotsPerSpot;
-		this.torchesPerSpot = torchesPerSpot;
-		this.torchSpawnCandidates = torchSpawnCandidates;
-		this.torchSpotPerLabel = torchSpotPerLabel;
+		this.torchCountsByBand = torchCountsByBand;
+		this.currentPosition = currentPosition;
 		this.previousEncounter = previousEncounter;
 		this.nowTick = nowTick;
 		this.caveScale = caveScale;
-		this.torchLinkedSpots = torchLinkedSpots;
-	}
-
-	/** Torch-adjacent spawn_on_torch candidates - see the field's own comment. */
-	public List<DarkSpotScanner.WaveSpot> torchSpawnCandidates() {
-		return this.torchSpawnCandidates;
-	}
-
-	/** The torch this spot is linked to, or null if it's a genuinely dark spot with nothing to break. */
-	public BlockPos linkedTorchFor(BlockPos spot) {
-		return this.torchLinkedSpots.get(spot);
-	}
-
-	/** The surface this spot is attached to (UP for an ordinary floor spot, DOWN for a ceiling spot -
-	 * see DarkSpotScanner.findCeilingSpots) - UP if spot isn't one of the labeled spot_a..spot_f
-	 * positions at all (a torch-spawn/fallback resolution, always floor-only today). */
-	public Direction normalFor(BlockPos spot) {
-		int index = this.spots.indexOf(spot);
-		return index >= 0 && index < this.spotNormals.size() ? this.spotNormals.get(index) : Direction.UP;
 	}
 
 	public CaveScale caveScale() {
@@ -116,98 +74,51 @@ public final class WaveContext {
 		return this.severityCap;
 	}
 
-	/** All scanned dark spots, nearest to furthest - used to build a despawn fallback chain. */
-	public List<BlockPos> spots() {
-		return this.spots;
-	}
-
-	/** Each dark spot's nearby dim spots, index-aligned with spots() - used by /wendigo debug's particle view. */
-	public List<List<BlockPos>> dimSpotsPerSpot() {
-		return this.dimSpotsPerSpot;
-	}
-
-	/** Resolves a schema spot label (e.g. "spot_b") to its scanned position, or null if not found. */
-	public BlockPos resolve(String label) {
-		for (int i = 0; i < SPOT_LABELS.length; i++) {
-			if (SPOT_LABELS[i].equals(label) && i < this.spots.size()) {
-				return this.spots.get(i);
-			}
-		}
-		return null;
-	}
-
-	/** Nearby torch-spot pairings, index-aligned with SPOT_LABELS (same nullable-by-short-list
-	 * convention as spots()) - threaded through PlanRunner.start/startWithApproach the same way
-	 * spots() itself is (see WendigoManager's various startWave/startWithApproach call sites), for
-	 * movement.approach_spot's own per-label lookup (PlanRunner.torchSpotForLabel). Independent of
-	 * whether resolve(label) itself returns non-null: a label can have a torch-spot pairing even when
-	 * its own dark spot wasn't found this scan (that mismatch is exactly what the teleport-substitute
-	 * case looks for). */
-	public List<BlockPos> torchSpotPerLabel() {
-		return this.torchSpotPerLabel;
+	/** Live torch count for one band, captured at buildContext time - see the field's own comment
+	 * on why nothing downstream should treat this as still-accurate by the time it's read. */
+	public int torchCountForBand(String band) {
+		return this.torchCountsByBand.getOrDefault(band, 0);
 	}
 
 	/** Renders this context as the user-prompt text the LLM sees alongside the action schema. */
 	public String toPromptText() {
-		ServerLevel level = this.player.level();
-		BlockPos playerPos = this.player.blockPosition();
-
 		StringBuilder sb = new StringBuilder();
 		sb.append("Target player: ").append(this.player.getGameProfile().name()).append(". ");
 		sb.append("Dweller severity for this player: ").append(this.severity).append("/").append(this.severityCap)
-			.append(" (cumulative time spent below y=0 - higher means this has been going on longer). ");
+			.append(" (a slow-burning escalation across many separate encounters with this player over "
+				+ "time - higher means this relationship with the dark is more established, not something "
+				+ "to try to advance within a single wave). ");
 		sb.append("Current caving scenario: ").append(describeCaveScale())
 			.append(" - how tight or open the space around the player is right now. ");
-		sb.append("Distance bands, nearest to furthest: grab_distance (0-3 blocks), lunge_distance (4-9), "
-			+ "close_quarters (10-14), medium (15-24), far (25+) - the same bands predicate.player_distance "
-			+ "compares against, so you can tell before picking spawn_at whether a spot already sits inside "
-			+ "combat/flee range of the player. ");
-		if (this.spots.isEmpty()) {
-			sb.append("No scanned dark spots found near the player at all right now - nowhere hidden enough nearby "
-				+ "to offer as spawn_at.\n");
-		} else {
-			sb.append("Scanned dark spots near the player, nearest to furthest - all of them reachable from the "
-				+ "player and from each other (engine-verified, walked via a real connected search, not a guess), "
-				+ "so movement.approach_spot can freely move between any two of these labels:\n");
-			for (int i = 0; i < this.spots.size(); i++) {
-				BlockPos spot = this.spots.get(i);
-				double distance = Math.sqrt(spot.distSqr(playerPos));
-				int light = level.getMaxLocalRawBrightness(spot);
-				int dimSpots = i < this.dimSpotsPerSpot.size() ? this.dimSpotsPerSpot.get(i).size() : 0;
-				int torches = i < this.torchesPerSpot.size() ? this.torchesPerSpot.get(i).size() : 0;
-				Direction normal = i < this.spotNormals.size() ? this.spotNormals.get(i) : Direction.UP;
-				sb.append(String.format(
-					"- %s: %.0f blocks away (%s), light level %d, %d nearby dim spots (edge-of-light positions reachable from here), %d nearby torches%s%n",
-					SPOT_LABELS[i], distance, ProximityBands.labelFor(distance), light, dimSpots, torches,
-					describeSurface(normal)));
+		sb.append("Positioning distance bands (spawn_at, movement.approach_band, combat.break_torch's optional "
+			+ "band), nearest to furthest - resolved LIVE against wherever the player actually is at the moment "
+			+ "each one is used, never a frozen position from right now: close_as_possible (0-4 blocks), close "
+			+ "(5-9), medium (10-16), far (17-24), farther (25-35), farthest (36+, also the natural despawn/"
+			+ "retreat distance). These are a DIFFERENT ladder from predicate.player_distance's own bands below - "
+			+ "same-sounding names (medium/far) mean different ranges in each one, so don't mix them up: this "
+			+ "ladder is only for spawn_at/movement.approach_band/combat.break_torch's band field. ");
+		sb.append("Combat/predicate distance bands (predicate.player_distance only), nearest to furthest: "
+			+ "grab_distance (0-3 blocks), lunge_distance (4-9), close_quarters (10-14), medium (15-24), far "
+			+ "(25+). ");
+		sb.append("Live torch counts by positioning band right now: ");
+		for (int i = 0; i < BAND_LABELS.length; i++) {
+			if (i > 0) {
+				sb.append(", ");
 			}
-			sb.append("This is how to reach a spot's dim spots when it isn't the one you spawned at: "
-				+ "movement.approach_spot to get there, then movement.approach_dim_spot (which always searches from "
-				+ "wherever the wendigo currently is) to actually reach one of its dim spots - e.g. spawn at a "
-				+ "distant spot with no dim spots of its own, approach_spot to a closer one that has some, then "
-				+ "approach_dim_spot from there for a real creeping-toward-the-light approach instead of just "
-				+ "appearing already at the edge of the light.\n");
-			sb.append("combat.break_torch resolves the nearest known light source live from wherever the wendigo "
-				+ "currently is (no label needed) - the per-spot torch counts above tell you whether that's worth "
-				+ "planning around before picking spawn_at, e.g. spawning at a distant spot that still has its own "
-				+ "nearby torch to snuff out.\n");
+			sb.append("torches_at_").append(BAND_LABELS[i]).append("_distance: ").append(torchCountForBand(BAND_LABELS[i]));
 		}
-		if (!this.torchSpawnCandidates.isEmpty()) {
-			sb.append(this.torchSpawnCandidates.size()).append(" reachable, already-lit torch-adjacent position(s) "
-				+ "also found nearby - see spawn_at's own description for spawn_on_torch, the option to spawn "
-				+ "already-exposed on one of these instead of waiting on real darkness.\n");
+		sb.append(". Worth planning combat.break_torch(band=...) around whichever band actually has some - a "
+			+ "band with a zero count has nothing for it to find, and it'll just skip cleanly if you try anyway. ");
+		if (this.currentPosition != null) {
+			sb.append("The wendigo is already active right now, ").append(String.format("%.0f", this.currentPosition.distanceFromPlayer()))
+				.append(" blocks from the player")
+				.append(this.currentPosition.isOnTopPlayer() ? ", currently perched on a ceiling roughly above them" : "")
+				.append(" - if that's already a good distance for what this plan is about to do, spawn_at can "
+					+ "resolve to right here with no travel at all; there's no obligation to move first just "
+					+ "because a band exists. ");
 		}
 		sb.append(describePreviousEncounter());
 		return sb.toString();
-	}
-
-	/** Appended to a spot's prompt line when it isn't an ordinary floor spot - see spotNormals. */
-	private String describeSurface(Direction normal) {
-		return switch (normal) {
-			case DOWN -> ", clinging to the ceiling above";
-			case UP -> "";
-			default -> ", clinging to a wall";
-		};
 	}
 
 	private String describeCaveScale() {

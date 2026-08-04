@@ -10,7 +10,6 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import com.wendigo.spatial.CaveScaleScanner.CaveScale;
-import com.wendigo.spatial.DarkSpotScanner;
 
 /**
  * Builds a per-request WendigoActionPlan schema with anything not yet unlocked for the given
@@ -39,6 +38,7 @@ public final class SchemaBuilder {
 		filterActionStepUnion(defs, severityPercent);
 		filterSoundCue(defs, severityPercent);
 		filterSpawnAt(schema, severityPercent, caveScale, torchSpawnAvailable);
+		filterApproachBand(defs, severityPercent, caveScale, torchSpawnAvailable);
 		filterStareBand(defs, severityPercent);
 
 		return schema;
@@ -78,54 +78,58 @@ public final class SchemaBuilder {
 	/**
 	 * Whether this spawn_at value is allowed at this severity/cave scale - single source of truth
 	 * for both the schema filter below and WendigoManager's matching defensive re-check.
-	 * - spot_a (nearest scanned spot, see WaveContext) is reserved for a tight/mineshaft-like cave
-	 *   only, any severity - there's nowhere far to spawn anyway in a cramped space, so even a low-
-	 *   severity encounter there can start close; a normal/massive cave never offers it.
-	 * - spot_b/c/d/e/f unlock progressively closer as severity climbs (e/f at 20%, d at 40%, c at
-	 *   60%, b at 80%) - the wendigo is allowed to appear progressively bolder/closer the more
-	 *   established this player's relationship with it already is. Some of these may be torch-linked
-	 *   rather than genuinely dark (see DarkSpotScanner.WaveSpot) - invisible here, spawn_at doesn't
-	 *   distinguish, only WendigoManager.spawnWave's resolution side reads that.
+	 * - close_as_possible is reserved for a tight/mineshaft-like cave only, any severity - there's
+	 *   nowhere far to go anyway in a cramped space, so even a low-severity encounter there can start
+	 *   close; a normal/massive cave never offers it.
+	 * - close/medium/far/farther unlock progressively closer as severity climbs (farther at 20%, far
+	 *   at 40%, medium at 60%, close at 80%) - the wendigo is allowed to appear progressively
+	 *   bolder/closer the more established this player's relationship with it already is. farthest
+	 *   shares farther's own 20% floor - there's no tier below that one to gate against.
 	 * - no_players_looking: always allowed - the safe, unwatched default.
-	 * - spawn_on_torch: unlocks on the exact same schedule as spot_b/c/d/e/f, just measured against
-	 *   the separate torch-spawn-candidate pool instead of a labeled spot - see minTorchSpawnDistance.
-	 *   torchSpawnAvailable is the caller's answer to "does at least one candidate clear that
-	 *   distance" (a world fact WaveContext/the caller computed, not a policy choice re-derived here).
-	 *   At 80%+ this lines up with combat.chase also being unlocked - see the prompt guidance in
+	 * - spawn_on_torch: unlocks on the exact same schedule as close/medium/far/farther, just measured
+	 *   against a live torch scan instead of a distance band directly - see minTorchSpawnDistance.
+	 *   torchSpawnAvailable is the caller's answer to "does at least one live torch clear that
+	 *   distance" (a world fact the caller computed, not a policy choice re-derived here). At 80%+
+	 *   this lines up with combat.chase also being unlocked - see the prompt guidance in
 	 *   WendigoManager for the "commit to a hunt" framing that only applies at that top tier; below
 	 *   80% it's offered as an ordinary spawn location choice, no forced follow-up.
+	 * - spot_above: same 60% floor as combat.lunge_attack/movement.drop - the three are meant to
+	 *   unlock together (see TierGates.minPercentFor's own comment), spot_above + drop + lunge being
+	 *   the tier-60 pairing the user's own request calls out explicitly.
 	 */
-	public static boolean isSpawnSpotAllowed(String label, int severityPercent, CaveScale caveScale, boolean torchSpawnAvailable) {
-		return switch (label) {
-			case "spot_a" -> caveScale == CaveScale.TIGHT;
-			case "spot_b" -> severityPercent >= 80;
-			case "spot_c" -> severityPercent >= 60;
-			case "spot_d" -> severityPercent >= 40;
-			case "spot_e", "spot_f" -> severityPercent >= 20;
+	public static boolean isBandAllowed(String band, int severityPercent, CaveScale caveScale, boolean torchSpawnAvailable) {
+		return switch (band) {
+			case "close_as_possible" -> caveScale == CaveScale.TIGHT;
+			case "close" -> severityPercent >= 80;
+			case "medium" -> severityPercent >= 60;
+			case "far" -> severityPercent >= 40;
+			case "farther", "farthest" -> severityPercent >= 20;
 			case "spawn_on_torch" -> torchSpawnAvailable && severityPercent >= 20;
+			case "spot_above" -> severityPercent >= 60;
 			default -> true; // "no_players_looking"
 		};
 	}
 
 	/** The minimum distance-from-player a spawn_on_torch candidate must clear to be usable at this
-	 * severity - the exact same progressive tiers spot_b(16)/c(24)/d(32)/e(40) unlock at (see
-	 * DarkSpotScanner.spotDistanceThreshold), just applied to the separate torch-spawn-candidate pool
-	 * instead of a labeled spot: 20-39% needs e-or-further, 40-59% d-or-further, 60-79% c-or-further,
-	 * 80%+ b-or-further. Below 20%, nothing qualifies (matches spot_e/f's own floor - there's no tier
-	 * below that one to fall back to). Public so WendigoManager's resolution side filters the same
-	 * candidate pool this schema check reasons about, not just gates the option's visibility. */
+	 * severity - the exact same progressive tiers close/medium/far/farther unlock at (see
+	 * PositionBands.distanceMin), just applied to a live torch scan instead of a distance band
+	 * directly: 20-39% needs farther-or-further, 40-59% far-or-further, 60-79% medium-or-further,
+	 * 80%+ close-or-further. Below 20%, nothing qualifies (matches farther/farthest's own floor -
+	 * there's no tier below that one to fall back to). Public so WendigoManager's resolution side
+	 * filters the same live torch scan this schema check reasons about, not just gates the option's
+	 * visibility. */
 	public static double minTorchSpawnDistance(int severityPercent) {
 		if (severityPercent >= 80) {
-			return DarkSpotScanner.spotDistanceThreshold(1); // spot_b's own threshold
+			return PositionBands.distanceMin("close");
 		}
 		if (severityPercent >= 60) {
-			return DarkSpotScanner.spotDistanceThreshold(2); // spot_c's own threshold
+			return PositionBands.distanceMin("medium");
 		}
 		if (severityPercent >= 40) {
-			return DarkSpotScanner.spotDistanceThreshold(3); // spot_d's own threshold
+			return PositionBands.distanceMin("far");
 		}
 		if (severityPercent >= 20) {
-			return DarkSpotScanner.spotDistanceThreshold(4); // spot_e's own threshold
+			return PositionBands.distanceMin("farther");
 		}
 		return Double.POSITIVE_INFINITY;
 	}
@@ -174,11 +178,36 @@ public final class SchemaBuilder {
 		JsonObject spawnAt = schema.getAsJsonObject("properties").getAsJsonObject("spawn_at");
 		JsonArray kept = new JsonArray();
 		for (JsonElement value : spawnAt.getAsJsonArray("enum")) {
-			if (isSpawnSpotAllowed(value.getAsString(), severityPercent, caveScale, torchSpawnAvailable)) {
+			if (isBandAllowed(value.getAsString(), severityPercent, caveScale, torchSpawnAvailable)) {
 				kept.add(value);
 			}
 		}
 		spawnAt.add("enum", kept);
+	}
+
+	/** movement_approach_band's own "band" field gets the exact same isBandAllowed filtering
+	 * spawn_at's enum does - a pre-existing gap in the old labeled-spot system (movement.approach_spot's
+	 * own "spot" enum was never severity-filtered, only spawn_at was, so a model could technically
+	 * request approach_spot on a label it was never offered as a spawn choice) closed as a natural
+	 * side effect of this rewrite rather than carried forward. spawn_on_torch doesn't apply here (a
+	 * spawn_at-only special value, not a distance band - torches are for arriving already exposed,
+	 * not for retreating from view mid-plan) and stays excluded if present. no_players_looking DOES
+	 * apply here now (unlike spawn_on_torch) - see PlanRunner's own movement.approach_band handling -
+	 * and, like spawn_at's own no_players_looking, is always kept regardless of severity (isBandAllowed's
+	 * own default case already returns true for it unconditionally, same as it does for spawn_at). */
+	private static void filterApproachBand(JsonObject defs, int severityPercent, CaveScale caveScale, boolean torchSpawnAvailable) {
+		if (!defs.has("movement_approach_band")) {
+			return;
+		}
+		JsonObject bandProperty = defs.getAsJsonObject("movement_approach_band").getAsJsonObject("properties").getAsJsonObject("band");
+		JsonArray kept = new JsonArray();
+		for (JsonElement value : bandProperty.getAsJsonArray("enum")) {
+			String band = value.getAsString();
+			if (!"spawn_on_torch".equals(band) && isBandAllowed(band, severityPercent, caveScale, torchSpawnAvailable)) {
+				kept.add(value);
+			}
+		}
+		bandProperty.add("enum", kept);
 	}
 
 	private static String refName(String ref) {

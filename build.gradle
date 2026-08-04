@@ -36,6 +36,27 @@ loom {
 	}
 }
 
+// Enables `./gradlew runGameTest` - a headless server run that discovers every @GameTest-annotated
+// method on the classpath and runs it against a scratch world, then exits with a pass/fail summary.
+// Lets automated scenarios (spawn a mock ServerPlayer via GameTestHelper, position/equip/pose it,
+// trigger a wave, assert on outcome) run without a real client ever connecting - see
+// src/gametest/java/com/wendigo/gametest. eula=true because the gametest task boots a real (if
+// scratch, throwaway) game server under the hood, same as any other server launch.
+fabricApi {
+	configureTests {
+		eula = true
+		enableGameTests = true
+		// A dedicated source set (src/gametest/java, with its own fabric.mod.json - see
+		// src/gametest/resources) rather than dropping test code into main - keeps @GameTest-
+		// annotated scenarios out of the actual shipped mod jar entirely. Deliberately its own
+		// separate mod id (not "wendigo") - configureTests' own modId option instead tries to
+		// register "wendigo" a second time under this source set, colliding with the loom.mods{}
+		// declaration below. The gametest mod just depends on wendigo (see its own fabric.mod.json)
+		// for classpath access to its classes, same as any other mod-on-mod dependency.
+		createSourceSet = true
+	}
+}
+
 dependencies {
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"

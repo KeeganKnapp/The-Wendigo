@@ -12,12 +12,16 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.Vec3;
 
 /**
- * Shared dark-spot scanning: ring-samples around an origin and checks for standable, passable
- * columns. Used both for single-spot lookups (retreat_to_dark, memory.store_dark_location) and
- * for building the wave system's multi-spot spawn/despawn candidate list.
+ * Shared dark-spot scanning: ring-samples/floods around an origin and checks for standable, passable
+ * columns. Every position this class hands out is resolved live, on demand, against whatever
+ * origin/player position is passed in right now - nothing here is pre-scanned or cached across ticks
+ * (see findLiveBandPosition's own doc comment, the primitive that replaced the old "6 pre-scanned
+ * labeled spots" system).
  */
 public final class DarkSpotScanner {
 	private DarkSpotScanner() {
@@ -40,9 +44,6 @@ public final class DarkSpotScanner {
 	// actual floor - small and deliberately downward-only (gravity, not floating up to one), so
 	// hill/valley coverage comes from having multiple layers rather than one big vertical window.
 	private static final int RELAX_DEPTH = 4;
-	// Minimum separation between two accepted wave spots so they don't cluster on the same ledge -
-	// 6 blocks (stored squared since every comparison site is against distSqr, not distance).
-	private static final double MIN_SPOT_SEPARATION_SQR = 36.0;
 	// Hard cap on what counts as a "dark spot" at all - never return a candidate brighter than
 	// this even if it's the darkest one sampled, so a bad neighborhood yields fewer/no spots
 	// instead of a technically-darkest-but-still-lit one. Separate from the stricter
@@ -130,313 +131,36 @@ public final class DarkSpotScanner {
 		return false;
 	}
 
-	// How close a too-lit candidate needs to be to a torch to count as "linkable" - not a simulated
-	// lighting removal (too expensive for a heuristic like this whole class), just "close enough that
-	// breaking it plausibly resolves this spot", same tradeoff as everywhere else here.
-	private static final double TORCH_LINK_RADIUS = 6.0;
-
-	/** A scanned wave spot - either a genuinely dark standable position (linkedTorch null), or one
-	 * that's too lit to qualify on its own but sits near a breakable torch - spawning there and
-	 * immediately destroying that one torch is assumed to resolve the lighting. The AI never sees
-	 * this distinction for spawn_at's regular spot_a..spot_f labels (spawn_at just offers the label
-	 * either way) - only the engine (WendigoManager) reads linkedTorch, to know whether to break a
-	 * torch on arrival. Also reused for spawn_on_torch candidates, where linkedTorch is always
-	 * non-null by definition - distanceFromOrigin there is what SchemaBuilder.minTorchSpawnDistance
-	 * filters against, mirroring spot_b..spot_f's own progressive distance unlock but for this
-	 * separate candidate pool instead of a labeled spot.
-	 *
-	 * <p>surfaceNormal is UP for every ordinary floor spot, DOWN for a ceiling spot (see
-	 * findCeilingSpots), and EAST/WEST/NORTH/SOUTH for a wall spot (see findWallSpots) - the
-	 * direction away from whatever solid surface the position is attached to. */
-	public record WaveSpot(BlockPos position, BlockPos linkedTorch, double distanceFromOrigin, Direction surfaceNormal) {
-		public boolean isTorchLinked() {
-			return linkedTorch != null;
-		}
-	}
-
-	/** findWaveSpots' result: the labeled spot_a..spot_f candidates, and separately, torch-adjacent
-	 * positions found along the way that are worth offering as spawn_on_torch fallback candidates
-	 * (see WendigoManager) - kept apart from spots() since they're a different kind of choice (a
-	 * deliberately-exposed emergency option, not a normal hidden spawn point), even though they came
-	 * from the exact same flood pass. */
-	public record WaveSpotScan(List<WaveSpot> spots, List<WaveSpot> torchSpawnCandidates) {
-	}
-
-	// Wave-spot search never widens past this radius from the player - a flood-fill through a truly
-	// massive cavern could otherwise wander arbitrarily far chasing the next distance threshold.
-	private static final double MAX_SEARCH_RADIUS = 48.0;
-	// spot_a itself - the very first, closest spot - is never allowed closer than this to the player,
-	// even if genuinely dark ground exists nearer than that. Spawning right on top of the player
-	// defeats the point of the whole scan regardless of how dark it is there.
-	private static final double MIN_FIRST_SPOT_DISTANCE = 6.0;
-	// Each accepted wave spot must be at least this much farther from the player (straight-line, not
-	// path-length) than the previous one, cumulative from MIN_FIRST_SPOT_DISTANCE (8, 16, 24, 32, 40,
-	// 48) - same "proper distance spread" as before, just now satisfied by a real connected search
-	// instead of independently re-sampling rings at each radius.
-	private static final double SPOT_DISTANCE_STEP = MAX_SEARCH_RADIUS / 6.0;
-
-	/** The cumulative distance threshold a labeled spot slot unlocks at - spot_a=0 through spot_f=5,
-	 * matching SPOT_LABELS' own ordering (see WaveContext). Public so severity gating that isn't about
-	 * a labeled spot at all (SchemaBuilder.minTorchSpawnDistance, for the separate spawn_on_torch
-	 * candidate pool) can reuse the exact same distance tiers spot_b..spot_f already unlock at, instead
-	 * of a second hardcoded copy of 16/24/32/40 that could silently drift from these. */
-	public static double spotDistanceThreshold(int spotIndex) {
-		return MIN_FIRST_SPOT_DISTANCE + spotIndex * SPOT_DISTANCE_STEP;
-	}
-	// Hard ceiling on how many standable columns one flood-fill will ever visit - bounds worst-case
-	// cost in a huge, fully open cavern regardless of MAX_SEARCH_RADIUS (a big radius still contains
-	// vastly more open volume in a massive cave than a tight one). Generous for a search that only
-	// runs once per wave start.
-	private static final int MAX_FLOOD_VISITED = 4000;
-	// How many of the (possibly many) flood-visited nodes get the real, comparatively expensive
-	// LightSourceScanner.findLightSources treatment - torch-linked-spot fallback and
-	// spawn_on_torch-candidate collection both draw from this same bounded set of checks rather than
-	// probing every single visited node.
-	private static final int MAX_TORCH_CHECKS = 60;
-	private static final int MAX_TORCH_SPAWN_CANDIDATES = 10;
-	// 8-directional horizontal step between flood nodes - deliberately not the exact same move set
-	// vanilla pathfinding models (diagonal-cutting rules, jump height, cobweb/fence malus etc.); this
-	// only needs to be AT LEAST as permissive as real movement, never stricter, since the failure mode
-	// of "found a spot slightly harder to actually reach" already has a runtime fallback chain
-	// (PlanRunner's despawn/retreat retry logic, stuck/timeout detection), while the failure mode this
-	// search exists to kill - "engine-verified-reachable" and "the wendigo can actually get there"
-	// silently drifting apart, one via ring-sampling+probing, the other via real navigation - has no
-	// such safety net; the two now use the exact same graph by construction, not two independent
-	// approximations of it.
-	private static final int[] FLOOD_STEP_DX = {1, -1, 0, 0, 1, 1, -1, -1};
-	private static final int[] FLOOD_STEP_DZ = {0, 0, 1, -1, 1, -1, 1, -1};
-	// A diagonal step covers sqrt(2) as much real ground as a cardinal one, but both were being
-	// treated as "one hop" of equal weight - in an open room that made the search reach any given
-	// Euclidean distance threshold fastest (fewest hops) by going perfectly diagonally, every time,
-	// regardless of tie-breaking order (shuffling which cell wins a tie doesn't help when diagonal
-	// travel isn't actually tied with cardinal travel to begin with - it's structurally cheaper).
-	// Weighting each step by its real distance and expanding cheapest-first (see the frontier below)
-	// makes "distance travelled" in the search match real distance instead, so cardinal and diagonal
-	// directions compete fairly.
-	private static final double DIAGONAL_STEP_COST = Math.sqrt(2.0);
-	// Whole-number thresholds (8, 16, 24...) are only reachable exactly by cardinal steps (cost 1.0
-	// each) - the nearest diagonal step can only overshoot one (6 steps = 8.49 cost to clear a
-	// threshold of 8), and any other angle overshoots by even more (octile distance only equals real
-	// distance exactly at 0/45/90-degree multiples). Cost-ordering alone would therefore always accept
-	// the cardinal candidate first, every time, for the same reason plain BFS always accepted the
-	// diagonal one - a different "always exactly one direction wins" bias, not a random tie. Instead
-	// of accepting the very first cell whose distance clears a threshold, candidates that clear it
-	// within this much extra cost of the first one are pooled and one is picked at random from the
-	// pool. Checked against a standalone simulation (open room, thousands of trials, angle of the
-	// chosen spot) rather than just guessed at a value: 1.5 still let the exact diagonal angles (45/
-	// 135/225/315 - reachable by many different step sequences that all land on precisely that angle,
-	// unlike most other angles) come up noticeably more than a uniform spread would predict; 3.0 came
-	// out close to flat across all directions without pooling candidates so late that "roughly the
-	// same time" stops being true.
-	private static final double ACCEPT_WINDOW_COST = 3.0;
-	// How far above/below a column's own floor a horizontally-adjacent column's floor may sit and
-	// still count as one flood step - generous downward (a mob can always fall/drop through open
-	// space), modest upward (roughly a single block's step-up, matching ordinary ground-mob capability).
-	private static final int FLOOD_MAX_STEP_UP = 1;
-	private static final int FLOOD_MAX_STEP_DOWN = 4;
+	// How far from the wendigo's own current position a live-band-position flood-fill is allowed to
+	// range - the wendigo can legitimately already be well away from the player itself (mid-orbit, or
+	// mid-plan after several steps), on top of however far the new position then needs to be from the
+	// player too.
+	private static final double MAX_LIVE_BAND_SEARCH_RADIUS = 64.0;
+	private static final int MAX_LIVE_BAND_FLOOD_VISITED = 6000;
 
 	/**
-	 * Flood-fills outward from origin (the player) across actually-connected standable columns -
-	 * replaces an earlier design that independently ring-sampled at each radius band and only
-	 * verified reachability afterward (via a throwaway pathfinding probe), which repeatedly proved
-	 * unreliable in practice (crevices, rails, fence-post gaps, search-budget limits - each its own
-	 * source of "engine says unreachable, live wendigo proves otherwise" drift). A flood-fill can't
-	 * have that problem: every column it ever visits was reached by walking there, one connected step
-	 * at a time, from the player's own position - reachability isn't verified after the fact, it's
-	 * true by construction.
+	 * Finds the nearest (by real path cost, not straight-line) standable/attachable column reachable
+	 * from the WENDIGO's own current position (self) whose straight-line distance from player falls
+	 * in [minDistanceFromPlayer, maxDistanceFromPlayer] - the one shared live-position resolver used
+	 * everywhere a plan needs "get to roughly this distance from the player": orbit's own waypoint,
+	 * movement.approach_band, spawn/engage positioning, and despawn/retreat's own farthest-band
+	 * target. Deliberately resolved fresh every single call, against whatever position is passed in
+	 * right now - never cached or reused from an earlier resolution, which is the whole point (a
+	 * player who's moved since the last call gets a position relative to where they actually are now,
+	 * not where they used to be).
 	 * <p>
-	 * spot_a is (randomly, among whichever cleared it at roughly the same accumulated cost - see
-	 * ACCEPT_WINDOW_COST) one of the standable columns visited whose straight-line distance from origin
-	 * is at least MIN_FIRST_SPOT_DISTANCE and whose light is dark enough (or torch-linked); each spot
-	 * after that needs SPOT_DISTANCE_STEP more distance than the last accepted one (cumulative: 8, 16,
-	 * 24, 32, 40, 48). A cave with several branches naturally spreads spots across whichever branches
-	 * reach each threshold first (a fork in the search just means the frontier has entries from
-	 * multiple branches active at once - no special-casing needed). The frontier is cost-ordered (see
-	 * FloodNode/DIAGONAL_STEP_COST), not plain FIFO - a uniform-cost breadth-first order made "first
-	 * past the threshold" always mean "reached diagonally", since a diagonal hop covers more real
-	 * distance than a cardinal one for the same "one step" cost. That alone still wasn't enough: whole-
-	 * number thresholds are only reachable exactly by cardinal steps, so pure cost-ordering then always
-	 * favored cardinal directions instead (see ACCEPT_WINDOW_COST) - two different "always exactly one
-	 * direction wins" biases from two different causes, not one bug with one fix. Separately
-	 * collects up to MAX_TORCH_SPAWN_CANDIDATES torch-adjacent positions encountered along the way,
-	 * for spawn_on_torch (see WendigoManager) - reachable by the same construction, no separate check
-	 * needed there either. Stops once {@code count} spots are found, the flood exhausts its budget
-	 * (MAX_FLOOD_VISITED) or its radius (MAX_SEARCH_RADIUS), or there's simply nowhere left to expand.
+	 * Floods outward from self (not player, unlike findDarkest/findDarkestAwayFrom) and guarantees
+	 * reachability from wherever the wendigo currently stands, filtered by a distance band measured
+	 * from a DIFFERENT point (player) than the flood's own origin. normal selects floor (UP) or
+	 * ceiling (DOWN) attachment, same convention as attachableColumn/isAttachable. Since only one
+	 * position is needed (not a spread pool), this returns the very first in-band match the flood
+	 * reaches, which - because the frontier is a real-distance-weighted priority queue - is guaranteed
+	 * to be the cheapest-to-reach one, not just the first visited in some arbitrary order. Returns
+	 * null if the flood exhausts its budget/radius without finding anything in-band.
 	 */
-	public static WaveSpotScan findWaveSpots(Level level, BlockPos origin, int count) {
-		return findAttachableSpots(level, origin, count, Direction.UP);
-	}
-
-	/**
-	 * Same flood-fill as findWaveSpots, searching for ceiling attachment points (normal DOWN -
-	 * solid rock above, open space below) instead of floor ones - lets the wendigo spawn/hide on a
-	 * dark patch of cave ceiling via AWCAPI's climbing (see WendigoEntity), staring down at the
-	 * player from above instead of always being at floor level.
-	 * <p>
-	 * Not extended to wall spots (normal EAST/WEST/NORTH/SOUTH) - a ceiling spot, like a floor spot,
-	 * is still naturally "one XZ column has one ceiling/floor", so it reuses this flood-fill's
-	 * existing column-based data model unchanged (just walking attachableColumn/nearbyAttachable's
-	 * search upward instead of downward - see their own doc comments). A wall spot isn't a function
-	 * of an XZ column at all, it's a function of a vertical face at a given Y band - see
-	 * findWallSpots' own, deliberately lighter-weight approach for that case instead.
-	 * <p>
-	 * findAttachableSpots' own flood START is found via a single vertical probe directly at origin's
-	 * own (x,z) (attachableColumn's own layered relax search, straight up/down only, no lateral
-	 * movement) - fine for a floor spot, since the player is BY DEFINITION standing on a floor right
-	 * there, but for a ceiling that same probe requires solid rock directly overhead within a narrow
-	 * vertical window, which most cave ceilings simply aren't at any one exact point (live testing
-	 * found ceiling spots showing up far less often than floor ones, even after widening how many
-	 * slots were reserved for them - this, not flood path-cost, turned out to be why: if that one
-	 * probe fails, the WHOLE ceiling flood returns empty immediately, regardless of how good the
-	 * ceiling is 10 blocks to either side). findCeilingSeed below widens that single point into a
-	 * real search before giving up.
-	 */
-	public static WaveSpotScan findCeilingSpots(Level level, BlockPos origin, int count) {
-		BlockPos start = attachableColumn(level, origin, Direction.DOWN);
-		if (start == null) {
-			start = findCeilingSeed(level, origin);
-		}
-		if (start == null) {
-			return new WaveSpotScan(List.of(), List.of());
-		}
-		return findAttachableSpots(level, origin, count, Direction.DOWN, start);
-	}
-
-	// How far (ring-sampled, same technique as findDarkest) to search for ANY valid ceiling
-	// attachment point near origin, once the direct straight-up probe above origin itself has
-	// failed - see findCeilingSpots' own comment for why this matters. 30 blocks, not
-	// MAX_SEARCH_RADIUS's own 48 - a ceiling seed this far out already uses up a meaningful chunk of
-	// the flood's own distance-from-origin budget before it's even started exploring.
-	private static final double[] CEILING_SEED_SEARCH_RADII = {6.0, 12.0, 18.0, 24.0, 30.0};
-
-	/** Ring-samples progressively wider radii around origin (shuffled order, see findDarkest) for
-	 * the first XZ column where attachableColumn(DOWN) succeeds - unlike the primary flood-fill,
-	 * this isn't itself reachability-verified (same looseness already accepted for
-	 * findWallSpots/findDimSpots elsewhere in this class) - it only needs to find A valid ceiling
-	 * point to hand off to findAttachableSpots as its flood start, which then explores outward from
-	 * there with the real connected-search guarantee. Returns null if nothing qualifies within 30
-	 * blocks at all. */
-	private static BlockPos findCeilingSeed(Level level, BlockPos origin) {
-		for (double radius : CEILING_SEED_SEARCH_RADII) {
-			for (int i : shuffledRingIndices()) {
-				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
-				int dx = (int) Math.round(Math.cos(angle) * radius);
-				int dz = (int) Math.round(Math.sin(angle) * radius);
-				BlockPos candidate = attachableColumn(level, origin.offset(dx, 0, dz), Direction.DOWN);
-				if (candidate != null) {
-					return candidate;
-				}
-			}
-		}
-		return null;
-	}
-
-	// How far up a wall (from a ring-sampled floor anchor - see findWallSpots) to probe for a dark
-	// attachment point - first pass, tune by feel.
-	private static final int MAX_WALL_CLIMB_HEIGHT = 32;
-	// Same ring-sampling technique as findDimSpots/findDarkest - NOT the flood-fill's real-
-	// connected-search guarantee findWaveSpots/findCeilingSpots rely on (see findWallSpots' own doc
-	// comment for why that tradeoff is acceptable here) - progressively farther, mirroring the
-	// flood-fill's own distance spread (spotDistanceThreshold's 8/16/24/32/40/48).
-	private static final double[] WALL_SEARCH_RADII = {8.0, 16.0, 24.0, 32.0, 40.0, 48.0};
-	private static final Direction[] HORIZONTAL_DIRECTIONS =
-		{Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST};
-
-	/**
-	 * Wall spots (normal EAST/WEST/NORTH/SOUTH) aren't naturally "one XZ column has one wall" the
-	 * way floor/ceiling spots are - a wall spans a whole range of Y at a fixed XZ edge, not a single
-	 * point per column - so rather than forcing them into findWaveSpots/findCeilingSpots' flood-fill
-	 * data model, this uses the same ring-sampling technique findDimSpots/findDarkest already use
-	 * for a lighter-weight secondary spot type: ring-sample floor anchors around origin (standable,
-	 * but NOT flood-verified reachable the way the primary spot pool is), then from each anchor,
-	 * probe straight up whichever of its 4 horizontal neighbors is solid, requiring every block of
-	 * the climb to be genuinely open-and-wall-backed (isAttachable, no gaps) before accepting a
-	 * position. Reachability here is "walk to this known-standable anchor, then climb this one
-	 * contiguous wall face straight up" - a real path AWCAPI's climbing navigation can always take
-	 * once at the anchor, just not flood-verified the same rigorous way the primary pool is (the
-	 * same looseness already accepted for findDimSpots/torch candidates elsewhere in this class).
-	 */
-	public static WaveSpotScan findWallSpots(Level level, BlockPos origin, int count) {
-		List<WaveSpot> found = new ArrayList<>();
-		for (double radius : WALL_SEARCH_RADII) {
-			if (found.size() >= count) {
-				break;
-			}
-			for (int i : shuffledRingIndices()) {
-				if (found.size() >= count) {
-					break;
-				}
-				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
-				int dx = (int) Math.round(Math.cos(angle) * radius);
-				int dz = (int) Math.round(Math.sin(angle) * radius);
-				BlockPos anchor = standableColumn(level, origin.offset(dx, 0, dz));
-				if (anchor == null) {
-					continue;
-				}
-				WaveSpot wallSpot = findWallSpotAbove(level, anchor, Math.sqrt(anchor.distSqr(origin)), found);
-				if (wallSpot != null) {
-					found.add(wallSpot);
-				}
-			}
-		}
-		return new WaveSpotScan(found, List.of());
-	}
-
-	/** Checks each of the 4 horizontal directions (shuffled, to avoid the same directional bias
-	 * findDarkest's own ring-sampling once had) for a wall right at anchor's own height, then climbs
-	 * straight up that one face (if found) up to MAX_WALL_CLIMB_HEIGHT blocks looking for a dark
-	 * attachment point - stops climbing the instant a gap breaks the wall's continuity. Never
-	 * offers anchor itself (dy=0) as a wall spot - that's just standing on the floor next to a wall,
-	 * not a meaningfully different, elevated attachment point. */
-	private static WaveSpot findWallSpotAbove(Level level, BlockPos anchor, double distance, List<WaveSpot> alreadyFound) {
-		List<Direction> directions = new ArrayList<>(HORIZONTAL_DIRECTIONS.length);
-		Collections.addAll(directions, HORIZONTAL_DIRECTIONS);
-		Collections.shuffle(directions, ThreadLocalRandom.current());
-		for (Direction normal : directions) {
-			if (!isAttachable(level, anchor, normal)) {
-				continue; // no wall in this direction at anchor's own height
-			}
-			for (int dy = 1; dy <= MAX_WALL_CLIMB_HEIGHT; dy++) {
-				BlockPos candidate = anchor.above(dy);
-				if (!isAttachable(level, candidate, normal)) {
-					break; // wall face ended (opening/gap) - stop climbing this one
-				}
-				int light = level.getMaxLocalRawBrightness(candidate);
-				if (light <= MAX_DARK_LIGHT
-						&& alreadyFound.stream().noneMatch(w -> w.position().distSqr(candidate) < MIN_SPOT_SEPARATION_SQR)) {
-					return new WaveSpot(candidate, null, distance, normal);
-				}
-			}
-		}
-		return null;
-	}
-
-	// How far from the wendigo's own current position an orbit-waypoint flood-fill is allowed to
-	// range - deliberately larger than MAX_SEARCH_RADIUS/MAX_FLOOD_VISITED, since (unlike every
-	// other scan in this class, always seeded at the player) the wendigo orbiting at the edge of
-	// its own band can legitimately already be MAX_SEARCH_RADIUS+ blocks from the player itself, on
-	// top of however far the new waypoint then needs to be from there too.
-	private static final double MAX_ORBIT_SEARCH_RADIUS = 64.0;
-	private static final int MAX_ORBIT_FLOOD_VISITED = 6000;
-
-	/**
-	 * Finds the nearest (by real path cost, not straight-line) standable, dark column reachable from
-	 * the WENDIGO's own current position (self) whose straight-line distance from player falls in
-	 * [minDistanceFromPlayer, maxDistanceFromPlayer] - the orbit behavior's own waypoint picker (see
-	 * PlanRunner.tickOrbit). Every other scan in this class floods outward from the PLAYER and
-	 * guarantees reachability from there; orbit needs the opposite guarantee (reachable from
-	 * wherever the wendigo currently stands, which could itself already be far from the player),
-	 * filtered by a distance band measured from a DIFFERENT point than the flood's own origin - a
-	 * genuinely different shape from findAttachableSpots' cumulative-distance-from-origin threshold
-	 * model below, not reusable from it. Since only one waypoint is needed (not a spread pool), this
-	 * returns the very first in-band match the flood reaches, which - because the frontier is the
-	 * same real-distance-weighted priority queue findAttachableSpots uses - is guaranteed to be the
-	 * cheapest-to-reach one, not just the first visited in some arbitrary order. Returns null if the
-	 * flood exhausts its budget/radius without finding anything in-band.
-	 */
-	public static BlockPos findOrbitWaypoint(Level level, BlockPos self, BlockPos player,
-			double minDistanceFromPlayer, double maxDistanceFromPlayer) {
-		BlockPos start = attachableColumn(level, self, Direction.UP);
+	public static BlockPos findLiveBandPosition(Level level, BlockPos self, BlockPos player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer, Direction normal) {
+		BlockPos start = attachableColumn(level, self, normal);
 		if (start == null) {
 			return null;
 		}
@@ -447,7 +171,7 @@ public final class DarkSpotScanner {
 		visited.add(start.asLong());
 
 		int visitedCount = 0;
-		while (!frontier.isEmpty() && visitedCount < MAX_ORBIT_FLOOD_VISITED) {
+		while (!frontier.isEmpty() && visitedCount < MAX_LIVE_BAND_FLOOD_VISITED) {
 			FloodNode currentNode = frontier.poll();
 			BlockPos current = currentNode.pos();
 			visitedCount++;
@@ -464,11 +188,11 @@ public final class DarkSpotScanner {
 				}
 			}
 
-			if (distanceFromSelf > MAX_ORBIT_SEARCH_RADIUS) {
+			if (distanceFromSelf > MAX_LIVE_BAND_SEARCH_RADIUS) {
 				continue; // don't expand past the search boundary
 			}
 			for (int i : shuffledFloodDirections()) {
-				BlockPos neighbor = nearbyAttachable(level, current.getX() + FLOOD_STEP_DX[i], current.getZ() + FLOOD_STEP_DZ[i], current.getY(), Direction.UP);
+				BlockPos neighbor = nearbyAttachable(level, current.getX() + FLOOD_STEP_DX[i], current.getZ() + FLOOD_STEP_DZ[i], current.getY(), normal);
 				if (neighbor == null) {
 					continue;
 				}
@@ -483,10 +207,160 @@ public final class DarkSpotScanner {
 		return null;
 	}
 
+	// Same order of magnitude as findNearestUnwatchedDarkSpot's own worst-case sample count (8 radii x
+	// 12 ring points = 96) - cheap relative to findLiveBandPosition's own MAX_LIVE_BAND_FLOOD_VISITED
+	// budget. First pass, adjust by feel once live-tested, especially in a TIGHT-cave-scale band
+	// (narrower shell, proportionally fewer samples land in it).
+	private static final int LIVE_BAND_3D_SAMPLE_ATTEMPTS = 80;
+
+	/**
+	 * findLiveBandPosition's geometry-only sibling, for callers that need a genuinely fair shot at
+	 * landing on ANY attachment surface (floor, ceiling, or a wall) rather than whichever one happens
+	 * to be cheapest to flood-fill-reach from the entity's own current position - see PlanRunner.
+	 * tickOrbit, the only caller. findLiveBandPosition's flood only ever searches for the SAME normal
+	 * at every step (both its own start-column lookup and each expansion step), so a normal other than
+	 * UP has to already be reachable via a same-normal-only path from wherever the entity currently
+	 * is - in practice this means a ceiling/wall pick from a floor-standing entity routinely fails to
+	 * even find a seed column, let alone flood out from one, systematically under-representing
+	 * anything but the floor. This method sidesteps that entirely: no flood, no dependency on the
+	 * entity's own current position at all - just genuine random points on a spherical shell between
+	 * minDistanceFromPlayer and maxDistanceFromPlayer around player, each resolved into a real
+	 * attachable position via attachableColumn (reused as-is; already normal-agnostic - only the UP
+	 * case gets a different relax sign, every other normal, walls included, already shares one relax
+	 * search). Deliberately NOT flood-verified reachable from the entity's own position, same
+	 * looseness findCeilingVantagePoint already accepts - relies on the entity's own navigation plus
+	 * stuck/trapped detection (PlanRunner.isRepeatedlyStuck, WendigoEntity.isOrbitTrapped) to recover
+	 * from a genuinely-unreachable pick rather than guaranteeing reachability upfront. Returns the
+	 * first sample that's both in-band and dark enough - not the "best" of many; sample order is
+	 * already random, so first-valid is already an unbiased pick, which suits a wander/positioning
+	 * caller (wants spread, not always the single darkest spot) better than accumulating a favorite
+	 * would. Returns null if nothing qualifies within LIVE_BAND_3D_SAMPLE_ATTEMPTS tries.
+	 */
+	public static BlockPos findLiveBandPosition3D(Level level, BlockPos player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer, Direction normal) {
+		ThreadLocalRandom random = ThreadLocalRandom.current();
+		double radiusSpread = maxDistanceFromPlayer - minDistanceFromPlayer;
+		for (int attempt = 0; attempt < LIVE_BAND_3D_SAMPLE_ATTEMPTS; attempt++) {
+			// Archimedes/Marsaglia uniform-sphere-point sampling: z uniform in [-1,1] is the property
+			// that has to land on Minecraft's actual vertical axis (Y) for this to fix ceiling/floor
+			// under-representation - mapping it to a horizontal axis instead would spread samples
+			// evenly around a horizontal ring while still clustering near straight-up/straight-down,
+			// exactly the bias this method exists to remove.
+			double z = random.nextDouble(-1.0, 1.0);
+			double theta = random.nextDouble(0.0, 2.0 * Math.PI);
+			double ringRadius = Math.sqrt(1.0 - z * z);
+			double radius = minDistanceFromPlayer + random.nextDouble() * radiusSpread;
+			int dx = (int) Math.round(ringRadius * Math.cos(theta) * radius);
+			int dy = (int) Math.round(z * radius);
+			int dz = (int) Math.round(ringRadius * Math.sin(theta) * radius);
+			BlockPos sample = player.offset(dx, dy, dz);
+			if (sample.getY() < level.getMinY() || sample.getY() > level.getMaxY()) {
+				continue;
+			}
+			BlockPos candidate = attachableColumn(level, sample, normal);
+			if (candidate == null) {
+				continue;
+			}
+			// attachableColumn's own relax can walk the resolved candidate a few blocks off the raw
+			// sampled point - re-check against the band here, unlike findLiveBandPosition's flood,
+			// which already gets this check for free by filtering post-expansion.
+			double distanceFromPlayer = Math.sqrt(candidate.distSqr(player));
+			if (distanceFromPlayer < minDistanceFromPlayer || distanceFromPlayer > maxDistanceFromPlayer) {
+				continue;
+			}
+			if (level.getMaxLocalRawBrightness(candidate) <= MAX_DARK_LIGHT) {
+				return candidate;
+			}
+		}
+		return null;
+	}
+
+	// Retries findLiveBandPosition up to this many times looking for one the player isn't currently
+	// looking toward - shuffledFloodDirections' own per-call randomization (see findLiveBandPosition's
+	// own doc comment) means repeated calls with the same inputs aren't guaranteed to return the same
+	// column, so retrying is a real search, not spinning on a deterministic result.
+	private static final int UNWATCHED_POSITION_ATTEMPTS = 5;
+
+	/**
+	 * findLiveBandPosition, filtered for a position the player isn't currently facing toward - backs
+	 * both spawn_at's own "no_players_looking" special value (WendigoManager's fresh-spawn path, self
+	 * seeded from the player's own position since there's no existing entity position yet) and
+	 * movement.approach_band's "no_players_looking" band (PlanRunner's mid-plan repositioning, self
+	 * seeded from the wendigo's own current position like every other band). Falls back to whichever
+	 * candidate was actually found (even if still watched) if none of the attempts come up unwatched,
+	 * rather than returning null and leaving the caller with nothing at all - same "some darkness
+	 * beats none" philosophy every other fallback in this class already follows.
+	 */
+	public static BlockPos findUnwatchedPosition(Level level, BlockPos self, Player player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer, Direction normal) {
+		BlockPos best = null;
+		for (int attempt = 0; attempt < UNWATCHED_POSITION_ATTEMPTS; attempt++) {
+			BlockPos candidate = findLiveBandPosition(level, self, player.blockPosition(), minDistanceFromPlayer, maxDistanceFromPlayer, normal);
+			if (candidate == null) {
+				continue;
+			}
+			best = candidate;
+			if (!isPlayerLookingToward(player, candidate)) {
+				return candidate;
+			}
+		}
+		return best;
+	}
+
+	// Expanding-ring search bounds for findNearestUnwatchedDarkSpot - stage 5's teleport-behind-player
+	// ambush is meant to read as "right behind you", not "somewhere vaguely nearby", so this starts
+	// close and only widens as far as it has to. First pass, adjust by feel like every other radius
+	// in this class.
+	private static final double TELEPORT_BEHIND_MIN_RADIUS = 2.0;
+	private static final double TELEPORT_BEHIND_MAX_RADIUS = 16.0;
+	private static final double TELEPORT_BEHIND_RADIUS_STEP = 2.0;
+
+	/**
+	 * Nearest standable, dark (see MAX_DARK_LIGHT), currently-unwatched (see isPlayerLookingToward)
+	 * column around player, searched via expanding rings (same RING_SAMPLE_POINTS/shuffled-order
+	 * technique findDarkestBiased uses) from TELEPORT_BEHIND_MIN_RADIUS out to _MAX_RADIUS - backs
+	 * combat.teleport_behind (stage 5 only). Deliberately NOT flood-verified reachable from the
+	 * wendigo's own current position, same looseness findCeilingVantagePoint already accepts for
+	 * orbit's own fallback: this is an instant teleport, not something that needs to be walked to, so
+	 * reachability from self is irrelevant here - only "is this a real, dark, unwatched spot near the
+	 * player" matters. Returns null if nothing in range qualifies at all.
+	 */
+	public static BlockPos findNearestUnwatchedDarkSpot(Level level, Player player) {
+		BlockPos origin = player.blockPosition();
+		for (double radius = TELEPORT_BEHIND_MIN_RADIUS; radius <= TELEPORT_BEHIND_MAX_RADIUS; radius += TELEPORT_BEHIND_RADIUS_STEP) {
+			for (int i : shuffledRingIndices()) {
+				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
+				int dx = (int) Math.round(Math.cos(angle) * radius);
+				int dz = (int) Math.round(Math.sin(angle) * radius);
+				BlockPos candidate = standableColumn(level, origin.offset(dx, 0, dz));
+				if (candidate == null) {
+					continue;
+				}
+				if (level.getMaxLocalRawBrightness(candidate) > MAX_DARK_LIGHT) {
+					continue;
+				}
+				if (!isPlayerLookingToward(player, candidate)) {
+					return candidate;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** Angle-only approximation (no line-of-sight/occlusion check, unlike the live in-game stare
+	 * predicate) of whether the player is currently facing toward a candidate position - good enough
+	 * for "don't send it somewhere already in view", not meant to be as precise as
+	 * predicate.player_looking_at_self. Same corner_of_eye threshold (~60 degrees) as that predicate. */
+	private static boolean isPlayerLookingToward(Player player, BlockPos pos) {
+		Vec3 toPos = Vec3.atCenterOf(pos).subtract(player.getEyePosition()).normalize();
+		double alignment = player.getLookAngle().normalize().dot(toPos);
+		return alignment >= Math.cos(Math.toRadians(60.0));
+	}
+
 	// Cap on how far above the player orbit's own ceiling-vantage preference (see
 	// PlanRunner.tickOrbit) will look for a ceiling to perch on - a straight-line height limit, not
-	// tied to MAX_ORBIT_SEARCH_RADIUS (that governs the flood-fill's real path-cost budget for the
-	// ordinary floor waypoint search this is an alternative to).
+	// tied to MAX_LIVE_BAND_SEARCH_RADIUS (that governs the flood-fill's real path-cost budget for
+	// the ordinary band-position search this is an alternative to).
 	private static final double MAX_CEILING_VANTAGE_HEIGHT = 30.0;
 
 	/** Straight vertical probe directly above player, looking for the first ceiling-attachable
@@ -508,112 +382,54 @@ public final class DarkSpotScanner {
 		return null;
 	}
 
-	private static WaveSpotScan findAttachableSpots(Level level, BlockPos origin, int count, Direction normal) {
-		return findAttachableSpots(level, origin, count, normal, null);
-	}
+	// Over-fetches from LightSourceScanner.findLightSources (nearest-first) since torches closer than
+	// a band's own minDistance would otherwise consume its count cap before anything genuinely in-band
+	// is ever reached - generous enough for realistic cave torch density without being unbounded.
+	private static final int BAND_TORCH_FETCH_COUNT = 40;
 
-	/** explicitStart, when given, is used as the flood's own starting point INSTEAD of
-	 * attachableColumn(origin, normal) - see findCeilingSpots' own comment for why a ceiling flood
-	 * needs this (a valid start point found somewhere other than directly at origin's own (x,z)).
-	 * Distance thresholds (spot_a..spot_f's own progressive unlock distances) are still measured
-	 * from origin regardless - only WHERE the flood begins exploring from changes, not what "how far
-	 * from the player" means for an accepted spot. */
-	private static WaveSpotScan findAttachableSpots(Level level, BlockPos origin, int count, Direction normal, BlockPos explicitStart) {
-		List<WaveSpot> spots = new ArrayList<>();
-		List<WaveSpot> torchSpawnCandidates = new ArrayList<>();
-		BlockPos start = explicitStart != null ? explicitStart : attachableColumn(level, origin, normal);
-		if (start == null) {
-			return new WaveSpotScan(spots, torchSpawnCandidates);
-		}
-
-		Queue<FloodNode> frontier = new PriorityQueue<>(Comparator.comparingDouble(FloodNode::cost));
-		Set<Long> visited = new HashSet<>();
-		frontier.add(new FloodNode(start, 0.0));
-		visited.add(start.asLong());
-
-		double nextThreshold = MIN_FIRST_SPOT_DISTANCE;
-		int visitedCount = 0;
-		int torchChecksUsed = 0;
-		// Candidates that have already cleared nextThreshold, waiting to see if anything else clears
-		// it within ACCEPT_WINDOW_COST before one gets picked - see that constant's own comment.
-		List<WaveSpot> thresholdCandidates = new ArrayList<>();
-		double windowStartCost = -1.0;
-
-		while (!frontier.isEmpty() && spots.size() < count && visitedCount < MAX_FLOOD_VISITED) {
-			FloodNode currentNode = frontier.poll();
-			BlockPos current = currentNode.pos();
-			visitedCount++;
-			boolean isStart = current.equals(start);
-			double distance = Math.sqrt(current.distSqr(origin));
-
-			if (windowStartCost >= 0 && currentNode.cost() > windowStartCost + ACCEPT_WINDOW_COST) {
-				spots.add(thresholdCandidates.get(ThreadLocalRandom.current().nextInt(thresholdCandidates.size())));
-				nextThreshold += SPOT_DISTANCE_STEP;
-				thresholdCandidates = new ArrayList<>();
-				windowStartCost = -1.0;
-			}
-
-			if (!isStart && spots.size() < count) {
-				boolean wantsTorchCheck = distance >= nextThreshold || torchSpawnCandidates.size() < MAX_TORCH_SPAWN_CANDIDATES;
-				List<BlockPos> nearbyTorch = null;
-				if (wantsTorchCheck && torchChecksUsed < MAX_TORCH_CHECKS) {
-					torchChecksUsed++;
-					nearbyTorch = LightSourceScanner.findLightSources(level, current, TORCH_LINK_RADIUS, 1);
-				}
-				if (distance >= nextThreshold) {
-					int light = level.getMaxLocalRawBrightness(current);
-					WaveSpot accepted = null;
-					if (light <= MAX_DARK_LIGHT) {
-						accepted = new WaveSpot(current, null, distance, normal);
-					} else if (nearbyTorch != null && !nearbyTorch.isEmpty()) {
-						accepted = new WaveSpot(current, nearbyTorch.get(0), distance, normal);
-					}
-					boolean tooCloseToAccepted = accepted != null
-						&& spots.stream().anyMatch(w -> w.position().distSqr(current) < MIN_SPOT_SEPARATION_SQR);
-					if (accepted != null && !tooCloseToAccepted) {
-						thresholdCandidates.add(accepted);
-						if (windowStartCost < 0) {
-							windowStartCost = currentNode.cost();
-						}
-					}
-				}
-				if (nearbyTorch != null && !nearbyTorch.isEmpty() && torchSpawnCandidates.size() < MAX_TORCH_SPAWN_CANDIDATES
-						&& torchSpawnCandidates.stream().noneMatch(w -> w.position().distSqr(current) < MIN_SPOT_SEPARATION_SQR)) {
-					torchSpawnCandidates.add(new WaveSpot(current, nearbyTorch.get(0), distance, normal));
-				}
-			}
-
-			if (distance > MAX_SEARCH_RADIUS) {
-				continue; // don't expand past the search boundary
-			}
-			for (int i : shuffledFloodDirections()) {
-				BlockPos neighbor = nearbyAttachable(level, current.getX() + FLOOD_STEP_DX[i], current.getZ() + FLOOD_STEP_DZ[i], current.getY(), normal);
-				if (neighbor == null) {
-					continue;
-				}
-				long key = neighbor.asLong();
-				if (!visited.add(key)) {
-					continue;
-				}
-				boolean diagonal = FLOOD_STEP_DX[i] != 0 && FLOOD_STEP_DZ[i] != 0;
-				frontier.add(new FloodNode(neighbor, currentNode.cost() + (diagonal ? DIAGONAL_STEP_COST : 1.0)));
+	/** Torches whose live distance from player falls in [minDistance, maxDistance], nearest-in-band
+	 * first - backs both the prompt's per-band torch counts (WaveContext) and combat.break_torch's
+	 * optional band-constrained target lookup (PlanRunner), both reading this fresh at the moment
+	 * they need it rather than a value cached from earlier. */
+	public static List<BlockPos> findTorchesInBand(Level level, BlockPos player, double minDistance, double maxDistance) {
+		List<BlockPos> nearby = LightSourceScanner.findLightSources(level, player, maxDistance, BAND_TORCH_FETCH_COUNT);
+		List<BlockPos> inBand = new ArrayList<>();
+		for (BlockPos candidate : nearby) {
+			double distance = Math.sqrt(candidate.distSqr(player));
+			if (distance >= minDistance && distance <= maxDistance) {
+				inBand.add(candidate);
 			}
 		}
-		// A window can still be open here - the flood ran out of frontier/budget before any later cell
-		// arrived to close it out (see the window-close check above) - don't drop a genuinely found
-		// last-threshold candidate just because nothing else happened to race it.
-		if (windowStartCost >= 0 && spots.size() < count) {
-			spots.add(thresholdCandidates.get(ThreadLocalRandom.current().nextInt(thresholdCandidates.size())));
-		}
-		return new WaveSpotScan(spots, torchSpawnCandidates);
+		return inBand;
 	}
 
 	/** A flood-fill frontier entry - cost is the accumulated real-distance-weighted path length from
-	 * the player (see DIAGONAL_STEP_COST), not a hop count, so the frontier's priority-queue ordering
-	 * expands the genuinely closest unvisited column next regardless of how many hops it took to
-	 * reach it. */
+	 * the flood's own start (see DIAGONAL_STEP_COST), not a hop count, so the frontier's priority-queue
+	 * ordering expands the genuinely closest unvisited column next regardless of how many hops it took
+	 * to reach it. */
 	private record FloodNode(BlockPos pos, double cost) {
 	}
+
+	// 8-directional horizontal step between flood nodes - deliberately not the exact same move set
+	// vanilla pathfinding models (diagonal-cutting rules, jump height, cobweb/fence malus etc.); this
+	// only needs to be AT LEAST as permissive as real movement, never stricter, since a spot slightly
+	// harder to actually reach already has a runtime fallback (stuck/timeout detection, a fresh
+	// re-resolution next attempt) - the failure mode this search exists to kill is
+	// "engine-verified-reachable" and "the wendigo can actually get there" silently drifting apart,
+	// which a real flood-fill can't have (every column visited was reached by walking there, one
+	// connected step at a time - reachability is true by construction, not verified after the fact).
+	private static final int[] FLOOD_STEP_DX = {1, -1, 0, 0, 1, 1, -1, -1};
+	private static final int[] FLOOD_STEP_DZ = {0, 0, 1, -1, 1, -1, 1, -1};
+	// A diagonal step covers sqrt(2) as much real ground as a cardinal one - weighting each step by
+	// its real distance and expanding cheapest-first (see the frontier above) makes "distance
+	// travelled" in the search match real distance, so cardinal and diagonal directions compete fairly
+	// instead of diagonal always winning ties under a naive uniform-cost scheme.
+	private static final double DIAGONAL_STEP_COST = Math.sqrt(2.0);
+	// How far above/below a column's own floor a horizontally-adjacent column's floor may sit and
+	// still count as one flood step - generous downward (a mob can always fall/drop through open
+	// space), modest upward (roughly a single block's step-up, matching ordinary ground-mob capability).
+	private static final int FLOOD_MAX_STEP_UP = 1;
+	private static final int FLOOD_MAX_STEP_DOWN = 4;
 
 	/** Finds the floor (normal UP) or ceiling (normal DOWN) attachment point at (x,z) nearest to
 	 * referenceY - up to FLOOD_MAX_STEP_UP above it, down to FLOOD_MAX_STEP_DOWN below - for
@@ -632,131 +448,6 @@ public final class DarkSpotScanner {
 			}
 		}
 		return null;
-	}
-
-	// A "dim spot" sits just above the darkness cutoff used elsewhere (predicate.self_in_darkness,
-	// SemanticBands.DARKNESS_LIGHT_THRESHOLD = 2) but below fully lit - the edge of a light source,
-	// not inside it. com.wendigo.spatial has no dependency on com.wendigo.plan (SemanticBands is
-	// package-private there anyway), so these are kept in sync by hand rather than shared.
-	private static final int DIM_LIGHT_MIN = 3;
-	private static final int DIM_LIGHT_MAX = 5;
-	// Ring-sampled (like findDarkest), not marched along a single straight line to "towards" - real
-	// cave terrain almost never keeps a literal straight line open and standable the whole way, so a
-	// line march mostly hit solid rock and came back empty. Rings still bias toward "towards" (see
-	// DIM_ANGLE_TOLERANCE_DEGREES) without requiring exact alignment with it.
-	private static final double[] DIM_SEARCH_RADII = {3.0, 6.0, 9.0, 12.0};
-	private static final double DIM_ANGLE_TOLERANCE_DEGREES = 70.0;
-
-	/**
-	 * Ring-samples a few radii around origin, keeping standable columns whose light level falls in
-	 * the dim band (edge-of-light, not fully dark or fully lit) and whose bearing from origin is
-	 * roughly toward "towards" (within DIM_ANGLE_TOLERANCE_DEGREES) - a real edge-of-light waypoint
-	 * near the player, not just any dim patch nearby regardless of direction. Returns up to count
-	 * spots, closest-to-"towards" first. Used by movement.approach_dim_spot's live resolution (the
-	 * wendigo's current position toward the nearest player) - the wave-context per-spot scan used to
-	 * call this too, but that wanted the opposite of an angle bias (see findSpotDimSpots).
-	 */
-	public static List<BlockPos> findDimSpots(Level level, BlockPos origin, BlockPos towards, int count) {
-		List<BlockPos> found = new ArrayList<>();
-		double dx0 = towards.getX() - origin.getX();
-		double dz0 = towards.getZ() - origin.getZ();
-		double totalDistance = Math.sqrt(dx0 * dx0 + dz0 * dz0);
-		if (totalDistance < 1.0) {
-			return found;
-		}
-		double bearingToTargetDegrees = Math.toDegrees(Math.atan2(dz0, dx0));
-
-		for (double radius : DIM_SEARCH_RADII) {
-			if (radius >= totalDistance || found.size() >= count) {
-				continue;
-			}
-			for (int i : shuffledRingIndices()) {
-				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
-				double angleDelta = Math.abs(normalizeDegrees(Math.toDegrees(angle) - bearingToTargetDegrees));
-				if (angleDelta > DIM_ANGLE_TOLERANCE_DEGREES) {
-					continue;
-				}
-				int dx = (int) Math.round(Math.cos(angle) * radius);
-				int dz = (int) Math.round(Math.sin(angle) * radius);
-				BlockPos candidate = standableColumn(level, origin.offset(dx, 0, dz));
-				if (candidate == null) {
-					continue;
-				}
-				int light = level.getMaxLocalRawBrightness(candidate);
-				if (light >= DIM_LIGHT_MIN && light <= DIM_LIGHT_MAX
-					&& found.stream().noneMatch(p -> p.distSqr(candidate) < MIN_SPOT_SEPARATION_SQR)) {
-					found.add(candidate);
-					if (found.size() >= count) {
-						break;
-					}
-				}
-			}
-		}
-		found.sort(java.util.Comparator.comparingDouble(p -> p.distSqr(towards)));
-		return found;
-	}
-
-	// Per-dark-spot torch discovery - distinct radius tiers instead of one narrow band searched
-	// repeatedly. findDimSpots' close-together DIM_SEARCH_RADII, biased toward a single "towards"
-	// direction, meant nearly every dim spot around a given dark spot climbed to the same one nearest
-	// light source - a far spawn point's own torch cluster in any direction other than toward the
-	// player was routinely invisible to both the prompt context and the live combat.break_torch
-	// resolution, so distant torches almost never got broken even when the wendigo was standing right
-	// next to a cluster of them. This scans omnidirectionally (no angle bias at all - a spot's nearby
-	// torches matter regardless of which side of it they're on) at five increasingly wide radii, one
-	// attempt per tier, so a spot with several torches at different distances actually surfaces more
-	// than just the closest one. Outer radius (35) matches LightSourceScanner's own hard cap, so
-	// anything found here is still within reach of PlanRunner's live break_torch resolution from the
-	// same spot.
-	private static final double[] SPOT_TORCH_SEARCH_RADII = {4.0, 9.0, 16.0, 25.0, 35.0};
-
-	/**
-	 * One dim-spot-then-climb-to-light-source attempt per SPOT_TORCH_SEARCH_RADII tier, all
-	 * omnidirectional around spot (see the field's own comment) - up to 5 dim spots/torches, fewer if
-	 * a given tier's ring came up empty. dimSpots() entries whose source can't be climbed to (or is
-	 * sealed off) still count as valid approach-and-stare targets, they just contribute nothing to
-	 * lightSources(), which is deduplicated since multiple tiers commonly climb to the identical
-	 * torch.
-	 */
-	public static RelevantSpots findSpotDimSpots(Level level, BlockPos spot) {
-		List<BlockPos> dimSpots = new ArrayList<>();
-		List<BlockPos> lightSources = new ArrayList<>();
-		for (double radius : SPOT_TORCH_SEARCH_RADII) {
-			BlockPos found = findDimSpotOmnidirectional(level, spot, radius, dimSpots);
-			if (found == null) {
-				continue;
-			}
-			dimSpots.add(found);
-			BlockPos source = LightSourceScanner.climbLightSource(level, found);
-			if (source != null && lightSources.stream().noneMatch(source::equals)) {
-				lightSources.add(source);
-			}
-		}
-		return new RelevantSpots(dimSpots, lightSources);
-	}
-
-	/** Ring-samples one radius around origin (shuffled order, see findDarkest) for a single standable
-	 * column in the dim light band, skipping anything too close to an already-accepted dim spot -
-	 * every direction is fair game, unlike findDimSpots' angle-toward-target bias. */
-	private static BlockPos findDimSpotOmnidirectional(Level level, BlockPos origin, double radius, List<BlockPos> alreadyFound) {
-		for (int i : shuffledRingIndices()) {
-			double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
-			int dx = (int) Math.round(Math.cos(angle) * radius);
-			int dz = (int) Math.round(Math.sin(angle) * radius);
-			BlockPos candidate = standableColumn(level, origin.offset(dx, 0, dz));
-			if (candidate == null) {
-				continue;
-			}
-			int light = level.getMaxLocalRawBrightness(candidate);
-			if (light >= DIM_LIGHT_MIN && light <= DIM_LIGHT_MAX
-				&& alreadyFound.stream().noneMatch(p -> p.distSqr(candidate) < MIN_SPOT_SEPARATION_SQR)) {
-				return candidate;
-			}
-		}
-		return null;
-	}
-
-	public record RelevantSpots(List<BlockPos> dimSpots, List<BlockPos> lightSources) {
 	}
 
 	/** Shuffled 0..RING_SAMPLE_POINTS-1 traversal order - see findDarkest's own note on why a fixed
@@ -817,9 +508,9 @@ public final class DarkSpotScanner {
 	 * Generalizes standableColumn to an arbitrary attachment surface - normal UP is exactly
 	 * standableColumn's own floor search (relaxes downward from each layer, looking for solid
 	 * ground below an open block); normal DOWN mirrors it for a ceiling (relaxes upward instead,
-	 * looking for solid rock above an open block) - see findCeilingSpots. The relax direction has to
-	 * invert for correctness (searching downward can never find a ceiling), unlike
-	 * nearbyAttachable's own window, which stays unmirrored on purpose (see that method's comment).
+	 * looking for solid rock above an open block). The relax direction has to invert for correctness
+	 * (searching downward can never find a ceiling), unlike nearbyAttachable's own window, which
+	 * stays unmirrored on purpose (see that method's comment).
 	 */
 	private static BlockPos attachableColumn(Level level, BlockPos column, Direction normal) {
 		int relaxSign = normal == Direction.UP ? -1 : 1;

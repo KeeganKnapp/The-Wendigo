@@ -48,10 +48,19 @@ import com.wendigo.spatial.CaveScaleScanner;
  * y&lt;0 dwell time isn't practical to test with. {@code debug} toggles the sender's own debug
  * session (see com.wendigo.debug.WendigoDebug) - chat commentary plus scanned-spot/dim-spot/live-
  * path particles for whatever wave is currently active, plus Night Vision for the duration (removed
- * when toggled back off). {@code aggression get/set} reads or
- * directly overrides a player's dweller severity, for jumping straight to a given tier instead of
- * grinding real time below y=0. {@code reset} discards the current wave and its cooldown so a fresh
+ * when toggled back off). {@code runs get/set} reads or
+ * directly overrides a player's completed-run count (which stage that puts them at), for jumping
+ * straight to a given stage instead of grinding out real encounters. {@code startrun} skips the
+ * 2000-tick eligibility wait for a fresh or already-active run - still needs the target to actually
+ * be under y=0 for it to pick up. {@code reset} discards the current wave and its cooldown so a fresh
  * {@code wave}/{@code wavetest} can fire right away instead of waiting for the current one to finish.
+ * {@code summon all/base/growth/eyes} spawns a stationary, staring dummy in front of the caller with
+ * only the requested rig layer (or all of them, stacked normally) given real items, for inspecting
+ * how each texture lines up on the model in isolation. {@code headoffset} (no args) reports the
+ * current standing rest-pose head-yaw correction override, {@code headoffset <degrees>} sets it, and
+ * {@code headoffset reset} clears it back to the default - live-tunable so the right value can be
+ * found by eye instead of a rebuild-and-restart per guess. {@code crawlpitch}/{@code climbpitch}
+ * toggle the flat-floor/climbing crawl-tracking head pitch negation the same way.
  */
 public final class WendigoCommands {
 	private static final String DEFAULT_SCENARIO =
@@ -60,9 +69,9 @@ public final class WendigoCommands {
 	private static final String DEFAULT_TEST_PLAN_FILE = "test-plan.json";
 	private static final String DEFAULT_TEST_PLAN_CONTENT = """
 	{
-	"spawn_at": "spot_a",
+	"spawn_at": "close_as_possible",
 	"plan": [
-	{ "type": "movement.approach_dim_spot", "speed": "slow" },
+	{ "type": "movement.approach_band", "band": "close", "speed": "slow" },
 	{ "type": "posture.stare", "enabled": true },
 	{
 	"type": "control.while",
@@ -116,25 +125,47 @@ public final class WendigoCommands {
 					.executes(ctx -> forceOrbit(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))))
 			.then(Commands.literal("headtest")
 				.executes(ctx -> spawnHeadTrackingTest(ctx.getSource())))
+			.then(Commands.literal("summon")
+				.then(Commands.literal("all")
+					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.ALL, "all")))
+				.then(Commands.literal("base")
+					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.BASE_ONLY, "base")))
+				.then(Commands.literal("growth")
+					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.GROWTH_ONLY, "growth")))
+				.then(Commands.literal("eyes")
+					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.EYES_ONLY, "eyes"))))
 			.then(Commands.literal("reset")
 				.executes(ctx -> resetForTesting(ctx.getSource())))
-			.then(Commands.literal("aggression")
+			.then(Commands.literal("headoffset")
+				.executes(ctx -> reportHeadOffset(ctx.getSource()))
+				.then(Commands.literal("reset")
+					.executes(ctx -> resetHeadOffset(ctx.getSource())))
+				.then(Commands.argument("degrees", IntegerArgumentType.integer(-360, 360))
+					.executes(ctx -> setHeadOffset(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "degrees")))))
+			.then(Commands.literal("crawlpitch")
+				.executes(ctx -> toggleCrawlPitch(ctx.getSource())))
+			.then(Commands.literal("climbpitch")
+				.executes(ctx -> toggleClimbPitch(ctx.getSource())))
+			.then(Commands.literal("runs")
 				.then(Commands.literal("get")
-					.executes(ctx -> getAggression(ctx.getSource(), ctx.getSource().getPlayerOrException()))
+					.executes(ctx -> getRuns(ctx.getSource(), ctx.getSource().getPlayerOrException()))
 					.then(Commands.argument("target", EntityArgument.player())
-						.executes(ctx -> getAggression(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))))
+						.executes(ctx -> getRuns(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))))
 				.then(Commands.literal("set")
 					.then(Commands.argument("target", EntityArgument.player())
 						.then(Commands.argument("value", IntegerArgumentType.integer(0))
-							.executes(ctx -> setAggression(ctx.getSource(), EntityArgument.getPlayer(ctx, "target"),
-								IntegerArgumentType.getInteger(ctx, "value")))))));
+							.executes(ctx -> setRuns(ctx.getSource(), EntityArgument.getPlayer(ctx, "target"),
+								IntegerArgumentType.getInteger(ctx, "value")))))))
+			.then(Commands.literal("startrun")
+				.executes(ctx -> startRun(ctx.getSource(), ctx.getSource().getPlayerOrException()))
+				.then(Commands.argument("target", EntityArgument.player())
+					.executes(ctx -> startRun(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))));
 	}
 
 	/**
 	 * Toggles the sender's own debug session: chat commentary of what the wendigo is doing/hits
-	 * trouble with (see PlanRunner#debugSay), plus particles for the active wave's scanned dark
-	 * spots (colored per spot_a..d), their dim spots (same color, darker), and the wendigo's live
-	 * path (white) - see com.wendigo.debug.WendigoDebug.
+	 * trouble with (see PlanRunner#debugSay), plus a particle trail for the wendigo's live path
+	 * (white) - see com.wendigo.debug.WendigoDebug.
 	 */
 	// Far past any realistic debug session length (~14 hours) so it never flicker-warns near
 	// expiring - toggling debug back off removes it explicitly instead of ever letting it run out.
@@ -149,6 +180,50 @@ public final class WendigoCommands {
 			player.removeEffect(MobEffects.NIGHT_VISION);
 		}
 		source.sendSystemMessage(Component.literal("[wendigo] Debug mode " + (nowEnabled ? "enabled" : "disabled") + "."));
+		return 1;
+	}
+
+	/** Live-overrides the standing rest-pose head-yaw correction (see WendigoVisual's onTick) so the
+	 * right value can be found by eye - stand a wendigo in front of you (e.g. `/wendigo summon all`),
+	 * make it stare (`/wendigo plantest {"plan":[{"type":"posture.stare","enabled":true}]}` or just
+	 * approach it), then run this repeatedly with different values until the face reads correctly.
+	 * Server-wide, not per-player (same scope as every other WendigoDebug toggle). */
+	private static int setHeadOffset(CommandSourceStack source, int degrees) {
+		WendigoDebug.setStandingHeadYawOverride(degrees);
+		source.sendSystemMessage(Component.literal("[wendigo] Standing head-yaw override set to " + degrees + " degrees."));
+		return degrees;
+	}
+
+	private static int resetHeadOffset(CommandSourceStack source) {
+		WendigoDebug.clearStandingHeadYawOverride();
+		source.sendSystemMessage(Component.literal("[wendigo] Standing head-yaw override cleared - back to the default."));
+		return 1;
+	}
+
+	private static int reportHeadOffset(CommandSourceStack source) {
+		float current = WendigoDebug.getStandingHeadYawOverride();
+		source.sendSystemMessage(Component.literal("[wendigo] Standing head-yaw override: "
+			+ (Float.isNaN(current) ? "none (using the default)" : (current + " degrees"))));
+		return 1;
+	}
+
+	/** Flips whether the flat-floor crawl-tracking head pitch is negated (see WendigoVisual.onTick's
+	 * headLookPitch computation) - lets the current negation be A/B tested live against the plain,
+	 * un-negated value instead of another rebuild-and-restart guess. */
+	private static int toggleCrawlPitch(CommandSourceStack source) {
+		boolean nowInverted = !WendigoDebug.isFloorCrawlPitchInverted();
+		WendigoDebug.setFloorCrawlPitchInverted(nowInverted);
+		source.sendSystemMessage(Component.literal("[wendigo] Flat-floor crawl head pitch is now "
+			+ (nowInverted ? "inverted (current code default)." : "NOT inverted (raw computeHeadLookPitch value).")));
+		return 1;
+	}
+
+	/** Same idea as {@link #toggleCrawlPitch}, for the climbing (wall/ceiling attachment) case. */
+	private static int toggleClimbPitch(CommandSourceStack source) {
+		boolean nowInverted = !WendigoDebug.isClimbPitchInverted();
+		WendigoDebug.setClimbPitchInverted(nowInverted);
+		source.sendSystemMessage(Component.literal("[wendigo] Climbing head pitch is now "
+			+ (nowInverted ? "inverted (current code default)." : "NOT inverted (raw computeHeadLookPitch value).")));
 		return 1;
 	}
 
@@ -317,32 +392,85 @@ public final class WendigoCommands {
 		WendigoMod.LOGGER.info("[wendigo] headtest spawned {} at {},{},{}", label, x, y, z);
 	}
 
-	/** Reports a player's current dweller severity ("aggression") - the same number/cap the LLM sees each request. */
-	private static int getAggression(CommandSourceStack source, ServerPlayer target) {
-		if (WendigoMod.severityTracker == null) {
-			source.sendFailure(Component.literal("Severity tracker isn't initialized."));
-			return 0;
-		}
-		int severity = WendigoMod.severityTracker.severityOf(target);
-		int cap = WendigoMod.severityTracker.severityCap();
-		int percent = cap > 0 ? 100 * severity / cap : 0;
-		source.sendSystemMessage(Component.literal("[wendigo] " + target.getGameProfile().name() + " aggression: "
-			+ severity + "/" + cap + " (" + percent + "%)"));
-		return severity;
+	// How far in front of the player (along their own facing) a texture-preview dummy spawns.
+	private static final double TEXTURE_PREVIEW_SPAWN_DISTANCE = 3.0;
+
+	/** Spawns one stationary, staring wendigo a few blocks in front of the caller with only the
+	 * requested rig layer(s) given real items - see WendigoEntity.TexturePreviewMode's own comment.
+	 * "all" is the normal stacked appearance; "base"/"growth"/"eyes" isolate one texture at a time
+	 * so it can be inspected without the other two layers drawn over it. Forces staring on so the
+	 * whole rig turns to face the caller and the eyes layer (which only lights up while
+	 * staring/chasing) is actually visible rather than reading as pitch black. */
+	private static int spawnTexturePreview(CommandSourceStack source, WendigoEntity.TexturePreviewMode mode, String label)
+			throws CommandSyntaxException {
+		ServerPlayer player = source.getPlayerOrException();
+		ServerLevel level = source.getLevel();
+		Vec3 look = player.getLookAngle();
+		Vec3 spawnPos = player.position().add(look.x * TEXTURE_PREVIEW_SPAWN_DISTANCE, 0.0, look.z * TEXTURE_PREVIEW_SPAWN_DISTANCE);
+		float yaw = player.getYRot() + 180.0f;
+
+		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
+		wendigo.snapTo(spawnPos.x, spawnPos.y, spawnPos.z, yaw, 0f);
+		wendigo.syncPoseToSpawnPosition();
+		wendigo.setTexturePreviewMode(mode);
+		wendigo.setStaring(true);
+		level.addFreshEntity(wendigo);
+
+		source.sendSystemMessage(Component.literal("[wendigo] Spawned a \"" + label + "\"-texture preview at "
+			+ spawnPos.toString() + " - /kill it (or let it despawn) when you're done looking."));
+		return 1;
 	}
 
-	/** Directly sets a player's dweller severity ("aggression") - jump straight to a tier for testing
-	 * instead of grinding real time below y=0. Clamped to [0, cap] by PlayerSeverityTracker. */
-	private static int setAggression(CommandSourceStack source, ServerPlayer target, int value) {
-		if (WendigoMod.severityTracker == null) {
-			source.sendFailure(Component.literal("Severity tracker isn't initialized."));
+	/** Reports a player's current completed-run count and the stage/percent that puts them at - the
+	 * same stage the LLM sees each request. */
+	private static int getRuns(CommandSourceStack source, ServerPlayer target) {
+		if (WendigoMod.progressionTracker == null) {
+			source.sendFailure(Component.literal("Progression tracker isn't initialized."));
 			return 0;
 		}
-		WendigoMod.severityTracker.setSeverity(target, value);
-		int actual = WendigoMod.severityTracker.severityOf(target);
-		source.sendSystemMessage(Component.literal("[wendigo] Set " + target.getGameProfile().name() + " aggression to "
-			+ actual + "/" + WendigoMod.severityTracker.severityCap()));
+		int completedRuns = WendigoMod.progressionTracker.completedRunsOf(target);
+		int stage = WendigoMod.progressionTracker.stageOf(target);
+		int percent = WendigoMod.progressionTracker.representativePercent(stage);
+		source.sendSystemMessage(Component.literal("[wendigo] " + target.getGameProfile().name() + " completed runs: "
+			+ completedRuns + " (stage " + stage + ", " + percent + "%)"));
+		return completedRuns;
+	}
+
+	/** Directly sets a player's completed-run count - jump straight to a stage for testing instead of
+	 * grinding out real encounters. Clears any in-progress run (debug jump, no partial-progress
+	 * preservation expected) - see WendigoProgressionTracker.setRunsForTesting. */
+	private static int setRuns(CommandSourceStack source, ServerPlayer target, int value) {
+		if (WendigoMod.progressionTracker == null) {
+			source.sendFailure(Component.literal("Progression tracker isn't initialized."));
+			return 0;
+		}
+		WendigoMod.progressionTracker.setRunsForTesting(target, value);
+		int actual = WendigoMod.progressionTracker.completedRunsOf(target);
+		int stage = WendigoMod.progressionTracker.stageOf(target);
+		source.sendSystemMessage(Component.literal("[wendigo] Set " + target.getGameProfile().name() + " completed runs to "
+			+ actual + " (stage " + stage + ")"));
 		return actual;
+	}
+
+	/** Marks the target immediately eligible for a run - skips WendigoProgressionTracker's own
+	 * 2000-tick-under-y=0 eligibility wait entirely (see startRun's own doc comment: it resets
+	 * eligibilityTicks and, unless a run was already active, opens a fresh ActiveRun on the spot),
+	 * without bypassing anything else real about how a run actually starts. Doesn't force a spawn by
+	 * itself - selectTarget still requires the target to genuinely be under y=0 before
+	 * tryEnterOrbit's own next scheduled attempt (up to ~1s later) picks them up, same "can't follow
+	 * back above ground" rule that's load-bearing everywhere else in this codebase, deliberately not
+	 * bypassed just for this debug convenience. If a run was already active on them, this is a no-op
+	 * beyond resetting their eligibility timer - existing progress is left untouched either way. */
+	private static int startRun(CommandSourceStack source, ServerPlayer target) {
+		if (WendigoMod.progressionTracker == null) {
+			source.sendFailure(Component.literal("Progression tracker isn't initialized."));
+			return 0;
+		}
+		boolean isFreshRun = WendigoMod.progressionTracker.startRun(target);
+		int stage = WendigoMod.progressionTracker.stageOf(target);
+		source.sendSystemMessage(Component.literal("[wendigo] " + (isFreshRun ? "Started a fresh" : "Marked eligible for the already-active")
+			+ " run on " + target.getGameProfile().name() + " (stage " + stage + ") - it'll pick up as soon as they're below y=0."));
+		return 1;
 	}
 
 	/** Discards the current level's active/pending wave (if any) and zeroes its cooldown, so a fresh
@@ -459,8 +587,8 @@ public final class WendigoCommands {
 
 		var server = source.getServer();
 		// Raw connectivity test, not tied to any player/severity - full unfiltered schema (TIGHT
-		// unlocks spot_a too, torchSpawnAvailable=true unlocks spawn_on_torch too, maximizing schema
-		// coverage for this test).
+		// unlocks close_as_possible too, torchSpawnAvailable=true unlocks spawn_on_torch too,
+		// maximizing schema coverage for this test).
 		WendigoMod.llmClient.requestPlan(systemPrompt, scenario, SchemaBuilder.forSeverity(100, CaveScaleScanner.CaveScale.TIGHT, true))
 			.whenComplete((plan, error) -> server.execute(() -> {
 				if (error != null) {

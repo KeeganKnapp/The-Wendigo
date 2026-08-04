@@ -16,8 +16,8 @@ import com.wendigo.spatial.DarkSpotScanner;
 /**
  * Punishes lingering too long in darkness (light &lt;= DarkSpotScanner.MAX_DARK_LIGHT, the same bar
  * the wendigo's own spawn/despawn scanning uses) - "you've been in the dark too long, time to die".
- * Separate mechanic from the normal severity-triggered wave system (that one rewards/escalates on
- * cumulative time below y=0 across many descents; this one punishes one continuous darkness stay,
+ * Separate mechanic from the normal spawn-count-triggered wave system (that one escalates on how many
+ * times the wendigo has ever spawned on this player; this one punishes one continuous darkness stay,
  * reset the instant the player steps into real light), though it reuses WendigoManager's wave
  * lifecycle to actually act on it: if no wendigo is currently active, it spawns a fresh hardcoded
  * ambush (WendigoManager.triggerDarknessAmbush); if one already is, it interrupts whatever that
@@ -25,21 +25,23 @@ import com.wendigo.spatial.DarkSpotScanner;
  * on a much shorter fixed threshold - the threat is already right there).
  */
 public final class DarknessOverstayTracker {
-	private static final int SAMPLE_INTERVAL_TICKS = 20; // once/sec, matches PlayerSeverityTracker
-	// Below this severity, staying in darkness never escalates into the ambush - just the periodic
-	// warning noise, per explicit design: "for players under 20% we just play the noises".
+	private static final int SAMPLE_INTERVAL_TICKS = 20; // once/sec, matches WendigoProgressionTracker
+	// Below this stage-derived percent, staying in darkness never escalates into the ambush - the
+	// periodic warning noise (see WARNING_NOISE_INTERVAL_TICKS) is independent of this threshold
+	// entirely, gated on the wendigo already being active on this player instead (see isActiveOn).
 	private static final int AMBUSH_MIN_PERCENT = 20;
 	// Each 20%-band gets a random threshold within its own shrinking 5-second window, counting down
-	// as severity climbs: 20-39% -> 15-20s, 40-59% -> 10-15s, 60-79% -> 5-10s, 80%+ -> 0-5s. Rolled
-	// once per continuous darkness stay (see rolledThresholdTicks), not re-rolled while already dark.
+	// as stage climbs: 20-39% -> 15-20s, 40-59% -> 10-15s, 60-79% -> 5-10s, 80%+ -> 0-5s. Rolled once
+	// per continuous darkness stay (see rolledThresholdTicks), not re-rolled while already dark.
 	// Explicit design call: this scaling is meant to stay (unlike per-step tier gating on the
 	// hardcoded plan's own content, e.g. spawn spot eligibility, which is NOT severity-scaled here -
 	// see triggerDarknessAmbush's bypassTierGating=true) - this is "the rule for when it's allowed
-	// to run", not a limitation on the plan itself, and severity is meant to affect it.
+	// to run", not a limitation on the plan itself, and stage is meant to affect it.
 	private static final int THRESHOLD_BAND_SECONDS = 5;
 	private static final int THRESHOLD_MAX_SECONDS = 20;
-	// How often the "get out of the dark" noise repeats while continuously in darkness - at every
-	// severity, even below AMBUSH_MIN_PERCENT, where it's the only thing that ever happens.
+	// How often the "get out of the dark" noise repeats while continuously in darkness - only while
+	// the wendigo is genuinely active on this specific player right now (see isActiveOn's own call
+	// site below), the user's own explicit request: no noise from just sitting in the dark alone.
 	private static final int WARNING_NOISE_INTERVAL_TICKS = 100; // 5s
 	// If a wendigo is already active when the darkness-overstay condition is met, it overrides into
 	// internal.chase_until_light instead of trying to spawn a second one - a much shorter fixed
@@ -47,7 +49,7 @@ public final class DarknessOverstayTracker {
 	// nothing to wait on a spawn for.
 	private static final int OVERRIDE_THRESHOLD_TICKS = 100; // 5s
 
-	private final PlayerSeverityTracker severityTracker;
+	private final WendigoProgressionTracker progressionTracker;
 	private final WendigoManager wendigoManager;
 	// How long (in ticks) each player has been continuously in darkness - removed entirely the
 	// instant they step into real light, not just paused, so a fresh stay always starts the clock
@@ -56,8 +58,8 @@ public final class DarknessOverstayTracker {
 	private final Map<UUID, Integer> rolledThresholdTicks = new HashMap<>();
 	private int ticksSinceSample;
 
-	public DarknessOverstayTracker(PlayerSeverityTracker severityTracker, WendigoManager wendigoManager) {
-		this.severityTracker = severityTracker;
+	public DarknessOverstayTracker(WendigoProgressionTracker progressionTracker, WendigoManager wendigoManager) {
+		this.progressionTracker = progressionTracker;
 		this.wendigoManager = wendigoManager;
 	}
 
@@ -73,7 +75,7 @@ public final class DarknessOverstayTracker {
 		this.ticksSinceSample = 0;
 
 		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-			// Same reasoning as PlayerSeverityTracker/WendigoManager's own tick hooks - this fires
+			// Same reasoning as WendigoProgressionTracker/WendigoManager's own tick hooks - this fires
 			// every real server tick regardless of /tick freeze, but this is world state that should
 			// only advance while the player's level is actually ticking.
 			if (player.isSpectator() || !player.level().tickRateManager().runsNormally()) {
@@ -87,11 +89,14 @@ public final class DarknessOverstayTracker {
 				continue;
 			}
 			int ticks = this.darkTicks.merge(id, SAMPLE_INTERVAL_TICKS, Integer::sum);
-			if (ticks % WARNING_NOISE_INTERVAL_TICKS < SAMPLE_INTERVAL_TICKS) {
-				WendigoSounds.play(player.level(), player.blockPosition(), WendigoSounds.Type.AMBIENT);
+			// The user's own explicit request: only play this "still lingering in the dark" warning
+			// while the wendigo is genuinely active on THIS player right now, not just because
+			// they're sitting in darkness generally (with no wendigo around at all, or one that's
+			// busy on someone else in a multiplayer group).
+			if (ticks % WARNING_NOISE_INTERVAL_TICKS < SAMPLE_INTERVAL_TICKS && this.wendigoManager.isActiveOn(player)) {
+				WendigoSounds.play(player.level(), player, WendigoSounds.Type.AMBIENT);
 			}
-			int percent = this.severityTracker.severityCap() > 0
-				? 100 * this.severityTracker.severityOf(player) / this.severityTracker.severityCap() : 0;
+			int percent = this.progressionTracker.percentOf(player);
 			if (percent < AMBUSH_MIN_PERCENT) {
 				continue;
 			}

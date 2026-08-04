@@ -57,6 +57,23 @@ final class RigMatrices {
      * live test comparing real east-wall and south-wall data by hand) only happens to cancel out
      * near yaw=+/-90 degrees and leaves a ~180 degree residual error at yaw=0/180, since the
      * negated column's own contribution to the composed result is itself yaw-dependent.
+     * <p>
+     * The correction itself is UNCONDITIONAL (always negates c2), not a per-frame determinant check
+     * - a live-reported bug traced to exactly that check: (c0,c1,c2) is {@code [localX localY localZ]
+     * * Ry(yaw)}, and det(Ry(yaw)) = +1 for every yaw (a proper rotation) - so det(c0,c1,c2) =
+     * det(localX,localY,localZ) * det(Ry(yaw)) = -1 * 1 = -1, ALWAYS, exactly, for every yaw and
+     * every orientation (confirmed calculateOrientation has no conditional branching before
+     * constructing localX/localY/localZ - the same formula runs for floor, wall, and ceiling alike,
+     * so this isn't an orientation-dependent special case). A per-frame {@code det < 0} check on a
+     * value that's mathematically guaranteed to already be exactly -1 does nothing useful when it's
+     * working, and is pure fragility when it isn't: ordinary floating-point rounding in a
+     * near-degenerate composition (a yaw/orientation combination where the columns become nearly
+     * parallel) can push the COMPUTED det to the wrong side of zero despite the TRUE value always
+     * being negative, flipping sign to +1 for that one frame with no corresponding change in the
+     * real orientation data at all - exactly what live debug logging on getGroundSide()/
+     * orientation.normal (which this composition doesn't even read) failed to explain: the rig
+     * visibly flipped while every other signal stayed correct and unchanged the whole time. Removing
+     * the runtime check entirely removes the only thing that could misfire.
      */
     static Matrix4f fromOrientationAndYaw(Orientation orientation, float yawDegrees) {
         double yawRad = Math.toRadians(yawDegrees);
@@ -76,13 +93,10 @@ final class RigMatrices {
         float c2y = (float) (lxy * sy + lzy * cy);
         float c2z = (float) (lxz * sy + lzz * cy);
 
-        double det = c0x * (c1y * c2z - c1z * c2y) - c0y * (c1x * c2z - c1z * c2x) + c0z * (c1x * c2y - c1y * c2x);
-        float sign = det < 0 ? -1f : 1f;
-
         return new Matrix4f(
                 c0x, c0y, c0z, 0f,
                 c1x, c1y, c1z, 0f,
-                c2x * sign, c2y * sign, c2z * sign, 0f,
+                -c2x, -c2y, -c2z, 0f,
                 0f, 0f, 0f, 1f
         );
     }

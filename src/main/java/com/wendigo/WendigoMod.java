@@ -17,8 +17,8 @@ import com.wendigo.llm.LlmConfig;
 import com.wendigo.sound.WendigoSounds;
 import com.wendigo.wave.DarknessOverstayTracker;
 import com.wendigo.wave.EncounterHistory;
-import com.wendigo.wave.PlayerSeverityTracker;
 import com.wendigo.wave.WendigoManager;
+import com.wendigo.wave.WendigoProgressionTracker;
 import com.wendigo.wave.WendigoWaveConfig;
 
 import eu.pb4.polymer.virtualentity.api.attachment.EntityAttachment;
@@ -38,8 +38,8 @@ public class WendigoMod implements ModInitializer {
 	// Exposed for WendigoCommands' /wendigo wave debug command, which needs to bypass the
 	// manager's normal cooldown/eligibility gating.
 	public static WendigoManager wendigoManager;
-	// Exposed for WendigoCommands' /wendigo aggression get/set debug commands.
-	public static PlayerSeverityTracker severityTracker;
+	// Exposed for WendigoCommands' /wendigo runs get/set debug commands.
+	public static WendigoProgressionTracker progressionTracker;
 
 	@Override
 	public void onInitialize() {
@@ -73,11 +73,11 @@ public class WendigoMod implements ModInitializer {
 		llmClient = new LlmClient(LlmConfig.load());
 
 		WendigoWaveConfig waveConfig = WendigoWaveConfig.load();
-		severityTracker = new PlayerSeverityTracker(waveConfig);
-		severityTracker.register();
-		wendigoManager = new WendigoManager(waveConfig, severityTracker, new EncounterHistory());
+		progressionTracker = new WendigoProgressionTracker();
+		progressionTracker.register();
+		wendigoManager = new WendigoManager(waveConfig, progressionTracker, new EncounterHistory());
 		wendigoManager.register();
-		new DarknessOverstayTracker(severityTracker, wendigoManager).register();
+		new DarknessOverstayTracker(progressionTracker, wendigoManager).register();
 
 		WendigoCommands.register();
 	}

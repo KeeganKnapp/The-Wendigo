@@ -11,8 +11,8 @@ import com.wendigo.plan.PlanRunner;
 
 /**
  * Per-player memory of the wendigo's last real encounter with them - a narrative-continuity signal
- * for the LLM prompt (see WaveContext.toPromptText), distinct from PlayerSeverityTracker's numeric
- * aggression meter. The severity number tells the model roughly how bold to be; this tells it what
+ * for the LLM prompt (see WaveContext.toPromptText), distinct from WendigoProgressionTracker's
+ * stage-derived percent. That number tells the model roughly how bold to be; this tells it what
  * actually happened last time, so it can react ("that didn't land, try something else") instead of
  * re-deriving a plan from the number alone every request - see the plan-shape collapse this was
  * built to address (real testing converged on one near-identical template regardless of severity).

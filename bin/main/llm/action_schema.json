@@ -1,22 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WendigoActionPlan",
-  "description": "One complete wave for the wendigo: where it spawns, what it does, and where it despawns. This one call drives the entire wave start to finish - there is no mid-wave re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, and the available spawn_at spot labels (spot_a..spot_f, nearest to furthest) with real distances/light levels - that context is NOT part of this schema since it's different every request. Where the wendigo despawns is NOT a model choice - the engine always picks the scanned spot that's farthest from and/or most obstructed from every nearby player, trying the next-best one automatically if the best pick turns out unreachable when it's actually time to flee. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
+  "description": "One complete engagement for the wendigo: where it positions itself, what it does, and where it withdraws to afterward. The wendigo is a persistent presence, not something that spawns fresh each time - it's usually already nearby, quietly keeping its distance, before this plan ever runs; spawn_at is where it moves to (walking there if not already close - or not moving at all if it's already at a good distance for what the plan is about to do - appearing fresh only for a genuine first encounter) before 'plan' starts, not a guaranteed brand-new appearance every request. Positioning throughout this whole plan works the same way: everywhere a distance band is named (spawn_at, movement.approach_band, combat.break_torch's optional band, despawn_band), it's resolved LIVE, fresh, against wherever the player actually is at that exact moment - never a position frozen from earlier in the request. This one call drives the entire engagement start to finish - there is no mid-engagement re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, the live band distance-from-player ladder, and how many torches currently sit at each band - that context is NOT part of this schema since it's different every request. Where the wendigo withdraws to afterward IS a model choice (see despawn_band) - the engine resolves a live position in that band at the moment it's actually time to flee, re-resolving fresh if the first attempt fails; this is a retreat back into hiding, not vanishing from existence, unless it genuinely can't find anywhere dark to go. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
   "type": "object",
   "properties": {
     "spawn_at": {
       "type": "string",
       "enum": [
-        "spot_a",
-        "spot_b",
-        "spot_c",
-        "spot_d",
-        "spot_e",
-        "spot_f",
+        "close_as_possible",
+        "close",
+        "medium",
+        "far",
+        "farther",
+        "farthest",
         "no_players_looking",
         "spawn_on_torch"
       ],
-      "description": "Which of the scanned dark spots (given in the prompt, nearest to furthest) the wendigo should spawn at. Only labels actually offered in the prompt are valid for this request - spot_a (the nearest one) only ever appears in a tight, mineshaft-like space (see the prompt's caving-scenario note), at any severity, since there's nowhere far to spawn anyway in a cramped space; spot_b/c/d/e/f otherwise unlock progressively closer to the player as severity climbs (e/f earliest, then d, then c, then b) - which labels are even offered already reflects how bold the wendigo is allowed to be right now. A handful of the farther labels (see each spot's own 'clinging to the ceiling above'/'clinging to a wall' note in the prompt, if present) may be on the ceiling or a wall instead of the floor - the wendigo can climb there and back like a spider, so spawn_at and every movement primitive work identically either way, no special handling needed; it's just a different kind of hiding spot to stare down from. 'no_players_looking' is a special value instead of naming a specific spot: the engine picks a random scanned spot the target player isn't currently looking toward (falling back to the furthest scanned spot if every one of them happens to be in view) - use this whenever the point is a clean, unnoticed first appearance rather than a specific spot's particular geometry (dim spots, torches, connectivity), since it's a better guarantee of not being caught mid-spawn than guessing which labeled spot is safest yourself. 'spawn_on_torch' - only offered when there's little to no real darkness nearby to work with, at whatever distance the current severity allows (the same e/d/c/b progression spot_e..spot_b unlock at, applied to these candidates instead) - spawns already exposed at a random nearby lit position, destroying its torch the instant it appears, no hiding or staring involved. Below 80% severity it's just an ordinary spawn location choice - plan however fits the moment, no obligation to chase. At 80%+ severity it's a commitment: pair it with an aggressive plan (e.g. sound.ambient_cue(danger) then combat.chase) since there's nothing subtle left once spawning fully exposed at that range. Don't pick it if a genuine dark spot is available and would fit the moment better."
+      "description": "Which live distance band from the player the wendigo should position itself at before 'plan' starts - resolved fresh at that moment (walked there if not already close, or not moved at all if the wendigo's current live distance already fits, appearing fresh only for a genuine first encounter), never a position frozen from earlier in the request. Only bands actually offered in the prompt are valid for this request - close_as_possible only ever appears in a tight, mineshaft-like space (see the prompt's caving-scenario note), at any severity, since there's nowhere far to go anyway in a cramped space; close/medium/far/farther otherwise unlock progressively closer to the player as severity climbs (farther earliest, then far, then medium, then close) - which bands are even offered already reflects how bold the wendigo is allowed to be right now. farthest is always available. A resolved position may land on the ceiling or a wall instead of the floor - the wendigo can climb there and back like a spider, so spawn_at and every movement primitive work identically either way, no special handling needed; it's just a different kind of vantage point to stare down from. 'no_players_looking' is a special value instead of naming a distance band: the engine picks a live position the target player isn't currently looking toward - use this whenever the point is a clean, unnoticed first appearance rather than a specific distance. 'spawn_on_torch' - only offered when there's at least one live torch far enough away for the current severity to allow (the same farther/far/medium/close progression, applied to torches instead of empty ground) - spawns already exposed at that torch's position, destroying it the instant it appears, no hiding or staring involved. Below 80% severity it's just an ordinary spawn location choice - plan however fits the moment, no obligation to chase. At 80%+ severity it's a commitment: pair it with an aggressive plan (e.g. sound.ambient_cue(chase) then combat.chase) since there's nothing subtle left once spawning fully exposed at that range. Don't pick it if a genuine dark spot is available and would fit the moment better."
     },
     "plan": {
       "type": "array",
@@ -26,6 +26,16 @@
         "$ref": "#/$defs/step"
       },
       "description": "Runs after spawning, before the despawn move. Executed in order. If a step's precondition isn't met (e.g. retreat_to_dark with source=stored but nothing has been stored yet), the engine falls back to a sensible default rather than erroring - it never rejects a whole plan for one bad step."
+    },
+    "despawn_band": {
+      "type": "string",
+      "enum": [
+        "medium",
+        "far",
+        "farther",
+        "farthest"
+      ],
+      "description": "Which live distance band from the player the wendigo withdraws to once 'plan' finishes (or whenever a movement.retreat_with_fallback step runs) - resolved fresh at that moment, re-resolved again from wherever it actually ended up if the first attempt fails. This is a genuine choice, not always the maximum distance: a wendigo that just had a fleeting, subtle encounter might only need to back off to medium before resuming its quiet watch, while one that just committed to a chase or a grab plausibly wants real distance (farther/farthest) before showing itself again. medium is the closest option offered - deliberately no closer band exists here, since retreating any nearer than that isn't a real withdrawal. Independent of spawn_at's own severity-gated unlock ladder - all four options are always available regardless of severity, since choosing to retreat modestly rather than maximally is never the bold/risky half of a decision."
     },
     "global_rules": {
       "type": "array",
@@ -40,6 +50,7 @@
   "required": [
     "spawn_at",
     "plan",
+    "despawn_band",
     "global_rules"
   ],
   "additionalProperties": false,
@@ -65,10 +76,7 @@
           "$ref": "#/$defs/movement_approach"
         },
         {
-          "$ref": "#/$defs/movement_approach_spot"
-        },
-        {
-          "$ref": "#/$defs/movement_approach_dim_spot"
+          "$ref": "#/$defs/movement_approach_band"
         },
         {
           "$ref": "#/$defs/movement_retreat_to_dark"
@@ -135,25 +143,26 @@
       ],
       "additionalProperties": false
     },
-    "movement_approach_spot": {
+    "movement_approach_band": {
       "type": "object",
-      "description": "MOVEMENT branch: pathfind to another scanned spot by label - only valid for a label listed in that spot's own \"pathfindable to\" list in the prompt for whichever spot the wendigo currently occupies (an engine-verified real route, not a guess). Mainly useful for reaching a spot's dim spots when it isn't the one the wendigo spawned at: approach_spot there first, then movement.approach_dim_spot (which always searches from the current position) to actually creep to the edge of its light.",
+      "description": "MOVEMENT branch: pathfind to a live position at the given distance band from the player - resolved fresh at the moment this step actually runs, against wherever the player is by then, never a position decided earlier in the plan. Only bands actually offered in the prompt are valid for this request (same severity/cave-scale gating as spawn_at). If the wendigo's current live distance already roughly fits what comes next, this step can simply be omitted - there's no requirement to move at all before an action if the current position already works.",
       "properties": {
         "type": {
           "type": "string",
-          "const": "movement.approach_spot"
+          "const": "movement.approach_band"
         },
-        "spot": {
+        "band": {
           "type": "string",
           "enum": [
-            "spot_a",
-            "spot_b",
-            "spot_c",
-            "spot_d",
-            "spot_e",
-            "spot_f"
+            "close_as_possible",
+            "close",
+            "medium",
+            "far",
+            "farther",
+            "farthest",
+            "no_players_looking"
           ],
-          "description": "Which scanned spot to move to - must be one listed as pathfindable-to from wherever the wendigo currently is."
+          "description": "Which live distance band to move to, relative to the player right now. 'no_players_looking' is a special value instead of naming a distance band (same meaning as spawn_at's own): pathfind from wherever the wendigo currently is to a live position roughly at the farther band that the player isn't currently facing toward, always available regardless of severity. Especially useful as the very first step of a plan that's engaging an entity already orbiting nearby - unlike a fresh spawn, an already-alive entity doesn't get repositioned by spawn_at at all, so this is how to explicitly walk it somewhere unwatched before the rest of the plan runs, the same way a fresh spawn_at=no_players_looking would."
         },
         "speed": {
           "type": "string",
@@ -167,31 +176,7 @@
       },
       "required": [
         "type",
-        "spot",
-        "speed"
-      ],
-      "additionalProperties": false
-    },
-    "movement_approach_dim_spot": {
-      "type": "object",
-      "description": "MOVEMENT branch: pathfind to the nearest dim spot (a standable position at the edge of a light source - not fully dark, not fully lit) reachable from the wendigo's current location. Lets it approach a light source, or observe a player who's in one, without fully exposing itself. Only useful from a spot that has nearby dim spots (see the per-spot count in the prompt) - if there are none nearby, this is a no-op and the plan continues.",
-      "properties": {
-        "type": {
-          "type": "string",
-          "const": "movement.approach_dim_spot"
-        },
-        "speed": {
-          "type": "string",
-          "enum": [
-            "slow",
-            "normal",
-            "fast"
-          ],
-          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
-        }
-      },
-      "required": [
-        "type",
+        "band",
         "speed"
       ],
       "additionalProperties": false
@@ -411,7 +396,7 @@
     },
     "sound_ambient_cue": {
       "type": "object",
-      "description": "SOUND branch: plays a cue audible near the wendigo's current position. All three currently play the same underlying ambient cave sound - distinct sound design per cue is future work - but pick the one that matches the moment anyway, since that'll matter once it's built.",
+      "description": "SOUND branch: plays a cue audible near the wendigo's current position, drawn from a distinct pool of cave sounds per cue. Heavily encouraged at the moment each cue is meant for (see below) - a plan is never required to include one, but it reads noticeably more alive when it does.",
       "properties": {
         "type": {
           "type": "string",
@@ -420,11 +405,12 @@
         "cue": {
           "type": "string",
           "enum": [
-            "jumpscare",
-            "caught",
-            "ambience"
+            "chase",
+            "flee",
+            "stare",
+            "ambient"
           ],
-          "description": "jumpscare = a sudden, startling sting - use right before/during a lunge or other close-up reveal. caught = a reaction cue for when the wendigo has just been clearly spotted (predicate.player_looking_at_self at dead_stare). ambience = a low, unplaced presence cue - safe to use anytime, including from a distance."
+          "description": "chase = heavily encouraged right before committing to combat.lunge_attack or combat.chase - announces the hunt is on. flee = heavily encouraged right before movement.retreat_with_fallback - announces the withdrawal back into darkness. stare = heavily encouraged right when posture.stare(enabled=true) starts a held stare. ambient = a low, unplaced presence cue with no specific moment it needs to pair with - safe to use anytime, including from a distance."
         }
       },
       "required": [
@@ -449,11 +435,30 @@
     },
     "combat_break_torch": {
       "type": "object",
-      "description": "COMBAT branch: pathfind to the nearest known light source (torch, lantern, etc.) and destroy it, snuffing that light out - like combat.lunge_attack, this is allowed to cross into light since reaching the target is the point. Only useful if the prompt reports torches found near the player - if none are nearby this is a no-op and the plan continues, never fails outright. A good sequence: spawn near a torch, break_torch, then movement.retreat_with_fallback to withdraw before despawning.",
+      "description": "COMBAT branch: destroy a torch, snuffing that light out - like combat.lunge_attack, this is allowed to cross into light since reaching the target is the point. Without 'band', targets the single nearest known light source live from wherever the wendigo currently is (no positioning needed first). With 'band', instead targets the nearest torch whose live distance from the player falls in that band right now - see the prompt's torches_at_<band>_distance counts to know whether that's worth planning around before committing to it. Either way, if no matching torch exists this is a no-op and the plan continues, never fails outright. A good sequence: spawn near a torch, break_torch, then movement.retreat_with_fallback to withdraw before despawning.",
       "properties": {
         "type": {
           "type": "string",
           "const": "combat.break_torch"
+        },
+        "band": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "close_as_possible",
+                "close",
+                "medium",
+                "far",
+                "farther",
+                "farthest"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional - constrains the torch search to one whose live distance from the player falls in this band. Set to null to just target the nearest torch from the wendigo's own current position instead."
         },
         "speed": {
           "type": "string",
@@ -467,6 +472,7 @@
       },
       "required": [
         "type",
+        "band",
         "speed"
       ],
       "additionalProperties": false
@@ -501,7 +507,7 @@
     },
     "control_despawn": {
       "type": "object",
-      "description": "CONTROL branch: end the wave immediately by vanishing right where the wendigo currently stands - no travel to a despawn point, no despawn fallback chain, no walk-away transition. Ends the plan the instant this step runs, so put it last. Use this for a fleeting, passive presence: appear, do something small and unsettling from a distance, then simply not be there anymore - a much subtler beat than being watched fleeing into the dark. Not the same as movement.retreat_with_fallback (a real flight back into darkness, for when the wendigo needs to physically get away first) - if the wendigo isn't already somewhere fine to vanish from, retreat before using this.",
+      "description": "CONTROL branch: end this engagement immediately by vanishing right where the wendigo currently stands - no travel to a hiding spot first, no walk-away transition. Ends the plan the instant this step runs, so put it last. It still retreats into darkness and keeps watching from a distance afterward, same as any other ending - this only changes whether that withdrawal is instant or visible. Use this for a fleeting, passive presence: appear, do something small and unsettling from a distance, then simply not be there anymore - a much subtler beat than being watched fleeing into the dark. Not the same as movement.retreat_with_fallback (a real flight back into darkness, for when the wendigo needs to physically get away first) - if the wendigo isn't already somewhere fine to vanish from, retreat before using this.",
       "properties": {
         "type": {
           "type": "string",
@@ -639,6 +645,12 @@
         },
         {
           "$ref": "#/$defs/predicate_player_unreachable"
+        },
+        {
+          "$ref": "#/$defs/predicate_target_moving"
+        },
+        {
+          "$ref": "#/$defs/predicate_target_is_stopped"
         }
       ]
     },
@@ -668,7 +680,7 @@
     },
     "predicate_player_approaching": {
       "type": "object",
-      "description": "True once the player has closed at least this much of the distance between them and the wendigo, measured relative to however far apart they were the moment the CURRENTLY-RUNNING control.while loop started (that distance is captured once, fresh, each time a control.while begins - capped at 18 blocks, so a loop that started very far away doesn't need an unrealistic amount of closing to trigger). low/medium/high are relative thresholds scaled to that starting distance (roughly 22%/44%/67% of it), not fixed block counts, so this behaves consistently whether the loop started 6 blocks away or 18. Prefer this over predicate.player_distance for a 'break once they've closed in meaningfully during this loop' condition: a fixed absolute distance can already be satisfied or violated by whatever step ran right before the loop started (e.g. the wendigo's own movement.approach_dim_spot closing distance on its way in), which this avoids since it only measures change from the moment the loop itself began. Only meaningful inside a control.while - used inside control.if or a global_rule (neither of which loop) it always reads as though nothing has been covered yet.",
+      "description": "True once the player has closed at least this much of the distance between them and the wendigo, measured relative to however far apart they were the moment the CURRENTLY-RUNNING control.while loop started (that distance is captured once, fresh, each time a control.while begins - capped at 18 blocks, so a loop that started very far away doesn't need an unrealistic amount of closing to trigger). low/medium/high are relative thresholds scaled to that starting distance (roughly 22%/44%/67% of it), not fixed block counts, so this behaves consistently whether the loop started 6 blocks away or 18. Prefer this over predicate.player_distance for a 'break once they've closed in meaningfully during this loop' condition: a fixed absolute distance can already be satisfied or violated by whatever step ran right before the loop started (e.g. the wendigo's own movement.approach_band closing distance on its way in), which this avoids since it only measures change from the moment the loop itself began. Only meaningful inside a control.while - used inside control.if or a global_rule (neither of which loop) it always reads as though nothing has been covered yet.",
       "properties": {
         "type": {
           "type": "string",
@@ -692,7 +704,7 @@
     },
     "predicate_player_undetected": {
       "type": "object",
-      "description": "True as long as the wendigo is still safely unnoticed: the player is NOT looking at it within the given band, AND the player has NOT closed in by approach_band's amount since the current control.while loop started (see predicate.player_approaching for exactly what that measures - the negation is baked in here so composing it yourself isn't necessary). This is the single check for a 'stay hidden and keep creeping closer' loop (control.while(predicate.player_undetected(...)) { movement.approach_dim_spot } then control.despawn/combat.lunge_attack once the loop ends) - prefer this over hand-building predicate.and(predicate.not(predicate.player_looking_at_self), predicate.not(predicate.player_approaching)) for that exact idiom, since manually composing a double negation is easy to get backwards (predicate.and(player_looking_at_self, player_approaching) looks similar but means the opposite: 'only keep going once already spotted and already closing in', which is false the instant the wendigo spawns unseen, so the loop runs zero times and immediately falls through to whatever comes next).",
+      "description": "True as long as the wendigo is still safely unnoticed: the player is NOT looking at it within the given band, AND the player has NOT closed in by approach_band's amount since the current control.while loop started (see predicate.player_approaching for exactly what that measures - the negation is baked in here so composing it yourself isn't necessary). This is the single check for a 'stay hidden and keep creeping closer' loop (control.while(predicate.player_undetected(...)) { movement.approach_band(close) } then control.despawn/combat.lunge_attack once the loop ends) - prefer this over hand-building predicate.and(predicate.not(predicate.player_looking_at_self), predicate.not(predicate.player_approaching)) for that exact idiom, since manually composing a double negation is easy to get backwards (predicate.and(player_looking_at_self, player_approaching) looks similar but means the opposite: 'only keep going once already spotted and already closing in', which is false the instant the wendigo spawns unseen, so the loop runs zero times and immediately falls through to whatever comes next).",
       "properties": {
         "type": {
           "type": "string",
@@ -821,6 +833,34 @@
         "type": {
           "type": "string",
           "const": "predicate.player_unreachable"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "predicate_target_moving": {
+      "type": "object",
+      "description": "True if the player currently has real horizontal velocity - walking, running, or sneaking all count, standing still (even mid-jump, even sprint-stopped a moment ago) doesn't. False if there's no player to check at all, same as most other player-facing predicates here. Use this to gate a control.while(target_moving) { movement.approach... } loop - keep tailing them only as long as they're actually on the move - or as a control.if condition to branch behavior on whether they're currently walking or holding still. See predicate.target_is_stopped for the complementary case.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "predicate.target_moving"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "predicate_target_is_stopped": {
+      "type": "object",
+      "description": "True if the player currently has no real horizontal velocity - genuinely standing still, not merely between two steps. NOT simply the logical negation of predicate.target_moving: with no player to check, both read false rather than one reading true - there's nothing to be 'stopped' if there's no target at all. Use this to branch toward a held stare/ambush the instant the player plants themselves (e.g. control.if(target_is_stopped) { posture.stare... }) as a natural pair with predicate.target_moving's own follow-while-moving idiom.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "predicate.target_is_stopped"
         }
       },
       "required": [

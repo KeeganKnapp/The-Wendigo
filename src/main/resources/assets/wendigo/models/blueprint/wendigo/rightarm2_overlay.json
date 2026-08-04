@@ -1,0 +1,49 @@
+{
+	"textures": {
+		"1": "wendigo:blueprint/wendigo/texture_base_overlay",
+		"particle": "minecraft:item/pufferfish"
+	},
+	"display": {
+		"head": {
+			"rotation": [0, 180, 0]
+		}
+	},
+	"elements": [
+		{
+			"from": [5.9, -7.1, 6.9],
+			"to": [8.1, 9.1, 9.1],
+			"rotation": {
+				"x": 0,
+				"y": 0,
+				"z": 0,
+				"origin": [7, 8, 8]
+			},
+			"faces": {
+				"north": {
+					"uv": [4, 7, 4.5, 11],
+					"texture": "#1"
+				},
+				"east": {
+					"uv": [4.5, 7, 5, 11],
+					"texture": "#1"
+				},
+				"south": {
+					"uv": [7, 4.5, 7.5, 8.5],
+					"texture": "#1"
+				},
+				"west": {
+					"uv": [7.5, 3, 8, 7],
+					"texture": "#1"
+				},
+				"up": {
+					"uv": [11.25, 11.25, 10.75, 10.75],
+					"texture": "#1"
+				},
+				"down": {
+					"uv": [0.5, 11, 0, 11.5],
+					"texture": "#1"
+				}
+			}
+		}
+	]
+}

@@ -8,12 +8,10 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
-import net.minecraft.world.level.block.TorchBlock;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 
 /**
  * Finds light-emitting blocks (torches, lanterns, etc.) near an origin - the counterpart to
@@ -70,40 +68,42 @@ public final class LightSourceScanner {
 		return found;
 	}
 
-	// A real torch's own crafting recipe (1 coal/charcoal + 1 stick -> torches) - not an exact
-	// yield, just a flavor-appropriate "salvaged the parts" drop for a light source the wendigo
-	// itself tore down, distinct from a torch broken any other way (player, explosion, fire, etc.),
-	// which still gets vanilla's own default drop (the torch item itself) untouched - this helper is
-	// only ever called from the wendigo's own destruction paths.
-	private static final ItemStack TORCH_BREAK_DROP_COAL = new ItemStack(Items.COAL);
-	private static final ItemStack TORCH_BREAK_DROP_STICK = new ItemStack(Items.STICK);
-
 	/**
 	 * Destroys a light source the wendigo itself is responsible for (combat.break_torch,
-	 * combat.chase's passive collateral, or a torch-linked spawn spot) - no vanilla drop
-	 * (dropBlock=false, same convention as everywhere else this mod destroys a block), replaced with
-	 * a coal + a stick if (and only if) the block was actually a torch (standing, wall, or soul -
-	 * see TorchBlock; deliberately excludes RedstoneTorchBlock, a different subclass of
-	 * BaseTorchBlock that isn't really "a torch" for this purpose). Any other light source type
-	 * (lantern, glowstone, redstone torch/lamp, etc.) still drops nothing, same as before.
+	 * combat.chase's passive collateral, or a torch-linked spawn spot) - dropBlock=true, so it just
+	 * drops itself as an ordinary item the same way a player breaking it would (torch, lantern,
+	 * copper lantern/torch at whichever oxidation stage, redstone torch, etc. all just work via
+	 * vanilla's own normal loot resolution - no manual substitution needed). Used to replace a real
+	 * torch's own drop with a flavor-appropriate coal+stick "salvaged the parts" pair instead of its
+	 * real drop - removed per explicit request, everything just drops itself now.
 	 */
 	public static void destroyByWendigo(ServerLevel level, BlockPos pos, Entity source) {
-		boolean isTorch = level.getBlockState(pos).getBlock() instanceof TorchBlock;
-		level.destroyBlock(pos, false, source, 512);
-		if (isTorch) {
-			level.addFreshEntity(new ItemEntity(level, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, TORCH_BREAK_DROP_COAL.copy()));
-			level.addFreshEntity(new ItemEntity(level, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5, TORCH_BREAK_DROP_STICK.copy()));
-		}
+		level.destroyBlock(pos, true, source, 512);
+	}
+
+	/** True for any light-emitting block combat.break_torch/the passive chase-destruction/torch-
+	 * linked-spawn machinery is allowed to target - light-emitting (getLightEmission() > 0), NOT a
+	 * full block (isCollisionShapeFullBlock - excludes glowstone, sea lanterns, shroomlight, redstone
+	 * lamps, jack o'lanterns and the like, matching the user's own explicit "isn't a full block"
+	 * scope), and explicitly not an end rod even though its own collision shape also isn't a full
+	 * block (the one carve-out the user asked for). Covers standing/wall/soul torches, copper torches
+	 * at every oxidation stage, lanterns and copper lanterns at every oxidation stage, and redstone
+	 * torches all for free - no per-block-type allowlist needed, just the two shape-based rules. */
+	private static boolean isBreakableLightSource(Level level, BlockPos pos) {
+		BlockState state = level.getBlockState(pos);
+		return state.getLightEmission() > 0
+			&& !state.isCollisionShapeFullBlock(level, pos)
+			&& !state.is(Blocks.END_ROD);
 	}
 
 	/**
 	 * Greedily steps to whichever of the 6 face-neighbors has strictly higher block light than the
 	 * current position, repeating until no neighbor is brighter (a local maximum). Returns that
-	 * position if it's an actual light-emitting block, or null if the climb dead-ended on a bright
-	 * spot that isn't a source (e.g. it wandered toward a lit but non-emissive area). Block light is
-	 * bounded 0-15 and each step strictly increases it, so this always terminates. Package-visible
-	 * so DarkSpotScanner can climb from an already-found dim spot instead of running an independent
-	 * ring scan just to find the light source responsible for it - see DarkSpotScanner.findSpotDimSpots.
+	 * position if it's an actual breakable light source (see isBreakableLightSource), or null if the
+	 * climb dead-ended on a bright spot that isn't one (e.g. it wandered toward a lit but non-
+	 * emissive area, or landed on a full-block source/end rod, neither of which is a valid target
+	 * here). Block light is bounded 0-15 and each step strictly increases it, so this always
+	 * terminates.
 	 */
 	static BlockPos climbLightSource(Level level, BlockPos start) {
 		BlockPos current = start;
@@ -124,7 +124,7 @@ public final class LightSourceScanner {
 			}
 
 			if (best.equals(current)) {
-				return level.getBlockState(best).getLightEmission() > 0 && hasPassableNeighbor(level, best)
+				return isBreakableLightSource(level, best) && hasPassableNeighbor(level, best)
 					? current : null;
 			}
 			current = best;

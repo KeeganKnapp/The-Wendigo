@@ -30,17 +30,29 @@ final class TierGates {
 	}
 
 	/** Minimum severity percent (0-100) at which this action type is allowed to run at all. Not
-	 * listed here (posture.stare, control.*, timing.wait, movement.approach_spot,
+	 * listed here (posture.stare, control.*, timing.wait, movement.approach_band,
 	 * internal.despawn_move) means always allowed - control flow, staring, and mandatory wave
-	 * cleanup are never gated. */
+	 * cleanup are never gated (movement.approach_band's own band choice is separately gated by
+	 * SchemaBuilder.isBandAllowed/filterApproachBand, not here - same split spawn_at's bands use). */
 	static int minPercentFor(String actionType) {
 		return switch (actionType) {
-			case "movement.approach", "movement.approach_dim_spot", "movement.retreat_to_dark",
+			case "movement.approach", "movement.retreat_to_dark",
 				"movement.retreat_with_fallback", "movement.reposition", "movement.hold",
 				"combat.break_torch", "sound.ambient_cue" -> 20;
 			case "memory.store_dark_location" -> 40;
-			case "combat.lunge_attack" -> 60;
+			// movement.drop shares combat.lunge_attack's own 60% tier - the user's own explicit
+			// pairing: spot_above (see SchemaBuilder.isBandAllowed, gated the same 60% here) + drop +
+			// lunge is meant to become available together, an overhead alternative to a ground-level
+			// lunge, not a strictly-better tactic reserved for its own higher bar. combat.chase's own
+			// 80% pairing (spot_above, drop, chase) unlocks naturally once chase itself does, needing
+			// no separate threshold for the combination.
+			case "combat.lunge_attack", "movement.drop" -> 60;
 			case "combat.chase" -> 80;
+			// Stage 5's own representativePercent (WendigoProgressionTracker.STAGE_PERCENTS[5]) exactly
+			// - the user's own explicit "only available to stage 5" request. Stage 4 tops out at 70, so
+			// this threshold is only ever reachable by stage 5 specifically, same precedent combat.chase's
+			// 80 already sets (also unreachable below stage 5, just less precisely-chosen a value).
+			case "combat.teleport_behind" -> 90;
 			default -> 0;
 		};
 	}

@@ -1,19 +1,14 @@
 package com.wendigo.sound;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.Map;
 
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundSource;
 
@@ -27,18 +22,32 @@ import com.wendigo.WendigoMod;
  * appear in more than one Type's pool where it fits both moods), referenced by ID rather than
  * duplicated into this mod's own resources. assets/minecraft/sounds.json separately silences the
  * real ambient.cave event so vanilla no longer plays cave ambience on its own - only the wendigo
- * does now. CHASE/FLEE/STARE are heavily encouraged but model-chosen (see sound.ambient_cue in
- * action_schema.json - AMBIENT is offered there too, for anytime use); SPAWN is engine-triggered
- * only, and AMBIENT is also played occasionally by the engine itself while orbiting (see
- * PlanRunner.tickOrbit) - there's no model-authored plan running then to place a cue in.
+ * does now. CHASE/FLEE/STARE/AMBIENT are heavily encouraged but model-chosen (see sound.ambient_cue
+ * in action_schema.json); SPAWN is engine-triggered only. AMBIENT used to also play occasionally on
+ * its own while orbiting with no active plan (see PlanRunner.tickOrbit's own history) - removed per
+ * the user's own explicit request, so a wendigo that's just orbiting, not currently mid-plan, is
+ * silent now.
  * <p>
- * play() no longer plays immediately - with this many independent triggers (model-chosen cues,
- * severity-milestone/darkness-overstay nags, orbit's own occasional ambience, spawn) all capable of
- * firing close together, back-to-back real playSound calls were overlapping into a wall of noise,
- * especially mid-chase. Every call instead enqueues per-level (see QUEUES) and a single per-tick
- * pump (tick(), registered in init()) drains at most one per MIN_SOUND_INTERVAL_TICKS - a real
- * queue, not a debounce that drops the extras, so a burst of legitimate cues still all eventually
- * play, just spaced out.
+ * play() is a plain availability check, not a queue - the user's own explicit request. Used to
+ * enqueue every call per-level and drain at most one per MIN_SOUND_INTERVAL_TICKS via a dedicated
+ * per-tick pump, so a burst of legitimate cues still all eventually played, just spaced out - but
+ * that pump was its own separate background process, registered directly on
+ * ServerTickEvents.END_SERVER_TICK independent of any single level's own freeze state, and it had to
+ * keep running on its own to ever drain anything at all - exactly the mechanism behind a previously-
+ * reported bug where queued sounds kept trickling out in real time even with ticks frozen for
+ * debugging. Now every call to play() just checks "is a slot free right now" (the same
+ * MIN_SOUND_INTERVAL_TICKS gap, tracked in NEXT_ALLOWED_TICK) and either plays immediately or drops
+ * the request outright - nothing is ever held onto to play later, so there's no backlog and nothing
+ * left running in the background to go wrong while frozen.
+ * <p>
+ * Every cue here is centered on the TARGET PLAYER, not the wendigo's own actual position - the
+ * user's own explicit framing: these are cinematic cues (a horror movie's own sound design, not
+ * something diegetically emitted from the wendigo's body that would naturally fall off with
+ * distance/direction the way footsteps or a hurt sound do - see WendigoEntity.playHurtSound/
+ * playStepSound and PlanRunner's own spear-hit sound, deliberately NOT changed by this, since those
+ * really are meant to sound like they're coming from wherever the wendigo actually is). Playing at
+ * the player's own position means it's always heard clearly regardless of where the wendigo is
+ * hiding, which is the whole point of an unplaced dread cue.
  */
 public final class WendigoSounds {
 	public enum Type {
@@ -48,14 +57,19 @@ public final class WendigoSounds {
 		/** Heavily encouraged right before movement.retreat_with_fallback - announces the withdrawal
 		 * back into darkness. */
 		FLEE,
-		/** Low, unplaced background presence - safe anytime, including from a distance. Also what
-		 * the periodic "still lingering"/severity-milestone nags (DarknessOverstayTracker,
-		 * PlayerSeverityTracker) use, and what orbit itself plays occasionally on its own. */
+		/** Low, unplaced background presence - safe anytime, including from a distance. Also what the
+		 * periodic "still lingering in the dark" warning noise (DarknessOverstayTracker) uses. */
 		AMBIENT,
 		/** Heavily encouraged right when posture.stare(enabled=true) starts a held stare. */
 		STARE,
 		/** Played once when a wave's wendigo actually spawns/relocates into the world. */
-		SPAWN
+		SPAWN,
+		/** Triggered the instant a grab lands (see PlanRunner.beginForcedRide) - lands right at that
+		 * exact moment or not at all (see the class doc comment - every cue now behaves this way, a
+		 * plain availability check, not a queue), which matters most for this one specifically: a
+		 * jumpscare that played late, after whatever else happened to already play first (a chase cue
+		 * right before the catch, commonly), isn't a jumpscare anymore. */
+		JUMPSCARE
 	}
 
 	// Registered eagerly (see init(), called from WendigoMod.onInitialize) rather than left as bare
@@ -66,6 +80,7 @@ public final class WendigoSounds {
 	private static final SoundEvent AMBIENT_EVENT = register("ambient");
 	private static final SoundEvent STARE_EVENT = register("stare");
 	private static final SoundEvent SPAWN_EVENT = register("spawn");
+	private static final SoundEvent JUMPSCARE_EVENT = register("jumpscare");
 
 	private static SoundEvent register(String name) {
 		ResourceKey<SoundEvent> key = ResourceKey.create(Registries.SOUND_EVENT, WendigoMod.id(name));
@@ -80,41 +95,21 @@ public final class WendigoSounds {
 	// a wall-of-noise problem as the same cue repeating.
 	private static final int MIN_SOUND_INTERVAL_TICKS = 260; // 13s
 
-	private record QueuedSound(BlockPos pos, Type type) {
-	}
-
-	private static final Map<ServerLevel, Deque<QueuedSound>> QUEUES = new HashMap<>();
 	private static final Map<ServerLevel, Integer> NEXT_ALLOWED_TICK = new HashMap<>();
 
 	private WendigoSounds() {
 	}
 
-	/** Registers the per-tick queue pump - also what actually forces the *_EVENT static fields to
-	 * register, via ordinary Java class-initialization-on-first-reference (same reason ModEntities
-	 * has its own init()). Called from WendigoMod.onInitialize. */
+	/** Forces the *_EVENT static fields above to register, via ordinary Java class-initialization-on-
+	 * first-reference (same reason ModEntities has its own init()) - called from WendigoMod.onInitialize
+	 * so every event exists in the registry before it freezes. Nothing else to set up now that play()
+	 * is a plain per-call availability check with no background pump to register (see the class doc
+	 * comment). */
 	public static void init() {
-		ServerTickEvents.END_SERVER_TICK.register(WendigoSounds::tick);
-	}
-
-	private static void tick(MinecraftServer server) {
-		for (Map.Entry<ServerLevel, Deque<QueuedSound>> entry : QUEUES.entrySet()) {
-			Deque<QueuedSound> queue = entry.getValue();
-			if (queue.isEmpty()) {
-				continue;
-			}
-			ServerLevel level = entry.getKey();
-			int now = server.getTickCount();
-			if (now < NEXT_ALLOWED_TICK.getOrDefault(level, 0)) {
-				continue;
-			}
-			QueuedSound next = queue.poll();
-			level.playSound(null, next.pos(), eventFor(next.type()), SoundSource.HOSTILE, 2.0F, 1.0F);
-			NEXT_ALLOWED_TICK.put(level, now + MIN_SOUND_INTERVAL_TICKS);
-		}
 	}
 
 	/** Public so vanilla-called hooks (e.g. Entity.getAmbientSound, not something this mod invokes
-	 * directly) can still resolve a type from the same single source of truth as tick(). */
+	 * directly) can still resolve a type from the same single source of truth as play(). */
 	public static SoundEvent eventFor(Type type) {
 		return switch (type) {
 			case CHASE -> CHASE_EVENT;
@@ -122,13 +117,20 @@ public final class WendigoSounds {
 			case AMBIENT -> AMBIENT_EVENT;
 			case STARE -> STARE_EVENT;
 			case SPAWN -> SPAWN_EVENT;
+			case JUMPSCARE -> JUMPSCARE_EVENT;
 		};
 	}
 
-	/** Enqueues this sound (see the class doc comment) rather than playing it immediately - actual
-	 * playback (same volume/pitch/source this mod always used) happens from tick() once the queue
-	 * reaches it and the minimum gap has elapsed. */
-	public static void play(ServerLevel level, BlockPos pos, Type type) {
-		QUEUES.computeIfAbsent(level, l -> new ArrayDeque<>()).add(new QueuedSound(pos, type));
+	/** Plays immediately if the same MIN_SOUND_INTERVAL_TICKS gap every cue shares has already
+	 * elapsed, or does nothing at all otherwise - a plain availability check (see the class doc
+	 * comment), never held onto, never played late. Centered on target (see the class doc comment for
+	 * why). */
+	public static void play(ServerLevel level, ServerPlayer target, Type type) {
+		int now = level.getServer().getTickCount();
+		if (now < NEXT_ALLOWED_TICK.getOrDefault(level, 0)) {
+			return;
+		}
+		level.playSound(null, target.blockPosition(), eventFor(type), SoundSource.HOSTILE, 2.0F, 1.0F);
+		NEXT_ALLOWED_TICK.put(level, now + MIN_SOUND_INTERVAL_TICKS);
 	}
 }

@@ -64,21 +64,32 @@ final class SemanticBands {
 	 * Angle within which a player's look vector counts as "facing" the wendigo, by named band -
 	 * corner_of_eye is deliberately capped at 60: past that it stops reading as "in the corner of
 	 * your eye" even with a normal FOV and starts counting as behind the player. dead_stare was
-	 * widened from a stricter 10 - with wall/ceiling climbing (AWCAPI), the visible model can read as
-	 * clearly stared at while the underlying hitbox sits tucked slightly behind a block corner from
-	 * the camera's exact angle, which under the old tight tolerance meant a held stare-hold loop
-	 * would never see a real dead-on look register at all (control.while never ends, the wendigo
-	 * never continues) until the player physically closed enough distance to also straighten out that
-	 * small hitbox/visual offset - not an intentional gameplay gate, just geometry slop this widening
-	 * absorbs.
+	 * widened from a stricter 10 to 18 to compensate for a tilted-climbing-surface bug (see
+	 * WendigoEntity.CRAWLING_DIMENSIONS' own comment): the visible model could read as clearly stared
+	 * at while the underlying hitbox's real anchor sat tucked slightly behind a block corner from the
+	 * camera's exact angle, so a held stare-hold loop would never see a real dead-on look register at
+	 * all until the player physically closed enough distance to straighten out that offset. Brought
+	 * back down to 14 (still looser than the original 10, not a full revert) now that
+	 * CRAWLING_DIMENSIONS' own width bump gives that case some real margin on its own - the user's own
+	 * follow-up report that flat floor/ceiling stares (unaffected by the tilted-surface bug either
+	 * way) were registering too easily, in particular over-triggering the new stage-1 orbit exposure
+	 * despawn (see WendigoManager.checkStage1Exposure), which needs an actually-narrow "truly spotted"
+	 * signal to stay meaningful.
 	 */
 	static double lookAngleDegrees(String band) {
 		return switch (band) {
 			case "corner_of_eye" -> 60.0;
-			case "dead_stare" -> 18.0;
+			case "dead_stare" -> 14.0;
 			default -> 30.0; // "in_view"
 		};
 	}
+
+	// How long a player has to continuously sit in the next-weaker look band before
+	// PlanPredicates.isLookedAtByAnyoneGraduated treats the narrower band as satisfied anyway - user's
+	// own explicit call. Exists so a stare-hold loop can't be stuck forever waiting for a dead-on look
+	// that's merely close (a sustained corner_of_eye/in_view glance reads as "noticed" too, just more
+	// slowly than an actual dead_stare would).
+	static final int GRADUATED_LOOK_STREAK_TICKS = 60; // 3s
 
 	// Cap on the "distance between wendigo and player when the enclosing control.while started"
 	// baseline used by predicate.player_approaching/predicate.player_undetected's approach_band - a
@@ -112,20 +123,28 @@ final class SemanticBands {
 	// The band PlanRunner's internal.orbit primitive tries to hold from its locked target while no
 	// plan is active - pathfind away below the min, toward above the max, hold position in between.
 	// Tightens in smaller caves (see CaveScaleScanner) - nowhere to hold a wide ring in a mineshaft
-	// corridor. First pass, adjust by feel.
+	// corridor. Tightened from an earlier, wider pass (TIGHT 12-18/NORMAL 20-30/MASSIVE 28-40) now
+	// that the wendigo can act directly from wherever it's orbiting (movement.approach_band handles
+	// any repositioning a plan actually needs) rather than always having to walk to a chosen spot
+	// first - being farther out by default no longer buys anything, so there's no reason to hold as
+	// wide a ring as before. First pass, adjust by feel.
+	// Pushed 4 blocks further out on both ends (from TIGHT 8-14/NORMAL 12-20/MASSIVE 20-30) per the
+	// user's own explicit "push his orbit rings a bit further out" request - a modest bump, not a
+	// full revert to the old pre-tightening pass documented above. Kept in sync by hand with
+	// WendigoManager's own orbitMinDistance/orbitMaxDistance copy.
 	static double orbitMinDistance(CaveScale caveScale) {
 		return switch (caveScale) {
 			case TIGHT -> 12.0;
-			case MASSIVE -> 28.0;
-			default -> 20.0; // NORMAL
+			case MASSIVE -> 24.0;
+			default -> 16.0; // NORMAL
 		};
 	}
 
 	static double orbitMaxDistance(CaveScale caveScale) {
 		return switch (caveScale) {
 			case TIGHT -> 18.0;
-			case MASSIVE -> 40.0;
-			default -> 30.0; // NORMAL
+			case MASSIVE -> 34.0;
+			default -> 24.0; // NORMAL
 		};
 	}
 }
