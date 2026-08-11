@@ -8,7 +8,11 @@ import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.wendigo.block.WendigoBlocks;
 import com.wendigo.command.WendigoCommands;
+import com.wendigo.debug.SpiderDiagnostics;
+import com.wendigo.debug.StareHeadTest;
+import com.wendigo.debug.WendigoDebugItems;
 import com.wendigo.entity.ModEntities;
 import com.wendigo.entity.WendigoEntity;
 import com.wendigo.entity.WendigoVisual;
@@ -40,12 +44,20 @@ public class WendigoMod implements ModInitializer {
 	public static WendigoManager wendigoManager;
 	// Exposed for WendigoCommands' /wendigo runs get/set debug commands.
 	public static WendigoProgressionTracker progressionTracker;
+	// See WendigoTuningConfig's own class doc comment - read directly from here (a shared static
+	// instance, same "loaded once at mod init" shape as the fields above) rather than threaded through
+	// PlanRunner's own constructor, which has no existing config wiring at all.
+	public static WendigoTuningConfig tuningConfig;
 
 	@Override
 	public void onInitialize() {
 		LOGGER.info("Wendigo mod initializing");
 		ModEntities.init();
+		WendigoBlocks.init();
 		WendigoSounds.init();
+		WendigoDebugItems.init();
+		SpiderDiagnostics.init();
+		StareHeadTest.register();
 
 		// Marks this mod's own src/main/resources/assets/wendigo (the unpacked AJ resource
 		// pack export) as resource-pack asset source, so Polymer's AutoHost merges and pushes
@@ -71,6 +83,7 @@ public class WendigoMod implements ModInitializer {
 		});
 
 		llmClient = new LlmClient(LlmConfig.load());
+		tuningConfig = WendigoTuningConfig.load();
 
 		WendigoWaveConfig waveConfig = WendigoWaveConfig.load();
 		progressionTracker = new WendigoProgressionTracker();

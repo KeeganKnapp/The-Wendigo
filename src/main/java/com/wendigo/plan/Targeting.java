@@ -17,7 +17,7 @@ import com.wendigo.entity.WendigoEntity;
  * treats "no player found" as a legitimate, already-handled case (give up, lose the target, fail to
  * resolve) - see nearestPlayer's null return - so a player who steps back above y=0 simply
  * disappears from the wendigo's targeting entirely, with no other code needed to make that stick. */
-final class Targeting {
+public final class Targeting {
 	private Targeting() {
 	}
 
@@ -30,8 +30,13 @@ final class Targeting {
 	 * Doesn't just fall through to vanilla's own getNearestPlayer when the locked target is
 	 * disqualified - that has no way to skip a too-high player and keep searching for someone lower,
 	 * so a real below-y=0 player nearby would otherwise go unnoticed if the closest one happened to be
-	 * above ground. */
-	static Player nearestPlayer(WendigoEntity self) {
+	 * above ground.
+	 * <p>
+	 * Public (not just this package's own callers) - the same narrow-exception precedent
+	 * PlanPredicates.isLookingAtSelf/isDeadStare already established - so WendigoEntity
+	 * (com.wendigo.entity) can sample distance-to-target every tick for its own rolling
+	 * playerDirection() history without duplicating this locked-target-aware lookup. */
+	public static Player nearestPlayer(WendigoEntity self) {
 		ServerPlayer locked = self.getLockedTarget();
 		if (locked != null && locked.isAlive() && locked.level() == self.level() && locked.getY() < 0) {
 			return locked;

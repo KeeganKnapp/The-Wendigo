@@ -2,6 +2,7 @@ package com.wendigo.entity;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
 import org.joml.Matrix4f;
 import org.joml.Quaternionf;
@@ -29,14 +30,14 @@ import com.wendigo.debug.WendigoDebug;
 
 /**
  * A Polymer virtual-entity rig: one packet-only {@code item_display} per bone, mirroring the
- * Animated-Java-exported wendigo rig (see WendigoAnimationData), PLUS a second, slightly-larger
- * "overlay" item_display per bone wearing the dark-growth texture (see overlayBones' own comment) -
- * every animated bone is really a coincident pair now, not a single element. Attached to a real,
- * invisible {@link WendigoEntity} via {@code EntityAttachment.ofTicking} -- see WendigoMod's
- * ServerEntityEvents hooks for the attach/detach wiring.
+ * Animated-Java-exported wendigo rig (see WendigoAnimationData), PLUS one extra, slightly-larger
+ * head-only {@code item_display} (see {@link #headGlow}) wearing the emissive "head_e" texture for
+ * the glowing-eyes effect. Attached to a real, invisible {@link WendigoEntity} via
+ * {@code EntityAttachment.ofTicking} -- see WendigoMod's ServerEntityEvents hooks for the
+ * attach/detach wiring.
  *
  * Every bone is given zero offset from the holder's tracked position, same as the reference
- * datapack: there all 12 bones were literal vehicle Passengers of one root item_display (so their
+ * datapack: there every bone was a literal vehicle Passenger of one root item_display (so their
  * world position always equals the root's), and all visual placement came entirely from each
  * bone's own "transformation" NBT. We reproduce that exactly: offset stays default (0,0,0), and
  * setTransformation() does all the work.
@@ -46,7 +47,7 @@ public class WendigoVisual extends ElementHolder {
     // next path node every tick (no LookAtGoal/RandomLookAroundGoal-style smoothing, since it has no
     // Goals beyond FloatGoal) -- reading it raw made the rig visibly jerky. Easing toward it instead
     // of copying it verbatim smooths that out; Mth.rotLerp already takes the shortest way around.
-    private static final float YAW_LERP_FACTOR = 0.4f;
+    private static final float YAW_LERP_FACTOR = 0.5f;
     // Same easing treatment as YAW_LERP_FACTOR, for the same reason - a wall/ceiling attachment
     // orientation swap (see onTick's rigOrientation branch) is physics-driven, not eased on
     // AWCAPI's own side, and popping straight to a new orientation the instant ClimberComponent
@@ -61,7 +62,7 @@ public class WendigoVisual extends ElementHolder {
     // how far it swings each tick. (A windowed-average alternative was tried for the flip-flopping
     // "upside-down pyramid" case specifically - reverted back to this by request.) First pass,
     // adjust by feel.
-    private static final float ORIENTATION_LERP_FACTOR = 0.15f;
+    private static final float ORIENTATION_LERP_FACTOR = 0.4f;
     // See onTick's rigOrientation block - empirically-found correction for the rig facing exactly
     // backwards while climbing, not derived from any formula. Was 180 while
     // RigMatrices.fromOrientationAndYaw's composition still had the yaw-dependent handedness bug
@@ -74,12 +75,22 @@ public class WendigoVisual extends ElementHolder {
     // flips to 0 rather than needing another offset value.
     private static final float CLIMB_YAW_OFFSET_DEGREES = 0.6f;
     private static final double LOOK_AT_PLAYER_RADIUS = 64.0;
-    // Empirical, same class of fix as CLIMB_YAW_OFFSET_DEGREES above but for the head bone instead
-    // of the whole rig: live testing showed the crawl-pose head-look tracking the player's bearing
-    // correctly (turning the right amount as the player moved) but facing exactly away from them, on
-    // both the floor and while climbing - a clean 180 is exactly what a front/back mismatch in the
-    // head bone's own baked "forward" produces, regardless of which yaw formula fed the delta.
-    private static final float HEAD_LOOK_YAW_CORRECTION_DEGREES = 180.0f;
+    // Was 180 (empirically, for the OLD rig's own head export) - live testing after the new
+    // per-bone-textured rig swap (see the 20th-pass memory entry) found the new head model's own
+    // baked "forward" no longer has the front/back mismatch the old 180 was compensating for
+    // ("in blockbench his head is completely on straight"): standing-idle and ordinary crawl
+    // navigation both confirmed correct at a flat 0 via live /wendigo headoffset testing, so that's
+    // now the default every non-climbing pose falls back to unless overridden. Still live-adjustable
+    // per-pose (see WendigoDebug's standing/tracking head-yaw overrides) in case a future geometry/UV
+    // change needs this revisited yet again - same reasoning CLIMB_YAW_OFFSET_DEGREES above documents.
+    private static final float HEAD_LOOK_YAW_CORRECTION_DEGREES = 0.0f;
+    // The climbing-tracking counterpart to HEAD_LOOK_YAW_CORRECTION_DEGREES above - a separate value
+    // since the climbing formula composes the correction differently (see this method's own comment on
+    // headLookYawDelta). Confirmed live via /wendigo climbheadoffset: 180 is correct for the new rig,
+    // the exact opposite of the floor case's own flip (180 -> 0) - matches this file's running pattern
+    // of the new per-bone-textured export needing every "front/back" style correction re-tuned, not
+    // necessarily in the same direction each time.
+    private static final float CLIMB_TRACKING_HEAD_LOOK_YAW_CORRECTION_DEGREES = 180.0f;
     // Bright, unmistakably-artificial cyan - distinct from anything else the rig or the cave itself
     // could plausibly tint, so it reads as "debug indicator" at a glance.
     private static final int DEBUG_GLOW_COLOR = 0x00FFFF;
@@ -130,9 +141,13 @@ public class WendigoVisual extends ElementHolder {
     // How much faster than real-time the crawl loop plays back at each band - even the slowest
     // moving speed still doubles it, so the limb cycle never reads as visibly skating/sliding across
     // the ground the way 1x playback did against real movement speed. First-pass, adjust by feel.
-    private static final double SLOW_ANIMATION_SPEED = 3.0;
-    private static final double NORMAL_ANIMATION_SPEED = 1.5;
+    private static final double SLOW_ANIMATION_SPEED = 2.5;
+    private static final double NORMAL_ANIMATION_SPEED = 3.25;
     private static final double FAST_ANIMATION_SPEED = 4.0;
+    // Real-time (1x) playback for the new looping "stand" idle animation - unlike the crawl loop, there's
+    // no live movement speed to scale this against while genuinely standing still. First-pass, adjust by
+    // feel once actually watched in-game.
+    private static final double STAND_ANIMATION_SPEED = 1.0;
 
     // How many consecutive not-moving ticks owner.isMoving() must read before the ANIMATION commits
     // to idle-crawl instead of the crawl loop - see onTick's debouncedMoving. Only the "stopping"
@@ -141,8 +156,12 @@ public class WendigoVisual extends ElementHolder {
     // RESTING_ON_FLOOR_DEBOUNCE_TICKS (see their own comments for the live-reported model-flicker bug
     // this is a companion fix for) - crawlPoseActive combines this flag with both of those, so an
     // independently-shorter window here could still let the model set flip even once the other two
-    // settle down.
-    private static final int MOVING_ANIMATION_DEBOUNCE_TICKS = 10;
+    // settle down. Real bug found live: this had silently drifted back down to 5 (half the documented/
+    // intended value) at some point after that comment was written, exactly reproducing the failure
+    // mode the comment itself warns about - a slope-crossing wendigo cycling through poses roughly
+    // every 10 ticks, this constant's own now-too-short window flipping independently of (and roughly
+    // twice as often as) the two 10-tick entity-side debounces it's supposed to stay locked to.
+    private static final int MOVING_ANIMATION_DEBOUNCE_TICKS = 2;
     // Window isGenuinelyProgressing checks NET displacement over - owner.isMoving() is pure
     // instantaneous velocity, which a mob wedged in a tight/concave gap (still bumping/jittering
     // against the obstacle tick to tick, never fully at rest) can keep satisfying every tick despite
@@ -156,25 +175,33 @@ public class WendigoVisual extends ElementHolder {
 
     private final WendigoEntity owner;
     private final Map<String, ItemDisplayElement> bones = new LinkedHashMap<>();
-    // One per entry in bones (same keys, same animation-driven transform every tick - see onTick's
-    // two per-bone loops), just a hair larger and wearing the "<bone>_overlay" model instead - the
-    // user's own explicit "dark growth on top of a regular Steve-looking base" request, same
-    // coincident-layers trick eyes/head already used for the glowing eyes (see eyes' own comment)
-    // generalized to the whole rig instead of just the head. texture_base_overlay is expected to be
-    // mostly transparent except wherever the growth actually is, exactly like texture_e is now
-    // mostly transparent except the eyes - see head_overlay.json's own padding relative to head.json.
-    private final Map<String, ItemDisplayElement> overlayBones = new LinkedHashMap<>();
+    // "open" (the jaw) is a head sub-bone in the new rig, baked as its own independent bone matrix
+    // rather than parented under "head" -- without also routing headLookExtra to it, the jaw stayed
+    // frozen in its animation-only orientation while the head itself turned to face the player,
+    // reading as the jaw detaching/poking off the head the further it turned (same failure mode
+    // applyBoneTransform's own doc comment describes for naively rotating a bone's full matrix).
+    private static final Set<String> HEAD_LOOK_BONES = Set.of("head", "open");
     // Not one of the animated bones in WendigoAnimationData (that file is generated from the
     // Animated-Java export and isn't meant to be hand-edited) -- instead this just mirrors "head"'s
-    // transformation every tick, at the exact same size/rotation, but with the glowing-eyes texture
-    // and its own independent brightness override driven by WendigoEntity#isStaring. Its model
-    // geometry is a hair larger than the head's own cube (see eyes.json) so the two coincident
-    // item-display layers don't z-fight where they overlap.
-    private final ItemDisplayElement eyes = new ItemDisplayElement();
+    // transformation every tick, at the exact same size/rotation, but with the head-only emissive
+    // "head_e" texture and its own independent brightness override driven by WendigoEntity#isStaring/
+    // isChasing. Was a separate floating "eyes" display in the old rig (its own bone, its own
+    // whole-body-sized emissive texture) - the new rig has no such bone at all, so this is now
+    // literally just a second head-shaped layer, same coincident-layers trick as before, just scoped
+    // to the head instead of a standalone element. Its model geometry is a hair larger than the head's
+    // own cubes (see head_e.json, generated from head.json's own bounds expanded by a small margin) so
+    // the two coincident item-display layers don't z-fight where they overlap.
+    private final ItemDisplayElement headGlow = new ItemDisplayElement();
     // A fractional frame accumulator rather than an int frame-index -- advancing by a non-integer
     // multiplier (2.5x, etc) every tick needs the fractional remainder to carry over, or the loop's
-    // real-time speed would round back down toward 1x.
+    // real-time speed would round back down toward 1x. Drives the CRAWL_NORMAL/CRAWL_ANGRY loop while
+    // actually moving - see standAnimationPhase for the equivalent while standing idle.
     private double animationPhase = 0.0;
+    // Same fractional-carry reasoning as animationPhase, for the new looping "stand" animation (41
+    // keyframes now, was a single static pose) - the user's own explicit "play it as a real looping
+    // idle animation" request. Advances only while genuinely standing idle (not moving, not in the
+    // crawl/swim hitbox), independent of animationPhase's own moving-only advancement.
+    private double standAnimationPhase = 0.0;
     private float smoothedYaw;
     private boolean yawInitialized;
     private final Quaternionf smoothedOrientation = new Quaternionf();
@@ -201,8 +228,6 @@ public class WendigoVisual extends ElementHolder {
         WendigoEntity.TexturePreviewMode previewMode = owner.getTexturePreviewMode();
         boolean showBase = previewMode == WendigoEntity.TexturePreviewMode.ALL
             || previewMode == WendigoEntity.TexturePreviewMode.BASE_ONLY;
-        boolean showGrowth = previewMode == WendigoEntity.TexturePreviewMode.ALL
-            || previewMode == WendigoEntity.TexturePreviewMode.GROWTH_ONLY;
         boolean showEyes = previewMode == WendigoEntity.TexturePreviewMode.ALL
             || previewMode == WendigoEntity.TexturePreviewMode.EYES_ONLY;
         for (String bone : WendigoAnimationData.REST_POSE.keySet()) {
@@ -220,29 +245,17 @@ public class WendigoVisual extends ElementHolder {
 
             this.bones.put(bone, element);
             this.addElement(element);
-
-            ItemDisplayElement overlayElement = new ItemDisplayElement();
-            if (showGrowth) {
-                ItemStack overlayStack = new ItemStack(Items.WHITE_DYE);
-                overlayStack.set(DataComponents.ITEM_MODEL, WendigoMod.id("blueprint/wendigo/" + bone + "_overlay"));
-                overlayElement.setItem(overlayStack);
-            }
-            overlayElement.setItemDisplayContext(ItemDisplayContext.HEAD);
-            overlayElement.setInterpolationDuration(ROTATION_INTERPOLATION_TICKS);
-            overlayElement.setTransformation(RigMatrices.fromRowMajor(WendigoAnimationData.REST_POSE.get(bone)));
-            this.overlayBones.put(bone, overlayElement);
-            this.addElement(overlayElement);
         }
 
         if (showEyes) {
-            ItemStack eyeStack = new ItemStack(Items.WHITE_DYE);
-            eyeStack.set(DataComponents.ITEM_MODEL, WendigoMod.id("blueprint/wendigo/eyes"));
-            this.eyes.setItem(eyeStack);
+            ItemStack glowStack = new ItemStack(Items.WHITE_DYE);
+            glowStack.set(DataComponents.ITEM_MODEL, WendigoMod.id("blueprint/wendigo/head_e"));
+            this.headGlow.setItem(glowStack);
         }
-        this.eyes.setItemDisplayContext(ItemDisplayContext.HEAD);
-        this.eyes.setInterpolationDuration(ROTATION_INTERPOLATION_TICKS);
-        this.eyes.setTransformation(RigMatrices.fromRowMajor(WendigoAnimationData.REST_POSE.get("head")));
-        this.addElement(this.eyes);
+        this.headGlow.setItemDisplayContext(ItemDisplayContext.HEAD);
+        this.headGlow.setInterpolationDuration(ROTATION_INTERPOLATION_TICKS);
+        this.headGlow.setTransformation(RigMatrices.fromRowMajor(WendigoAnimationData.REST_POSE.get("head")));
+        this.addElement(this.headGlow);
     }
 
     @Override
@@ -263,7 +276,7 @@ public class WendigoVisual extends ElementHolder {
         boolean onFloor = this.owner.isRestingOnFloor();
         boolean crawlPoseActive = moving || crawlHitbox;
         // A held stare OR an active chase both want the same "keep watching the target" treatment -
-        // see trackingTarget's use below (headLookExtra) and applyEyes' glow condition.
+        // see trackingTarget's use below (headLookExtra) and applyHeadGlow's glow condition.
         boolean trackingTarget = this.owner.isStaring() || this.owner.isChasing();
         // Fetched once, used both by headLookExtra's climbing-case computation below and by
         // rigOrientation's own (unrelated) tilt composition further down.
@@ -314,6 +327,15 @@ public class WendigoVisual extends ElementHolder {
         } else {
             this.animationPhase = 0.0;
         }
+        // Same "always advances/resets at the true tick rate, independent of the push throttle" reasoning
+        // as animationPhase above, for the new looping stand animation - genuinely standing idle only
+        // (not moving, not in the crawl/swim hitbox); crawlHitbox-but-not-moving still holds the single
+        // CRAWL_IDLE frame, unchanged.
+        if (!moving && !crawlHitbox) {
+            this.standAnimationPhase += STAND_ANIMATION_SPEED;
+        } else {
+            this.standAnimationPhase = 0.0;
+        }
 
         // PUSH THROTTLE: only actually send a new keyframe to the client every
         // ROTATION_INTERPOLATION_TICKS ticks, instead of every tick - see that constant's own
@@ -356,7 +378,16 @@ public class WendigoVisual extends ElementHolder {
         // head_overlay.json) only corrects which texture paints which face; this corrects which way
         // the corrected face physically points.
         Matrix4f headLookExtra;
-        if (crawlPoseActive && trackingTarget) {
+        if (trackingTarget) {
+            // Used to require crawlPoseActive too, so a STANDING wendigo that's staring (posture.stare
+            // only ever sets a boolean flag - see WendigoEntity.setStaring/PlanRunner's "posture.stare"
+            // case - it never actually turns the entity's real yRot toward the player) got no
+            // independent head-look at all, just the body's own leftover yaw plus the flat idle
+            // correction below: it would visibly stand there staring at whatever direction it happened
+            // to already be facing, not at the player. Dropping the crawlPoseActive requirement lets
+            // this same look-at math run for standing+tracking too - the formula itself already only
+            // depends on yaw/orientation, not on which pose is currently animating, so nothing else
+            // about it needs to change for the standing case.
             // Vertical component - see computeHeadLookPitch's own comment for why this one formula
             // covers both the floor and climbing cases without needing an onFloor branch of its own.
             // Composed as rotateY(...).rotateX(...) rather than the other order deliberately: JOML
@@ -435,40 +466,60 @@ public class WendigoVisual extends ElementHolder {
             // backwards at the previous plain "yaw - lookAtPlayerYaw()" and reads correctly with
             // this same 180 folded in - a real behavior difference from the standing/climbing cases
             // below, not a mistake; see this method's other two corrections for why each pose needs
-            // its own independently-tuned value instead of one shared constant.
+            // its own independently-tuned value instead of one shared constant. Now independently
+            // live-tunable too (see WendigoDebug.getTrackingHeadYawOverride, set via
+            // /wendigo trackheadoffset) - the new per-bone head texture changed which physical face
+            // the "front" artwork lands on again, same class of change that has flipped this
+            // constant's needed value more than once before; NaN falls back to the same plain
+            // HEAD_LOOK_YAW_CORRECTION_DEGREES default every other still-hardcoded pose keeps using.
+            float trackingOverride = WendigoDebug.getTrackingHeadYawOverride();
+            float trackingCorrectionDegrees = Float.isNaN(trackingOverride) ? HEAD_LOOK_YAW_CORRECTION_DEGREES : trackingOverride;
+            float climbTrackingOverride = WendigoDebug.getClimbTrackingHeadYawOverride();
+            float climbTrackingCorrectionDegrees = Float.isNaN(climbTrackingOverride)
+                ? CLIMB_TRACKING_HEAD_LOOK_YAW_CORRECTION_DEGREES : climbTrackingOverride;
             float headLookYawDelta = onFloor
-                ? yaw - lookAtPlayerYaw() + HEAD_LOOK_YAW_CORRECTION_DEGREES
-                : yaw + CLIMB_YAW_OFFSET_DEGREES + computeClimbingHeadLookYaw(orientation);
+                ? yaw - lookAtPlayerYaw() + trackingCorrectionDegrees
+                : yaw + CLIMB_YAW_OFFSET_DEGREES + computeClimbingHeadLookYaw(orientation) + climbTrackingCorrectionDegrees;
             headLookExtra = new Matrix4f()
                 .rotateY((float) Math.toRadians(headLookYawDelta))
                 .rotateX((float) Math.toRadians(headLookPitch));
         } else if (onFloor && !crawlPoseActive) {
-            // Standing rest-pose specifically (not crawl-idle, floor or climbing - see the plain
-            // else branch below, which now shares this same default value). Confirmed correct at
-            // the plain HEAD_LOOK_YAW_CORRECTION_DEGREES value via live /wendigo headoffset testing.
+            // Standing rest-pose, NOT tracking anyone (trackingTarget already routed above if it were
+            // true) - just a flat UV/front-facing correction on top of whatever the STAND animation's
+            // own baked yaw already is, same idea as the plain else branch below. Confirmed correct via
+            // live /wendigo headoffset testing (0 degrees, after the new per-bone head texture).
             // Left live-adjustable (NaN override = "use that same default") rather than hardcoded,
             // in case a future geometry/UV change needs it revisited again.
             float override = WendigoDebug.getStandingHeadYawOverride();
             float standingCorrectionDegrees = Float.isNaN(override) ? HEAD_LOOK_YAW_CORRECTION_DEGREES : override;
             headLookExtra = new Matrix4f().rotateY((float) Math.toRadians(standingCorrectionDegrees));
         } else {
-            // Crawl-idle, floor or climbing - not actively tracking anyone. An earlier pass this
-            // session special-cased floor-crawl-idle to a flat 0 based on /wendigo headtest's
-            // "crawling" dummies reading correctly at that value - but every headtest crawling dummy
-            // spawns with setDebugForceChasing(true) (see WendigoCommands.HEADTEST_SLOTS), so that
-            // observation was actually confirming the ACTIVE-TRACKING branch above, not this one; it
-            // never tested a genuinely non-tracking crawl-idle wendigo at all. Live testing an actual
-            // idle (not staring/chasing) wendigo this session found floor-idle backwards at that flat
-            // 0 and correct at the same plain HEAD_LOOK_YAW_CORRECTION_DEGREES climbing-idle already
-            // used - so both now share the one plain correction, same as standing.
-            headLookExtra = new Matrix4f().rotateY((float) Math.toRadians(HEAD_LOOK_YAW_CORRECTION_DEGREES));
+            // Crawl-idle, floor or climbing, AND ordinary crawl-navigation movement while not
+            // actively tracking anyone (i.e. crawlPoseActive true, trackingTarget false covers both -
+            // this isn't just the held idle pose). An earlier pass this session special-cased
+            // floor-crawl-idle to a flat 0 based on /wendigo headtest's "crawling" dummies reading
+            // correctly at that value - but every headtest crawling dummy spawns with
+            // setDebugForceChasing(true) (see WendigoCommands.HEADTEST_SLOTS), so that observation was
+            // actually confirming the ACTIVE-TRACKING branch above, not this one; it never tested a
+            // genuinely non-tracking crawl-idle wendigo at all. Live testing an actual idle (not
+            // staring/chasing) wendigo this session found floor-idle backwards at that flat 0 and
+            // correct at the same plain HEAD_LOOK_YAW_CORRECTION_DEGREES climbing-idle already used -
+            // so both now share the one plain correction, same as standing - reading the SAME live
+            // override as the standing branch above (not just sharing its default value) so a single
+            // /wendigo headoffset test covers both instead of only ever affecting the standing pose,
+            // which is what let this one silently stay wrong after the newest texture swap despite the
+            // active-tracking pose (a separately-tuned override, see trackingCorrectionDegrees above)
+            // reading correctly.
+            float idleOverride = WendigoDebug.getStandingHeadYawOverride();
+            float idleCorrectionDegrees = Float.isNaN(idleOverride) ? HEAD_LOOK_YAW_CORRECTION_DEGREES : idleOverride;
+            headLookExtra = new Matrix4f().rotateY((float) Math.toRadians(idleCorrectionDegrees));
         }
 
         // Off a horizontal floor (climbing a wall/ceiling), a plain yaw can no longer represent the
         // rig's real orientation - ItemDisplayElement only exposes yaw/pitch, no roll (confirmed via
         // javap), so an arbitrary attachment tilt has to be composed straight into each bone's own
         // matrix instead (see RigMatrices.fromOrientationAndYaw). Null while on a genuine floor, so
-        // that path stays exactly what it always was - see applyBoneTransform/applyEyes below.
+        // that path stays exactly what it always was - see applyBoneTransform/applyHeadGlow below.
         Matrix4f rigOrientation = null;
         if (!onFloor) {
             // CLIMB_YAW_OFFSET_DEGREES: live testing showed the rig facing exactly backwards (moving
@@ -517,23 +568,44 @@ public class WendigoVisual extends ElementHolder {
         }
 
         if (moving) {
-            int frame = ((int) this.animationPhase) % WendigoAnimationData.CRAWL_FRAME_COUNT;
+            // The user's own explicit "angry crawl" trigger: chase/lunge/carrying a grabbed player
+            // (isCapturing) play CRAWL_ANGRY, everything else that's simply navigating plays
+            // CRAWL_NORMAL - see PlanRunner.isCapturing's own doc comment for the exact trigger list.
+            boolean angry = this.owner.isCapturing();
+            Map<String, float[][]> crawlAnimation = angry ? WendigoAnimationData.CRAWL_ANGRY : WendigoAnimationData.CRAWL_NORMAL;
+            int frameCount = angry ? WendigoAnimationData.CRAWL_ANGRY_FRAME_COUNT : WendigoAnimationData.CRAWL_NORMAL_FRAME_COUNT;
+            int frame = ((int) this.animationPhase) % frameCount;
+            float[] headFrameMatrix = crawlAnimation.get("head")[frame];
+            Vector3f headPivot = RigMatrices.fromRowMajor(headFrameMatrix).getTranslation(new Vector3f());
             for (Map.Entry<String, ItemDisplayElement> entry : this.bones.entrySet()) {
-                float[] matrix = WendigoAnimationData.CRAWL.get(entry.getKey())[frame];
-                Matrix4f boneHeadLookExtra = "head".equals(entry.getKey()) ? headLookExtra : null;
-                applyBoneTransform(entry.getValue(), matrix, yaw, rigOrientation, boneHeadLookExtra);
-                applyBoneTransform(this.overlayBones.get(entry.getKey()), matrix, yaw, rigOrientation, boneHeadLookExtra);
+                float[] matrix = crawlAnimation.get(entry.getKey())[frame];
+                Matrix4f boneHeadLookExtra = HEAD_LOOK_BONES.contains(entry.getKey()) ? headLookExtra : null;
+                applyBoneTransform(entry.getValue(), matrix, yaw, rigOrientation, boneHeadLookExtra, headPivot);
             }
-            applyEyes(WendigoAnimationData.CRAWL.get("head")[frame], yaw, rigOrientation, headLookExtra);
+            applyHeadGlow(headFrameMatrix, yaw, rigOrientation, headLookExtra, headPivot);
+        } else if (crawlHitbox) {
+            // Held crawl-idle pose - the user's own explicit "crawl idle stays the same" (a single
+            // frame, unchanged, not looped like stand/crawl now both are).
+            float[] headFrameMatrix = WendigoAnimationData.CRAWL_IDLE.get("head");
+            Vector3f headPivot = RigMatrices.fromRowMajor(headFrameMatrix).getTranslation(new Vector3f());
+            for (Map.Entry<String, ItemDisplayElement> entry : this.bones.entrySet()) {
+                float[] matrix = WendigoAnimationData.CRAWL_IDLE.get(entry.getKey());
+                Matrix4f boneHeadLookExtra = HEAD_LOOK_BONES.contains(entry.getKey()) ? headLookExtra : null;
+                applyBoneTransform(entry.getValue(), matrix, yaw, rigOrientation, boneHeadLookExtra, headPivot);
+            }
+            applyHeadGlow(headFrameMatrix, yaw, rigOrientation, headLookExtra, headPivot);
         } else {
-            Map<String, float[]> pose = crawlHitbox ? WendigoAnimationData.CRAWL_IDLE : WendigoAnimationData.REST_POSE;
+            // Standing idle - now a real looping animation (41 keyframes), not a single static rest
+            // pose - the user's own explicit "play it as a real looping idle animation" request.
+            int frame = ((int) this.standAnimationPhase) % WendigoAnimationData.STAND_FRAME_COUNT;
+            float[] headFrameMatrix = WendigoAnimationData.STAND.get("head")[frame];
+            Vector3f headPivot = RigMatrices.fromRowMajor(headFrameMatrix).getTranslation(new Vector3f());
             for (Map.Entry<String, ItemDisplayElement> entry : this.bones.entrySet()) {
-                float[] matrix = pose.get(entry.getKey());
-                Matrix4f boneHeadLookExtra = "head".equals(entry.getKey()) ? headLookExtra : null;
-                applyBoneTransform(entry.getValue(), matrix, yaw, rigOrientation, boneHeadLookExtra);
-                applyBoneTransform(this.overlayBones.get(entry.getKey()), matrix, yaw, rigOrientation, boneHeadLookExtra);
+                float[] matrix = WendigoAnimationData.STAND.get(entry.getKey())[frame];
+                Matrix4f boneHeadLookExtra = HEAD_LOOK_BONES.contains(entry.getKey()) ? headLookExtra : null;
+                applyBoneTransform(entry.getValue(), matrix, yaw, rigOrientation, boneHeadLookExtra, headPivot);
             }
-            applyEyes(pose.get("head"), yaw, rigOrientation, headLookExtra);
+            applyHeadGlow(headFrameMatrix, yaw, rigOrientation, headLookExtra, headPivot);
         }
     }
 
@@ -545,19 +617,27 @@ public class WendigoVisual extends ElementHolder {
      * reflects the entity's actual physics-driven facing, not that override; layering the two
      * together is a live-tuning problem for later, not attempted here.
      *
-     * <p>headLookExtra (null for every bone except the head/eyes, which always get a non-null value
-     * now - see onTick's own comment on why headLookExtra is never null there anymore) is composed
-     * by left-multiplying only the bone's own ROTATION, leaving
-     * its baked TRANSLATION untouched - naively rotating the bone's whole matrix (translation
-     * included, the same way rigOrientation/yaw rotate the rig as a rigid body) would move the
-     * head's POSITION too, not just its facing, reading as the head detaching and poking off the
-     * neck the further it turned (the exact reason every OTHER bone shares one rotation instead of
-     * each having its own - see targetYaw's own comment in onTick). */
-    private void applyBoneTransform(ItemDisplayElement element, float[] matrix, float yaw, Matrix4f rigOrientation, Matrix4f headLookExtra) {
+     * <p>headLookExtra (null for every bone except the head-look bones - the head itself plus any
+     * head sub-bones, see HEAD_LOOK_BONES - which always get a non-null value now, see onTick's own
+     * comment on why headLookExtra is never null there anymore) orbits the bone around headPivot (the
+     * HEAD bone's own baked position for this frame, not necessarily this bone's own translation):
+     * T(headPivot) * headLookExtra * T(-headPivot) * bone. For the head bone itself this degenerates
+     * to exactly the old "rotate in place" behavior (its own translation IS headPivot, by
+     * construction, so the net translation is unchanged - naively rotating the bone's whole matrix
+     * around the WORLD origin instead would move the head's POSITION too, not just its facing,
+     * reading as the head detaching and poking off the neck the further it turned, the exact reason
+     * every OTHER bone shares one rotation instead of each having its own - see targetYaw's own
+     * comment in onTick). For a head SUB-bone (the jaw/"open"), whose own baked translation sits
+     * elsewhere (near the mouth, not the neck), orbiting around the shared headPivot instead of the
+     * jaw's own translation is what keeps it rigidly attached and turning together with the head
+     * instead of spinning in place at its own separate anchor - confirmed live: reusing the old
+     * "preserve own translation" trick for the jaw read as the jaw moving independently of the head
+     * rather than as a child of it. */
+    private void applyBoneTransform(ItemDisplayElement element, float[] matrix, float yaw, Matrix4f rigOrientation, Matrix4f headLookExtra, Vector3f headPivot) {
         Matrix4f bone = RigMatrices.fromRowMajor(matrix);
         if (headLookExtra != null) {
-            Vector3f position = bone.getTranslation(new Vector3f());
-            bone = new Matrix4f(headLookExtra).mul(bone).setTranslation(position);
+            Vector3f negPivot = new Vector3f(headPivot).negate();
+            bone = new Matrix4f().translate(headPivot).mul(headLookExtra).translate(negPivot).mul(bone);
         }
         if (rigOrientation != null) {
             element.setTransformation(new Matrix4f(rigOrientation).mul(bone));
@@ -686,15 +766,9 @@ public class WendigoVisual extends ElementHolder {
                 bone.setGlowColorOverride(DEBUG_GLOW_COLOR);
             }
         }
-        for (ItemDisplayElement overlayBone : this.overlayBones.values()) {
-            overlayBone.setGlowing(glowing);
-            if (glowing) {
-                overlayBone.setGlowColorOverride(DEBUG_GLOW_COLOR);
-            }
-        }
-        this.eyes.setGlowing(glowing);
+        this.headGlow.setGlowing(glowing);
         if (glowing) {
-            this.eyes.setGlowColorOverride(DEBUG_GLOW_COLOR);
+            this.headGlow.setGlowColorOverride(DEBUG_GLOW_COLOR);
         }
     }
 
@@ -712,11 +786,16 @@ public class WendigoVisual extends ElementHolder {
     Vec3 getBoneWorldPosition(String bone) {
         float[] matrix;
         if (this.debouncedMoving) {
-            int frame = ((int) this.animationPhase) % WendigoAnimationData.CRAWL_FRAME_COUNT;
-            matrix = WendigoAnimationData.CRAWL.get(bone)[frame];
+            boolean angry = this.owner.isCapturing();
+            Map<String, float[][]> crawlAnimation = angry ? WendigoAnimationData.CRAWL_ANGRY : WendigoAnimationData.CRAWL_NORMAL;
+            int frameCount = angry ? WendigoAnimationData.CRAWL_ANGRY_FRAME_COUNT : WendigoAnimationData.CRAWL_NORMAL_FRAME_COUNT;
+            int frame = ((int) this.animationPhase) % frameCount;
+            matrix = crawlAnimation.get(bone)[frame];
+        } else if (this.owner.isCrawling()) {
+            matrix = WendigoAnimationData.CRAWL_IDLE.get(bone);
         } else {
-            Map<String, float[]> pose = this.owner.isCrawling() ? WendigoAnimationData.CRAWL_IDLE : WendigoAnimationData.REST_POSE;
-            matrix = pose.get(bone);
+            int frame = ((int) this.standAnimationPhase) % WendigoAnimationData.STAND_FRAME_COUNT;
+            matrix = WendigoAnimationData.STAND.get(bone)[frame];
         }
         Matrix4f boneMatrix = RigMatrices.fromRowMajor(matrix);
         Matrix4f world;
@@ -817,14 +896,16 @@ public class WendigoVisual extends ElementHolder {
         return local;
     }
 
-    /** Keeps the eyes overlay locked to the head bone's own transform every frame, in either pose -
-     * see applyBoneTransform for the rigOrientation (wall/ceiling attachment) and headLookExtra
-     * (independent crawl-pose stare/chase tracking) parameters. */
-    private void applyEyes(float[] headMatrix, float yaw, Matrix4f rigOrientation, Matrix4f headLookExtra) {
-        applyBoneTransform(this.eyes, headMatrix, yaw, rigOrientation, headLookExtra);
+    /** Keeps the head-only emissive glow overlay locked to the head bone's own transform every frame,
+     * in every pose - see applyBoneTransform for the rigOrientation (wall/ceiling attachment) and
+     * headLookExtra (independent crawl-pose stare/chase tracking) parameters. */
+    private void applyHeadGlow(float[] headMatrix, float yaw, Matrix4f rigOrientation, Matrix4f headLookExtra, Vector3f headPivot) {
+        applyBoneTransform(this.headGlow, headMatrix, yaw, rigOrientation, headLookExtra, headPivot);
         // Only actually visible-in-the-dark while the entity is mid-stare or actively chasing (see
         // WendigoEntity#isStaring/#isChasing) -- null resets to natural lighting, same as everywhere
-        // else on the rig, the rest of the time.
-        this.eyes.setBrightness((this.owner.isStaring() || this.owner.isChasing()) ? Brightness.FULL_BRIGHT : null);
+        // else on the rig, the rest of the time. Deliberately still isStaring/isChasing, NOT the new
+        // broader isCapturing - the user only asked isCapturing to pick the crawl animation, not to
+        // widen the glow trigger.
+        this.headGlow.setBrightness((this.owner.isStaring() || this.owner.isChasing()) ? Brightness.FULL_BRIGHT : null);
     }
 }

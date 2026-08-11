@@ -21,8 +21,8 @@ public class LlmConfig {
 	// "anthropic" or "openai" - selects which of the two below (model/openaiModel) and which env
 	// var (ANTHROPIC_API_KEY/OPENAI_API_KEY) LlmClient actually uses; the other provider's client
 	// is never constructed, so its key doesn't need to be set at all.
-	public String provider = "openai";
-	public String model = "claude-haiku-4-5"; // used when provider = "anthropic"
+	public String provider = "anthropic";
+	public String model = "claude-haiku-4-5-20251001"; // used when provider = "anthropic"
 	public String openaiModel = "gpt-4o"; // used when provider = "openai"
 	public long maxTokens = 512;
 	public int requestTimeoutSeconds = 30;

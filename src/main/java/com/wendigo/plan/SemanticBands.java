@@ -44,8 +44,31 @@ final class SemanticBands {
 			case "immediate" -> new int[] {0, 10};
 			case "short" -> new int[] {20, 40};
 			case "long" -> new int[] {140, 220};
+			// The user's own explicit "20 seconds or more" request - a real "go dormant for a stretch"
+			// option above long's own 11s ceiling, not just a bigger long.
+			case "very_long" -> new int[] {400, 600};
 			default -> new int[] {60, 100}; // "medium"
 		};
+	}
+
+	/** Classifies an arbitrary elapsed-tick count into the nearest of this same duration ladder, by
+	 * upper bound - used by PlanRunner's control.re_evaluate step log to describe how long an
+	 * already-completed step actually took, not to roll a fresh wait. Monotonic: anything past long's
+	 * own 220-tick ceiling reads as very_long, there's no higher band to fall back to. */
+	static String classifyTicksAsDurationBand(int ticks) {
+		if (ticks <= 10) {
+			return "immediate";
+		}
+		if (ticks <= 40) {
+			return "short";
+		}
+		if (ticks <= 100) {
+			return "medium";
+		}
+		if (ticks <= 220) {
+			return "long";
+		}
+		return "very_long";
 	}
 
 	static int maxIterations(String band) {
@@ -108,14 +131,14 @@ final class SemanticBands {
 		};
 	}
 
-	static final double ARRIVAL_DISTANCE = 2.5;
+	static final double ARRIVAL_DISTANCE = 10;
 	// How close combat.lunge_attack needs to close to before it lands a hit.
-	static final double MELEE_RANGE = 3.0;
+	static final double MELEE_RANGE = 2.0;
 	// How close combat.break_torch needs to reach its target before it breaks it. Was tighter (2.0)
 	// but the pathfinder's actual stopping point near a wall-mounted block routinely landed just
 	// outside that - see isBreakTorchResolved's fallback for the other half of that fix (a clean,
 	// non-failed navigation finish counts as "arrived" regardless of this exact number).
-	static final double TORCH_BREAK_RANGE = 3.0;
+	static final double TORCH_BREAK_RANGE = 2.0;
 	// Safety net so a movement/timing action can never hang the plan forever (e.g. an
 	// unreachable path target) - overridden per-action where a real duration is known.
 	static final int ACTION_TIMEOUT_TICKS = 200;
@@ -128,10 +151,12 @@ final class SemanticBands {
 	// any repositioning a plan actually needs) rather than always having to walk to a chosen spot
 	// first - being farther out by default no longer buys anything, so there's no reason to hold as
 	// wide a ring as before. First pass, adjust by feel.
-	// Pushed 4 blocks further out on both ends (from TIGHT 8-14/NORMAL 12-20/MASSIVE 20-30) per the
-	// user's own explicit "push his orbit rings a bit further out" request - a modest bump, not a
-	// full revert to the old pre-tightening pass documented above. Kept in sync by hand with
-	// WendigoManager's own orbitMinDistance/orbitMaxDistance copy.
+	// Pushed 4 blocks further out on both ends (from TIGHT 8-14/NORMAL 12-20/MASSIVE 20-30), then
+	// pulled back in 4 blocks again (the user's own explicit "push in the orbit distances a little
+	// bit" follow-up, same session) - landing back on the original tightened-pass numbers documented
+	// above, not a coincidence worth re-deriving, just how the two modest same-magnitude adjustments
+	// happened to net out. Kept in sync by hand with WendigoManager's own orbitMinDistance/
+	// orbitMaxDistance copy.
 	static double orbitMinDistance(CaveScale caveScale) {
 		return switch (caveScale) {
 			case TIGHT -> 12.0;
@@ -142,7 +167,7 @@ final class SemanticBands {
 
 	static double orbitMaxDistance(CaveScale caveScale) {
 		return switch (caveScale) {
-			case TIGHT -> 18.0;
+			case TIGHT -> 16.0;
 			case MASSIVE -> 34.0;
 			default -> 24.0; // NORMAL
 		};

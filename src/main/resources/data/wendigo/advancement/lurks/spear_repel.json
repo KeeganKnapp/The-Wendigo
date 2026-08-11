@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/grabbed",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "Meet its charge with a spear, and drive it back. The better your spear, the more likely you'll live to see tomorrow"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:iron_spear"
+    },
+    "title": {
+      "text": "Point Taken"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

@@ -31,7 +31,9 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.WendigoMod;
+import com.wendigo.debug.StareHeadTest;
 import com.wendigo.debug.WendigoDebug;
+import com.wendigo.debug.WendigoDebugItems;
 import com.wendigo.entity.ModEntities;
 import com.wendigo.entity.WendigoEntity;
 import com.wendigo.plan.SchemaBuilder;
@@ -48,19 +50,23 @@ import com.wendigo.spatial.CaveScaleScanner;
  * y&lt;0 dwell time isn't practical to test with. {@code debug} toggles the sender's own debug
  * session (see com.wendigo.debug.WendigoDebug) - chat commentary plus scanned-spot/dim-spot/live-
  * path particles for whatever wave is currently active, plus Night Vision for the duration (removed
- * when toggled back off). {@code runs get/set} reads or
+ * when toggled back off), plus a one-time grant of the three WendigoDebugItems testing tools (bug
+ * bookmark, stage-5 spawner, tracked-spider summoner). {@code runs get/set} reads or
  * directly overrides a player's completed-run count (which stage that puts them at), for jumping
  * straight to a given stage instead of grinding out real encounters. {@code startrun} skips the
  * 2000-tick eligibility wait for a fresh or already-active run - still needs the target to actually
  * be under y=0 for it to pick up. {@code reset} discards the current wave and its cooldown so a fresh
  * {@code wave}/{@code wavetest} can fire right away instead of waiting for the current one to finish.
- * {@code summon all/base/growth/eyes} spawns a stationary, staring dummy in front of the caller with
+ * {@code summon all/base/eyes} spawns a stationary, staring dummy in front of the caller with
  * only the requested rig layer (or all of them, stacked normally) given real items, for inspecting
  * how each texture lines up on the model in isolation. {@code headoffset} (no args) reports the
  * current standing rest-pose head-yaw correction override, {@code headoffset <degrees>} sets it, and
  * {@code headoffset reset} clears it back to the default - live-tunable so the right value can be
- * found by eye instead of a rebuild-and-restart per guess. {@code crawlpitch}/{@code climbpitch}
- * toggle the flat-floor/climbing crawl-tracking head pitch negation the same way.
+ * found by eye instead of a rebuild-and-restart per guess. {@code trackheadoffset} is the same idea
+ * for the separate active-tracking (stare/chase, crawl pose, floor) head-yaw correction instead, and
+ * {@code climbheadoffset} the same again for active-tracking while climbing (wall/ceiling/slope).
+ * {@code crawlpitch}/{@code climbpitch} toggle the flat-floor/climbing crawl-tracking head pitch
+ * negation the same way.
  */
 public final class WendigoCommands {
 	private static final String DEFAULT_SCENARIO =
@@ -69,7 +75,6 @@ public final class WendigoCommands {
 	private static final String DEFAULT_TEST_PLAN_FILE = "test-plan.json";
 	private static final String DEFAULT_TEST_PLAN_CONTENT = """
 	{
-	"spawn_at": "close_as_possible",
 	"plan": [
 	{ "type": "movement.approach_band", "band": "close", "speed": "slow" },
 	{ "type": "posture.stare", "enabled": true },
@@ -119,19 +124,23 @@ public final class WendigoCommands {
 							StringArgumentType.getString(ctx, "file"))))))
 			.then(Commands.literal("debug")
 				.executes(ctx -> toggleDebug(ctx.getSource())))
+			.then(Commands.literal("verbose")
+				.executes(ctx -> toggleVerbose(ctx.getSource())))
 			.then(Commands.literal("orbit")
 				.executes(ctx -> forceOrbit(ctx.getSource(), ctx.getSource().getPlayerOrException()))
 				.then(Commands.argument("target", EntityArgument.player())
 					.executes(ctx -> forceOrbit(ctx.getSource(), EntityArgument.getPlayer(ctx, "target")))))
 			.then(Commands.literal("headtest")
-				.executes(ctx -> spawnHeadTrackingTest(ctx.getSource())))
+				.executes(ctx -> spawnHeadTrackingTest(ctx.getSource()))
+				.then(Commands.literal("stare")
+					.executes(ctx -> spawnStareHeadTest(ctx.getSource()))
+					.then(Commands.literal("stop")
+						.executes(ctx -> stopStareHeadTest(ctx.getSource())))))
 			.then(Commands.literal("summon")
 				.then(Commands.literal("all")
 					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.ALL, "all")))
 				.then(Commands.literal("base")
 					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.BASE_ONLY, "base")))
-				.then(Commands.literal("growth")
-					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.GROWTH_ONLY, "growth")))
 				.then(Commands.literal("eyes")
 					.executes(ctx -> spawnTexturePreview(ctx.getSource(), WendigoEntity.TexturePreviewMode.EYES_ONLY, "eyes"))))
 			.then(Commands.literal("reset")
@@ -142,6 +151,18 @@ public final class WendigoCommands {
 					.executes(ctx -> resetHeadOffset(ctx.getSource())))
 				.then(Commands.argument("degrees", IntegerArgumentType.integer(-360, 360))
 					.executes(ctx -> setHeadOffset(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "degrees")))))
+			.then(Commands.literal("trackheadoffset")
+				.executes(ctx -> reportTrackHeadOffset(ctx.getSource()))
+				.then(Commands.literal("reset")
+					.executes(ctx -> resetTrackHeadOffset(ctx.getSource())))
+				.then(Commands.argument("degrees", IntegerArgumentType.integer(-360, 360))
+					.executes(ctx -> setTrackHeadOffset(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "degrees")))))
+			.then(Commands.literal("climbheadoffset")
+				.executes(ctx -> reportClimbTrackHeadOffset(ctx.getSource()))
+				.then(Commands.literal("reset")
+					.executes(ctx -> resetClimbTrackHeadOffset(ctx.getSource())))
+				.then(Commands.argument("degrees", IntegerArgumentType.integer(-360, 360))
+					.executes(ctx -> setClimbTrackHeadOffset(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "degrees")))))
 			.then(Commands.literal("crawlpitch")
 				.executes(ctx -> toggleCrawlPitch(ctx.getSource())))
 			.then(Commands.literal("climbpitch")
@@ -176,10 +197,23 @@ public final class WendigoCommands {
 		boolean nowEnabled = WendigoDebug.toggle(player);
 		if (nowEnabled) {
 			player.addEffect(new MobEffectInstance(MobEffects.NIGHT_VISION, DEBUG_NIGHT_VISION_DURATION_TICKS, 0, true, true));
+			WendigoDebugItems.giveDebugItems(player);
 		} else {
 			player.removeEffect(MobEffects.NIGHT_VISION);
 		}
 		source.sendSystemMessage(Component.literal("[wendigo] Debug mode " + (nowEnabled ? "enabled" : "disabled") + "."));
+		return 1;
+	}
+
+	/** See WendigoDebug.verboseEnabled's own doc comment - the per-tick diagnostic dumps (WDIAG,
+	 * PATH_NODES, CHASE_REPATH, NEARBY_SURFACES, FLOOR_COLUMN, ONGROUND_TRANSITION) and PlanRunner's
+	 * own high-volume chat commentary, both quieted by default now. Server-wide, not per-player, same
+	 * as crawlpitch/climbpitch above - unlike the main debug toggle, this doesn't gate whether a
+	 * session exists at all, just how much it says once one does. */
+	private static int toggleVerbose(CommandSourceStack source) {
+		boolean nowEnabled = !WendigoDebug.verboseEnabled();
+		WendigoDebug.setVerbose(nowEnabled);
+		source.sendSystemMessage(Component.literal("[wendigo] Verbose debug output " + (nowEnabled ? "enabled." : "disabled.")));
 		return 1;
 	}
 
@@ -204,6 +238,53 @@ public final class WendigoCommands {
 		float current = WendigoDebug.getStandingHeadYawOverride();
 		source.sendSystemMessage(Component.literal("[wendigo] Standing head-yaw override: "
 			+ (Float.isNaN(current) ? "none (using the default)" : (current + " degrees"))));
+		return 1;
+	}
+
+	/** Same idea as {@link #setHeadOffset}/{@link #resetHeadOffset}/{@link #reportHeadOffset}, for the
+	 * active-tracking (stare/chase, crawl pose, on the floor) head-yaw correction instead - see
+	 * WendigoVisual.onTick's own headLookYawDelta computation. Stand a wendigo in front of you and
+	 * make it chase/stare (e.g. `/wendigo headtest stare` or a real chase) to dial this one in, since
+	 * it only applies while actively tracking, unlike the standing-rest-pose override above. */
+	private static int setTrackHeadOffset(CommandSourceStack source, int degrees) {
+		WendigoDebug.setTrackingHeadYawOverride(degrees);
+		source.sendSystemMessage(Component.literal("[wendigo] Active-tracking head-yaw override set to " + degrees + " degrees."));
+		return degrees;
+	}
+
+	private static int resetTrackHeadOffset(CommandSourceStack source) {
+		WendigoDebug.clearTrackingHeadYawOverride();
+		source.sendSystemMessage(Component.literal("[wendigo] Active-tracking head-yaw override cleared - back to the default."));
+		return 1;
+	}
+
+	private static int reportTrackHeadOffset(CommandSourceStack source) {
+		float current = WendigoDebug.getTrackingHeadYawOverride();
+		source.sendSystemMessage(Component.literal("[wendigo] Active-tracking head-yaw override: "
+			+ (Float.isNaN(current) ? "none (using the default)" : (current + " degrees"))));
+		return 1;
+	}
+
+	/** Same idea again, for the CLIMBING (wall/ceiling/slope) active-tracking head-yaw correction -
+	 * see WendigoVisual.onTick's climbTrackingCorrectionDegrees. Get a wendigo staring/chasing while
+	 * attached to a wall, ceiling, or slope to dial this one in - unlike the other two head-yaw
+	 * overrides, there's no confirmed-correct value here yet, only a confirmed-wrong default (0). */
+	private static int setClimbTrackHeadOffset(CommandSourceStack source, int degrees) {
+		WendigoDebug.setClimbTrackingHeadYawOverride(degrees);
+		source.sendSystemMessage(Component.literal("[wendigo] Climbing active-tracking head-yaw override set to " + degrees + " degrees."));
+		return degrees;
+	}
+
+	private static int resetClimbTrackHeadOffset(CommandSourceStack source) {
+		WendigoDebug.clearClimbTrackingHeadYawOverride();
+		source.sendSystemMessage(Component.literal("[wendigo] Climbing active-tracking head-yaw override cleared - back to the default (0)."));
+		return 1;
+	}
+
+	private static int reportClimbTrackHeadOffset(CommandSourceStack source) {
+		float current = WendigoDebug.getClimbTrackingHeadYawOverride();
+		source.sendSystemMessage(Component.literal("[wendigo] Climbing active-tracking head-yaw override: "
+			+ (Float.isNaN(current) ? "none (using the default, 0)" : (current + " degrees"))));
 		return 1;
 	}
 
@@ -356,7 +437,7 @@ public final class WendigoCommands {
 		level.setBlockAndUpdate(new BlockPos(x, baseY, baseZ), Blocks.STONE.defaultBlockState());
 	}
 
-	private static void spawnHeadTestWendigo(ServerLevel level, int x, int y, int z, float yaw, Direction normal,
+	private static WendigoEntity spawnHeadTestWendigo(ServerLevel level, int x, int y, int z, float yaw, Direction normal,
 			boolean chasing, String label) {
 		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
 		wendigo.snapTo(x + 0.5, y, z + 0.5, yaw, 0f);
@@ -369,6 +450,7 @@ public final class WendigoCommands {
 		}
 		level.addFreshEntity(wendigo);
 		WendigoMod.LOGGER.info("[wendigo] headtest spawned {} at {},{},{} yaw={}", label, x, y, z, yaw);
+		return wendigo;
 	}
 
 	/** Spawns on the outward top/south corner of buildInclineCorner's step block - a genuinely
@@ -392,15 +474,67 @@ public final class WendigoCommands {
 		WendigoMod.LOGGER.info("[wendigo] headtest spawned {} at {},{},{}", label, x, y, z);
 	}
 
+	/** /wendigo headtest stare - the user's own explicit "we need the test to also actually be a
+	 * command that we can summon dummies with so I can look at their head and see if our head
+	 * obstruction + stare logic is correct" request: an in-game, walk-around-able sibling of
+	 * WendigoGameTests' own stareHeadVisibilityPrintsWhileStanding/WhileCrawling. Spawns two
+	 * stationary dummies (standing in the open, crawling under a dropped low ceiling - same
+	 * buildHeadTestTunnel/carveLowCeiling rig spawnHeadTrackingTest already uses, just two slots
+	 * instead of the full lineup) and hands them to StareHeadTest.start, which then keeps the
+	 * caller's own action bar updated with live PlanPredicates.isLookingAtSelf(..., "dead_stare")
+	 * results for each one every 10 ticks - walk around, behind cover, etc. and watch it update. */
+	private static final List<HeadTestSlot> STARE_HEADTEST_SLOTS = List.of(
+		new HeadTestSlot("stare test - standing", Direction.UP, true, YAW_SOUTH, false),
+		new HeadTestSlot("stare test - crawling", Direction.UP, true, YAW_SOUTH, true));
+
+	private static int spawnStareHeadTest(CommandSourceStack source) throws CommandSyntaxException {
+		ServerPlayer player = source.getPlayerOrException();
+		ServerLevel level = source.getLevel();
+
+		BlockPos playerPos = player.blockPosition();
+		int baseX = playerPos.getX() + 3;
+		int baseY = playerPos.getY();
+		int baseZ = playerPos.getZ();
+		int length = HEADTEST_SLOT_SPACING * STARE_HEADTEST_SLOTS.size() + 1;
+
+		buildHeadTestTunnel(level, baseX, baseY, baseZ, length);
+		carveLowCeiling(level, baseX, baseY, baseZ, STARE_HEADTEST_SLOTS);
+
+		WendigoEntity standing = spawnHeadTestWendigo(level, baseX, baseY, baseZ,
+			STARE_HEADTEST_SLOTS.get(0).yaw(), STARE_HEADTEST_SLOTS.get(0).normal(),
+			STARE_HEADTEST_SLOTS.get(0).chasing(), STARE_HEADTEST_SLOTS.get(0).label());
+		WendigoEntity crawling = spawnHeadTestWendigo(level, baseX + HEADTEST_SLOT_SPACING, baseY, baseZ,
+			STARE_HEADTEST_SLOTS.get(1).yaw(), STARE_HEADTEST_SLOTS.get(1).normal(),
+			STARE_HEADTEST_SLOTS.get(1).chasing(), STARE_HEADTEST_SLOTS.get(1).label());
+
+		StareHeadTest.start(player, standing, crawling);
+		player.teleportTo(baseX - 2 + 0.5, baseY, baseZ + 1.5);
+
+		source.sendSystemMessage(Component.literal("[wendigo] Stare head-visibility test rig built at "
+			+ baseX + "," + baseY + "," + baseZ + " - a standing dummy and (" + HEADTEST_SLOT_SPACING
+			+ " blocks over) a crawling one. Your action bar now shows live dead_stare status for each "
+			+ "as you look around/walk behind cover - run '/wendigo headtest stare stop' to end it."));
+		return 1;
+	}
+
+	private static int stopStareHeadTest(CommandSourceStack source) throws CommandSyntaxException {
+		ServerPlayer player = source.getPlayerOrException();
+		boolean wasActive = StareHeadTest.stop(player);
+		source.sendSystemMessage(Component.literal(wasActive
+			? "[wendigo] Stare head-visibility test session ended."
+			: "[wendigo] No active stare head-visibility test session to stop."));
+		return 1;
+	}
+
 	// How far in front of the player (along their own facing) a texture-preview dummy spawns.
 	private static final double TEXTURE_PREVIEW_SPAWN_DISTANCE = 3.0;
 
 	/** Spawns one stationary, staring wendigo a few blocks in front of the caller with only the
 	 * requested rig layer(s) given real items - see WendigoEntity.TexturePreviewMode's own comment.
-	 * "all" is the normal stacked appearance; "base"/"growth"/"eyes" isolate one texture at a time
-	 * so it can be inspected without the other two layers drawn over it. Forces staring on so the
-	 * whole rig turns to face the caller and the eyes layer (which only lights up while
-	 * staring/chasing) is actually visible rather than reading as pitch black. */
+	 * "all" is the normal stacked appearance; "base"/"eyes" isolate one texture at a time so it can be
+	 * inspected without the other layer drawn over it. Forces staring on so the whole rig turns to
+	 * face the caller and the eyes layer (which only lights up while staring/chasing) is actually
+	 * visible rather than reading as pitch black. */
 	private static int spawnTexturePreview(CommandSourceStack source, WendigoEntity.TexturePreviewMode mode, String label)
 			throws CommandSyntaxException {
 		ServerPlayer player = source.getPlayerOrException();
@@ -587,9 +721,8 @@ public final class WendigoCommands {
 
 		var server = source.getServer();
 		// Raw connectivity test, not tied to any player/severity - full unfiltered schema (TIGHT
-		// unlocks close_as_possible too, torchSpawnAvailable=true unlocks spawn_on_torch too,
-		// maximizing schema coverage for this test).
-		WendigoMod.llmClient.requestPlan(systemPrompt, scenario, SchemaBuilder.forSeverity(100, CaveScaleScanner.CaveScale.TIGHT, true))
+		// unlocks close_as_possible too, maximizing schema coverage for this test).
+		WendigoMod.llmClient.requestPlan(systemPrompt, scenario, SchemaBuilder.forSeverity(100, CaveScaleScanner.CaveScale.TIGHT))
 			.whenComplete((plan, error) -> server.execute(() -> {
 				if (error != null) {
 					source.sendFailure(Component.literal("[wendigo] LLM request failed: " + error.getMessage()));

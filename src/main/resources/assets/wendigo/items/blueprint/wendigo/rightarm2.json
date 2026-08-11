@@ -3,7 +3,14 @@
 		"type": "minecraft:model",
 		"model": "wendigo:blueprint/wendigo/rightarm2",
 		"tints": [
-			{"type": "minecraft:dye", "default": [1, 1, 1]}
+			{
+				"type": "minecraft:dye",
+				"default": [
+					1,
+					1,
+					1
+				]
+			}
 		]
 	}
 }

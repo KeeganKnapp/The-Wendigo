@@ -27,7 +27,7 @@ import net.minecraft.world.level.pathfinder.Node;
  */
 final class DarknessMalus {
 	// Below this, no penalty at all - fully dark, ideal.
-	private static final int IDEAL_LIGHT_MAX = 1;
+	private static final int IDEAL_LIGHT_MAX = 2;
 	// 2-4: "can manage" - a mild, linearly growing penalty.
 	private static final int MANAGEABLE_LIGHT_MAX = 4;
 	private static final float MANAGEABLE_MALUS_PER_LEVEL = 3.0F;
@@ -41,6 +41,12 @@ final class DarknessMalus {
 	// Cobwebs get an even heavier flat penalty than the worst light case - getting physically stuck
 	// is a worse outcome than being briefly lit, so this should almost always lose to any detour.
 	private static final float COBWEB_MALUS = 150.0F;
+	// Heavier still than COBWEB_MALUS - see apply's own comment for why this is a malus at all now
+	// (was a hard exclusion) - getting completely stranded with zero viable neighbors after an
+	// accidental fall onto dripstone is an even worse outcome than a cobweb tangle, so this should
+	// lose to literally any other detour, however long, while still remaining crossable as a genuine
+	// last resort.
+	private static final float POINTED_DRIPSTONE_MALUS = 250.0F;
 	// The user's own explicit "40% penalty" request for ceiling pathfinding specifically (walls are
 	// deliberately exempt - see apply's own check - matching WendigoEntity's own pitch-ramped speed
 	// penalty, which likewise only applies past a dead-on wall toward a ceiling), so the wendigo
@@ -54,7 +60,7 @@ final class DarknessMalus {
 	// (those are large deliberately, to all but forbid crossing genuinely lit ground; this is meant
 	// to be a soft, easily-outweighed tiebreaker instead, since a whole climbing ROUTE accumulates
 	// this once per step, not once total).
-	private static final float CLIMBING_MALUS = 0.5F;
+	private static final float CLIMBING_MALUS = 0.0F;
 
 	// Below this severity, a route through anything brighter than EDGE_LIGHT (5, the same "spawn
 	// limit" DarkSpotScanner.MAX_DARK_LIGHT uses) doesn't exist as far as pathfinding is concerned at
@@ -105,6 +111,15 @@ final class DarknessMalus {
 	// normal finite malus so it can still find its way back to real darkness.
 	private int startLight;
 
+	// Per-search diagnostic counters - live-testing the chase-repath-glitch investigation needs to
+	// know whether THIS class (not AWCAPI's own search, which has no concept of light at all and so
+	// can't be the explanation on its own) is starving the candidate pool during a specific degenerate
+	// repath. Reset in prepare(), read (and logged, by the caller) via the getters after done().
+	private int lightExcludedCount;
+	private int waterExcludedCount;
+	private int keptCount;
+	private float maxKeptMalus;
+
 	void setLightTolerant(boolean lightTolerant) {
 		this.lightTolerant = lightTolerant;
 	}
@@ -117,11 +132,31 @@ final class DarknessMalus {
 	void prepare(Mob mob) {
 		this.nodeMalusApplied.clear();
 		this.startLight = mob.level().getMaxLocalRawBrightness(mob.blockPosition());
+		this.lightExcludedCount = 0;
+		this.waterExcludedCount = 0;
+		this.keptCount = 0;
+		this.maxKeptMalus = 0.0F;
 	}
 
 	/** Call from the evaluator's own done(), before super.done(). */
 	void done() {
 		this.nodeMalusApplied.clear();
+	}
+
+	int getLightExcludedCount() {
+		return this.lightExcludedCount;
+	}
+
+	int getWaterExcludedCount() {
+		return this.waterExcludedCount;
+	}
+
+	int getKeptCount() {
+		return this.keptCount;
+	}
+
+	float getMaxKeptMalus() {
+		return this.maxKeptMalus;
 	}
 
 	/**
@@ -169,6 +204,25 @@ final class DarknessMalus {
 				}
 				if (mob.level().getBlockState(pos).is(Blocks.COBWEB)) {
 					malus += COBWEB_MALUS;
+				}
+				// Was a genuine unconditional exclusion (same shape as the water-source check above),
+				// added after an earlier live report: the wendigo got stuck standing on one (likely
+				// walked/forced onto an upward-pointing stalagmite acting as an ad-hoc floor) and
+				// couldn't path away from it, resolving itself only once the block was broken.
+				// Downgraded to a heavy-but-finite malus instead after a NEW live report: falling onto
+				// pointed dripstone from the ceiling (physics, not deliberate pathing) left it with
+				// ZERO viable neighbors at all - every real escape route also touched dripstone
+				// somewhere, and unlike a deliberate walk-in, there's no way to guarantee an unblocked
+				// route exists once already standing there by accident. A hard exclusion can strand an
+				// entity that GENUINELY has no other option; a large-but-finite malus (matching COBWEB's
+				// own "large-but-finite, not BLOCKED" reasoning exactly) lets the pathfinder still route
+				// through it as an absolute last resort while continuing to avoid it whenever any other
+				// path exists - checked both ways, same as the exclusion it replaces: pos itself (a
+				// downward-pointing stalactite occupying the candidate space) and pos.below() (an
+				// upward-pointing stalagmite being treated as a floor, the original reported scenario).
+				if (mob.level().getBlockState(pos).is(Blocks.POINTED_DRIPSTONE)
+						|| mob.level().getBlockState(pos.below()).is(Blocks.POINTED_DRIPSTONE)) {
+					malus += POINTED_DRIPSTONE_MALUS;
 				}
 				// Solid ground directly beneath is a genuine floor node (or a legitimate multi-block
 				// drop's own landing spot, which always resolves to one of these too - see

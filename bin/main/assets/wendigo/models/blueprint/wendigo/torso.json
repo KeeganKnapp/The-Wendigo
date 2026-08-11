@@ -1,6 +1,6 @@
 {
 	"textures": {
-		"1": "wendigo:blueprint/wendigo/texture_e",
+		"1": "wendigo:blueprint/wendigo/texture",
 		"particle": "minecraft:item/pufferfish"
 	},
 	"display": {

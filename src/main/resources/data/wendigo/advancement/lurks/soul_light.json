@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/grabbed",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "Find shelter in the glow of a soul light, deep below. Larger soul light sources yield better protection"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:soul_lantern"
+    },
+    "title": {
+      "text": "Consecrated Ground"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

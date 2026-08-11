@@ -3,15 +3,25 @@ package com.wendigo.spatial;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.BiPredicate;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+
+import com.wendigo.block.SnuffedTorchBlock;
+import com.wendigo.block.SnuffedWallTorchBlock;
+import com.wendigo.block.WendigoBlocks;
 
 /**
  * Finds light-emitting blocks (torches, lanterns, etc.) near an origin - the counterpart to
@@ -43,6 +53,23 @@ public final class LightSourceScanner {
 	 * radii/angles are what give this reasonable coverage.
 	 */
 	public static List<BlockPos> findLightSources(Level level, BlockPos origin, double maxRadius, int count) {
+		return findLightSources(level, origin, maxRadius, count, LightSourceScanner::isBreakableLightSource);
+	}
+
+	/** isSnuffableLightSource's own scan - a real light source the wendigo will actually SNUFF rather
+	 * than fully destroy (see snuffByWendigo) - torch-family or candle-family only, a narrower subset
+	 * of findLightSources' own broad "any non-full-block emitter" scope. Deliberately a SEPARATE scan,
+	 * not a filter layered on top of findLightSources' own results - lanterns/everything else must stay
+	 * fully untouched by anything this feeds (combat.break_torch's targeting, the passive chase-
+	 * collateral destruction), while findLightSources itself keeps its existing broad behavior
+	 * unchanged for its other callers (DarkSpotScanner's torch-count prompt context, spawn_on_torch
+	 * candidate scanning). */
+	public static List<BlockPos> findSnuffableLightSources(Level level, BlockPos origin, double maxRadius, int count) {
+		return findLightSources(level, origin, maxRadius, count, LightSourceScanner::isSnuffableLightSource);
+	}
+
+	private static List<BlockPos> findLightSources(Level level, BlockPos origin, double maxRadius, int count,
+			BiPredicate<Level, BlockPos> isTarget) {
 		List<BlockPos> found = new ArrayList<>();
 		double[] radii = {5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0};
 
@@ -55,7 +82,7 @@ public final class LightSourceScanner {
 				int dx = (int) Math.round(Math.cos(angle) * radius);
 				int dz = (int) Math.round(Math.sin(angle) * radius);
 				BlockPos seed = origin.offset(dx, 0, dz);
-				BlockPos source = climbLightSource(level, seed);
+				BlockPos source = climbLightSource(level, seed, isTarget);
 				if (source != null && found.stream().noneMatch(p -> p.distSqr(source) < MIN_SEPARATION_SQR)) {
 					found.add(source);
 				}
@@ -69,43 +96,122 @@ public final class LightSourceScanner {
 	}
 
 	/**
-	 * Destroys a light source the wendigo itself is responsible for (combat.break_torch,
-	 * combat.chase's passive collateral, or a torch-linked spawn spot) - dropBlock=true, so it just
-	 * drops itself as an ordinary item the same way a player breaking it would (torch, lantern,
-	 * copper lantern/torch at whichever oxidation stage, redstone torch, etc. all just work via
-	 * vanilla's own normal loot resolution - no manual substitution needed). Used to replace a real
-	 * torch's own drop with a flavor-appropriate coal+stick "salvaged the parts" pair instead of its
-	 * real drop - removed per explicit request, everything just drops itself now.
+	 * Destroys a light source the wendigo itself is responsible for (torches/lanterns/etc. outside the
+	 * snuffable scope, or a torch-linked spawn spot) - dropBlock=true, so it just drops itself as an
+	 * ordinary item the same way a player breaking it would. Still used as-is for anything
+	 * findSnuffableLightSources doesn't cover.
 	 */
 	public static void destroyByWendigo(ServerLevel level, BlockPos pos, Entity source) {
 		level.destroyBlock(pos, true, source, 512);
 	}
 
+	// The user's own explicit request, matching /playsound minecraft:block.redstone_torch.burnout block
+	// @a ~ ~ ~ 0.5 2 exactly (volume 0.5, pitch 2) - played once at pos for every real snuff (not the
+	// destroyByWendigo fallback below, which isn't a snuff at all).
+	private static void playSnuffSound(ServerLevel level, BlockPos pos) {
+		level.playSound(null, pos, SoundEvents.REDSTONE_TORCH_BURNOUT, SoundSource.BLOCKS, 0.5F, 2.0F);
+	}
+
+	/**
+	 * Replaces a torch/candle at pos with its snuffed (unlit, light level 0, still physically present)
+	 * form instead of destroying it - candles just get their own real LIT property flipped off in
+	 * place (a real, already-existing vanilla state - see AbstractCandleBlock), torches get replaced
+	 * with the matching one of WendigoBlocks' 8 SnuffedTorchBlock/SnuffedWallTorchBlock instances
+	 * (preserving FACING for the wall case), remembering the exact real family so a later
+	 * flint-and-steel relight or a plain break recovers the right item. Callers are expected to have
+	 * already found pos via findSnuffableLightSources, so both branches below should always match one
+	 * of the two families in practice - falls back to destroyByWendigo if somehow neither does, rather
+	 * than silently doing nothing to a light source the caller clearly intended to act on.
+	 */
+	public static void snuffByWendigo(ServerLevel level, BlockPos pos, Entity source) {
+		BlockState state = level.getBlockState(pos);
+		if (state.is(BlockTags.CANDLES) || state.is(BlockTags.CANDLE_CAKES)) {
+			level.setBlock(pos, state.setValue(BlockStateProperties.LIT, false), Block.UPDATE_ALL);
+			playSnuffSound(level, pos);
+			return;
+		}
+		Block snuffed = WendigoBlocks.snuffedFor(state.getBlock());
+		if (snuffed instanceof SnuffedWallTorchBlock wallTorch) {
+			level.setBlock(pos, wallTorch.defaultBlockState()
+				.setValue(SnuffedWallTorchBlock.FACING, state.getValue(BlockStateProperties.HORIZONTAL_FACING)),
+				Block.UPDATE_ALL);
+			playSnuffSound(level, pos);
+			return;
+		}
+		if (snuffed != null) {
+			level.setBlock(pos, snuffed.defaultBlockState(), Block.UPDATE_ALL);
+			playSnuffSound(level, pos);
+			return;
+		}
+		destroyByWendigo(level, pos, source);
+	}
+
+	/**
+	 * Reverses snuffByWendigo - restores a still-snuffed torch/candle at pos back to its real lit form,
+	 * the same state a player's own flint-and-steel relight would produce (see
+	 * SnuffedTorchBlock/SnuffedWallTorchBlock.useItemOn, which this mirrors exactly), just triggered by
+	 * the engine instead of a player interaction. No-op if pos no longer holds a snuffed instance (a
+	 * player broke it, relit it themselves, or replaced it with something else in the meantime, or a
+	 * candle that's already lit) - nothing left here for the caller's relight queue to do.
+	 */
+	public static void relightByWendigo(ServerLevel level, BlockPos pos) {
+		BlockState state = level.getBlockState(pos);
+		if (state.getBlock() instanceof SnuffedWallTorchBlock wallTorch) {
+			level.setBlock(pos, wallTorch.relightBlock().defaultBlockState()
+				.setValue(BlockStateProperties.HORIZONTAL_FACING, state.getValue(SnuffedWallTorchBlock.FACING)),
+				Block.UPDATE_ALL);
+			return;
+		}
+		if (state.getBlock() instanceof SnuffedTorchBlock torch) {
+			level.setBlock(pos, torch.relightBlock().defaultBlockState(), Block.UPDATE_ALL);
+			return;
+		}
+		if ((state.is(BlockTags.CANDLES) || state.is(BlockTags.CANDLE_CAKES)) && !state.getValue(BlockStateProperties.LIT)) {
+			level.setBlock(pos, state.setValue(BlockStateProperties.LIT, true), Block.UPDATE_ALL);
+		}
+	}
+
 	/** True for any light-emitting block combat.break_torch/the passive chase-destruction/torch-
-	 * linked-spawn machinery is allowed to target - light-emitting (getLightEmission() > 0), NOT a
-	 * full block (isCollisionShapeFullBlock - excludes glowstone, sea lanterns, shroomlight, redstone
-	 * lamps, jack o'lanterns and the like, matching the user's own explicit "isn't a full block"
-	 * scope), and explicitly not an end rod even though its own collision shape also isn't a full
-	 * block (the one carve-out the user asked for). Covers standing/wall/soul torches, copper torches
-	 * at every oxidation stage, lanterns and copper lanterns at every oxidation stage, and redstone
-	 * torches all for free - no per-block-type allowlist needed, just the two shape-based rules. */
+	 * linked-spawn machinery is allowed to target for full destruction (findLightSources' own scope) -
+	 * light-emitting (getLightEmission() > 0), NOT a full block (isCollisionShapeFullBlock - excludes
+	 * glowstone, sea lanterns, shroomlight, redstone lamps, jack o'lanterns and the like, matching the
+	 * user's own explicit "isn't a full block" scope), and explicitly not an end rod or glow lichen even
+	 * though both also have a non-full-block collision shape (the carve-outs the user asked for - glow
+	 * lichen in particular isn't a placed light source the way a torch/lantern is, it's a naturally-
+	 * spreading cave decoration, so "break the torch" reads wrong applied to it). Covers standing/wall/
+	 * soul torches, copper torches at every oxidation stage, lanterns and copper lanterns at every
+	 * oxidation stage, and redstone torches all for free - no per-block-type allowlist needed, just the
+	 * shape-based rule plus these two carve-outs. Also still backs DarkSpotScanner's torch-count prompt
+	 * context and spawn_on_torch candidate scanning (via findLightSources) - deliberately untouched by
+	 * the narrower snuffable scope below, which only governs what the wendigo will actually SNUFF. */
 	private static boolean isBreakableLightSource(Level level, BlockPos pos) {
 		BlockState state = level.getBlockState(pos);
 		return state.getLightEmission() > 0
 			&& !state.isCollisionShapeFullBlock(level, pos)
-			&& !state.is(Blocks.END_ROD);
+			&& !state.is(Blocks.END_ROD)
+			&& !state.is(Blocks.GLOW_LICHEN);
+	}
+
+	/** True only for the 8 real torch blocks WendigoBlocks knows how to snuff (torch/soul_torch/
+	 * copper_torch/redstone_torch, standing + wall) or a candle/candle-cake block (BlockTags.CANDLES/
+	 * CANDLE_CAKES) - see snuffByWendigo. Deliberately much narrower than isBreakableLightSource (see
+	 * findSnuffableLightSources' own doc comment for why lanterns and everything else stay out of this
+	 * one specifically). */
+	private static boolean isSnuffableLightSource(Level level, BlockPos pos) {
+		BlockState state = level.getBlockState(pos);
+		return WendigoBlocks.snuffedFor(state.getBlock()) != null
+			|| state.is(BlockTags.CANDLES) || state.is(BlockTags.CANDLE_CAKES);
 	}
 
 	/**
 	 * Greedily steps to whichever of the 6 face-neighbors has strictly higher block light than the
 	 * current position, repeating until no neighbor is brighter (a local maximum). Returns that
-	 * position if it's an actual breakable light source (see isBreakableLightSource), or null if the
-	 * climb dead-ended on a bright spot that isn't one (e.g. it wandered toward a lit but non-
-	 * emissive area, or landed on a full-block source/end rod, neither of which is a valid target
-	 * here). Block light is bounded 0-15 and each step strictly increases it, so this always
-	 * terminates.
+	 * position if it's an actual target per isTarget, or null if the climb dead-ended on a bright spot
+	 * that isn't one (e.g. it wandered toward a lit but non-emissive area, or landed on a full-block
+	 * source/end rod, neither of which is a valid target here). Block light is bounded 0-15 and each
+	 * step strictly increases it, so this always terminates.
 	 */
-	static BlockPos climbLightSource(Level level, BlockPos start) {
+	private static BlockPos climbLightSource(Level level, BlockPos start, BiPredicate<Level, BlockPos> isTarget) {
 		BlockPos current = start;
 
 		while (true) {
@@ -124,7 +230,7 @@ public final class LightSourceScanner {
 			}
 
 			if (best.equals(current)) {
-				return isBreakableLightSource(level, best) && hasPassableNeighbor(level, best)
+				return isTarget.test(level, best) && hasPassableNeighbor(level, best)
 					? current : null;
 			}
 			current = best;

@@ -49,7 +49,7 @@ public final class DarkSpotScanner {
 	// instead of a technically-darkest-but-still-lit one. Separate from the stricter
 	// SemanticBands.DARKNESS_LIGHT_THRESHOLD (self_in_darkness) - this is "acceptable to spawn/
 	// despawn/hide at", not "fully hidden". Public so PlanRunner can reuse it as the exact same bar
-	// for "is it OK to actually finish despawning here" - see PlanRunner.readyToVanish.
+	// for "is it OK to actually finish despawning here" - see PlanRunner.readyToWithdraw.
 	public static final int MAX_DARK_LIGHT = 4;
 
 	/**
@@ -107,6 +107,57 @@ public final class DarkSpotScanner {
 			if (light <= MAX_DARK_LIGHT && light < bestLight) {
 				bestLight = light;
 				best = candidate;
+			}
+		}
+		return best;
+	}
+
+	// combat.teleport_ahead's own target band - the user's own explicit "1-2 lightlevel... more
+	// likely to be close to a light, since the player is more likely to path through light" reasoning:
+	// unlike every other search in this class (which wants the DARKEST candidate, capped at
+	// MAX_DARK_LIGHT), this one deliberately wants a MILDLY lit spot instead, on the theory that a
+	// player's own real route is more likely to run near their own placed torches than through
+	// genuine total darkness - landing exactly there reads as lying in wait along their actual path,
+	// not teleporting to a random dark pocket that happens to be nearby but off their route.
+	private static final int PREDICTED_PATH_DIM_LIGHT_MIN = 1;
+	private static final int PREDICTED_PATH_DIM_LIGHT_MAX = 2;
+	private static final double PREDICTED_PATH_RADIUS_STEP = 4.0;
+
+	/**
+	 * combat.teleport_ahead's own resolver: searches expanding rings out to maxRadius around origin
+	 * (the player's own predicted position, not their current one - see PlanRunner's own extrapolation)
+	 * for the standable column whose light level sits closest to [PREDICTED_PATH_DIM_LIGHT_MIN,
+	 * PREDICTED_PATH_DIM_LIGHT_MAX] - a score of 0 if it's already in that range, otherwise the
+	 * distance (in light levels) to the nearest edge of it. Ties broken by real distance from origin
+	 * (prefer closer). Deliberately no hard brightness ceiling the way findDarkest's own
+	 * MAX_DARK_LIGHT is - a fully-lit candidate still scores worse than a dim one and loses on that
+	 * basis alone, no separate exclusion needed. Returns null if nothing standable turns up anywhere
+	 * in the whole radius sweep (an empty column, solid rock throughout, etc.) - PlanRunner's own
+	 * combat.teleport_ahead handling is responsible for falling back to combat.teleport_in_view when
+	 * this comes back empty, same as when the player isn't moving at all.
+	 */
+	public static BlockPos findDimSpotNear(Level level, BlockPos origin, double maxRadius) {
+		BlockPos best = null;
+		int bestScore = Integer.MAX_VALUE;
+		double bestDistSqr = Double.MAX_VALUE;
+		for (double radius = PREDICTED_PATH_RADIUS_STEP; radius <= maxRadius; radius += PREDICTED_PATH_RADIUS_STEP) {
+			for (int i : shuffledRingIndices()) {
+				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
+				int dx = (int) Math.round(Math.cos(angle) * radius);
+				int dz = (int) Math.round(Math.sin(angle) * radius);
+				BlockPos candidate = standableColumn(level, origin.offset(dx, 0, dz));
+				if (candidate == null) {
+					continue;
+				}
+				int light = level.getMaxLocalRawBrightness(candidate);
+				int score = light < PREDICTED_PATH_DIM_LIGHT_MIN ? PREDICTED_PATH_DIM_LIGHT_MIN - light
+					: light > PREDICTED_PATH_DIM_LIGHT_MAX ? light - PREDICTED_PATH_DIM_LIGHT_MAX : 0;
+				double distSqr = candidate.distSqr(origin);
+				if (score < bestScore || (score == bestScore && distSqr < bestDistSqr)) {
+					best = candidate;
+					bestScore = score;
+					bestDistSqr = distSqr;
+				}
 			}
 		}
 		return best;
@@ -275,6 +326,157 @@ public final class DarkSpotScanner {
 		return null;
 	}
 
+	// Same order of magnitude as LIVE_BAND_3D_SAMPLE_ATTEMPTS - findLiveBandPositionInView applies an
+	// extra isPlayerLookingToward filter on top of the same band+dark checks, so it needs the same
+	// kind of sample budget, not a smaller one.
+	private static final int IN_VIEW_POSITION_ATTEMPTS = 80;
+	// Same corner_of_eye threshold (~60 degrees) isPlayerLookingToward's own 2-arg overload already
+	// used before this class gained a second, tighter facing-check consumer - "broadly somewhere in
+	// view" is good enough for combat.teleport_in_view's own "let the player glimpse it" reveal.
+	private static final double IN_VIEW_ALIGNMENT_DEGREES = 60.0;
+	// combat.teleport_to_eyeline's own, much tighter alignment - the user's own explicit "inline with
+	// the target's eyeline" request: genuinely along their current gaze, not just broadly in their
+	// peripheral field of view the way IN_VIEW_ALIGNMENT_DEGREES is. Matches
+	// SemanticBands.lookAngleDegrees("dead_stare") (14 degrees) - same duplicated-constant tradeoff
+	// this class's own MAX_DARK_LIGHT/DarknessMalus doc comment already accepts, since
+	// com.wendigo.spatial can't depend on the package-private com.wendigo.plan.SemanticBands.
+	private static final double EYELINE_ALIGNMENT_DEGREES = 14.0;
+
+	/**
+	 * findLiveBandPosition3D's sibling for combat.teleport_in_view: same spherical-shell sampling
+	 * (see that method's own doc comment for why - genuine 3D coverage of the band, not a same-normal
+	 * flood), same normal=UP-only floor convention combat.teleport_to_band's own ordinary bands
+	 * already use, but keeps only a candidate the player IS currently facing toward (broadly - see
+	 * IN_VIEW_ALIGNMENT_DEGREES) instead of filtering it out - the exact opposite of
+	 * findUnwatchedPosition's own filter, since this backs a deliberate "let the player glimpse it"
+	 * reveal rather than a blind-spot ambush. Returns null if nothing in-band, dark, AND in-view turns
+	 * up within IN_VIEW_POSITION_ATTEMPTS tries - PlanRunner's own combat.teleport_in_view handling is
+	 * responsible for then trying a farther-out band instead (see its own "search outward" fallback).
+	 */
+	public static BlockPos findLiveBandPositionInView(Level level, Player player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer) {
+		return findLiveBandPositionFacing(level, player, minDistanceFromPlayer, maxDistanceFromPlayer,
+			IN_VIEW_ALIGNMENT_DEGREES);
+	}
+
+	/** combat.teleport_to_eyeline's own resolver - identical shape to findLiveBandPositionInView right
+	 * above (same sampling, same dark requirement), just gated on the much tighter
+	 * EYELINE_ALIGNMENT_DEGREES instead - a dark spot genuinely along the player's current line of
+	 * sight, not merely somewhere broadly in view. */
+	public static BlockPos findLiveBandPositionEyeline(Level level, Player player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer) {
+		return findLiveBandPositionFacing(level, player, minDistanceFromPlayer, maxDistanceFromPlayer,
+			EYELINE_ALIGNMENT_DEGREES);
+	}
+
+	private static BlockPos findLiveBandPositionFacing(Level level, Player player,
+			double minDistanceFromPlayer, double maxDistanceFromPlayer, double alignmentDegrees) {
+		BlockPos playerPos = player.blockPosition();
+		ThreadLocalRandom random = ThreadLocalRandom.current();
+		double radiusSpread = maxDistanceFromPlayer - minDistanceFromPlayer;
+		for (int attempt = 0; attempt < IN_VIEW_POSITION_ATTEMPTS; attempt++) {
+			double z = random.nextDouble(-1.0, 1.0);
+			double theta = random.nextDouble(0.0, 2.0 * Math.PI);
+			double ringRadius = Math.sqrt(1.0 - z * z);
+			double radius = minDistanceFromPlayer + random.nextDouble() * radiusSpread;
+			int dx = (int) Math.round(ringRadius * Math.cos(theta) * radius);
+			int dy = (int) Math.round(z * radius);
+			int dz = (int) Math.round(ringRadius * Math.sin(theta) * radius);
+			BlockPos sample = playerPos.offset(dx, dy, dz);
+			if (sample.getY() < level.getMinY() || sample.getY() > level.getMaxY()) {
+				continue;
+			}
+			BlockPos candidate = attachableColumn(level, sample, Direction.UP);
+			if (candidate == null) {
+				continue;
+			}
+			double distanceFromPlayer = Math.sqrt(candidate.distSqr(playerPos));
+			if (distanceFromPlayer < minDistanceFromPlayer || distanceFromPlayer > maxDistanceFromPlayer) {
+				continue;
+			}
+			// Exactly 0, not just <= MAX_DARK_LIGHT like every other dark-spot search in this class -
+			// the user's own explicit "any teleport action should only ever land on a 0-light block"
+			// request. Safe to tighten right here rather than only post-filtering the result in
+			// PlanRunner (see combat.teleport_to_band's own separate post-filter for why THAT one
+			// couldn't do the same) - this method has exactly two callers, findLiveBandPositionInView/
+			// findLiveBandPositionEyeline, both exclusively backing combat.teleport_in_view/
+			// combat.teleport_to_eyeline and nothing else, so nothing non-teleport shares this search.
+			if (level.getMaxLocalRawBrightness(candidate) > 0) {
+				continue;
+			}
+			if (isPlayerLookingToward(player, candidate, alignmentDegrees)) {
+				return candidate;
+			}
+		}
+		return null;
+	}
+
+	// combat.teleport_to_band's own "above_player" destination: how far straight up from the player
+	// the ceiling perch must be - "no closer than 10 blocks up... within 30 blocks", the user's own
+	// explicit words, read as a vertical constraint (a horizontal search only ever widens the search
+	// for a valid ceiling point, it doesn't relax how far above the player that point sits).
+	private static final double CEILING_ABOVE_MIN_HEIGHT = 10.0;
+	private static final double CEILING_ABOVE_MAX_HEIGHT = 30.0;
+	// How far horizontally off dead-center-above-the-player this is willing to search once the exact
+	// directly-above column turns out lit (or has no ceiling at all within the height window) - the
+	// user's own "~20 block search range" figure, distinct from the 30-block vertical cap above.
+	private static final double CEILING_ABOVE_SEARCH_RADIUS = 20.0;
+	private static final double CEILING_ABOVE_RADIUS_STEP = 4.0;
+
+	/**
+	 * combat.teleport_to_band's own "above_player" resolver: prefers landing directly above the
+	 * player (dead-center X/Z), the lowest valid ceiling point that's still at least
+	 * CEILING_ABOVE_MIN_HEIGHT up - "as close as possible" while honoring the no-closer-than-10 floor.
+	 * If that exact column is lit, or has no ceiling within [MIN,MAX] at all, widens into an
+	 * expanding-ring horizontal search (same shuffled-ring technique findNearestUnwatchedDarkSpot
+	 * uses) out to CEILING_ABOVE_SEARCH_RADIUS, each ring point re-checked against the same vertical
+	 * window. Returns null if nothing qualifies anywhere in that search - PlanRunner's own cascade
+	 * (TierGates.TELEPORT_BAND_PRIORITY) is responsible for falling back to the next-best band from
+	 * there, not this method.
+	 */
+	public static BlockPos findCeilingSpotAbovePlayer(Level level, BlockPos player) {
+		BlockPos direct = findVerticalAttachableInRange(level, player, Direction.DOWN, CEILING_ABOVE_MIN_HEIGHT, CEILING_ABOVE_MAX_HEIGHT);
+		if (direct != null && level.getMaxLocalRawBrightness(direct) <= MAX_DARK_LIGHT) {
+			return direct;
+		}
+		for (double radius = CEILING_ABOVE_RADIUS_STEP; radius <= CEILING_ABOVE_SEARCH_RADIUS; radius += CEILING_ABOVE_RADIUS_STEP) {
+			for (int i : shuffledRingIndices()) {
+				double angle = (2 * Math.PI * i) / RING_SAMPLE_POINTS;
+				int dx = (int) Math.round(Math.cos(angle) * radius);
+				int dz = (int) Math.round(Math.sin(angle) * radius);
+				BlockPos candidate = findVerticalAttachableInRange(level, player.offset(dx, 0, dz), Direction.DOWN,
+					CEILING_ABOVE_MIN_HEIGHT, CEILING_ABOVE_MAX_HEIGHT);
+				if (candidate == null) {
+					continue;
+				}
+				if (level.getMaxLocalRawBrightness(candidate) <= MAX_DARK_LIGHT) {
+					return candidate;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** findVerticalAttachablePoint's bounded sibling: same straight-line probe, but only within
+	 * [minDistance, maxDistance] from origin rather than from 1 all the way out to maxDistance -
+	 * findCeilingSpotAbovePlayer's own "no closer than 10 blocks up" requirement needs the lower
+	 * bound findVerticalAttachablePoint doesn't have. Only meaningful for normal=DOWN (the only
+	 * direction findCeilingSpotAbovePlayer ever calls this with) - unlike findVerticalAttachablePoint,
+	 * doesn't bother supporting UP, since nothing in this codebase needs a floor-with-a-minimum-depth
+	 * search yet. */
+	private static BlockPos findVerticalAttachableInRange(Level level, BlockPos origin, Direction normal,
+			double minDistance, double maxDistance) {
+		int minY = (int) Math.min(origin.getY() + minDistance, level.getMaxY());
+		int maxY = (int) Math.min(origin.getY() + maxDistance, level.getMaxY());
+		for (int y = minY; y <= maxY; y++) {
+			BlockPos candidate = new BlockPos(origin.getX(), y, origin.getZ());
+			if (isAttachable(level, candidate, normal)) {
+				return candidate;
+			}
+		}
+		return null;
+	}
+
 	// Retries findLiveBandPosition up to this many times looking for one the player isn't currently
 	// looking toward - shuffledFloodDirections' own per-call randomization (see findLiveBandPosition's
 	// own doc comment) means repeated calls with the same inputs aren't guaranteed to return the same
@@ -311,7 +513,7 @@ public final class DarkSpotScanner {
 	// ambush is meant to read as "right behind you", not "somewhere vaguely nearby", so this starts
 	// close and only widens as far as it has to. First pass, adjust by feel like every other radius
 	// in this class.
-	private static final double TELEPORT_BEHIND_MIN_RADIUS = 2.0;
+	private static final double TELEPORT_BEHIND_MIN_RADIUS = 8.0;
 	private static final double TELEPORT_BEHIND_MAX_RADIUS = 16.0;
 	private static final double TELEPORT_BEHIND_RADIUS_STEP = 2.0;
 
@@ -319,7 +521,10 @@ public final class DarkSpotScanner {
 	 * Nearest standable, dark (see MAX_DARK_LIGHT), currently-unwatched (see isPlayerLookingToward)
 	 * column around player, searched via expanding rings (same RING_SAMPLE_POINTS/shuffled-order
 	 * technique findDarkestBiased uses) from TELEPORT_BEHIND_MIN_RADIUS out to _MAX_RADIUS - backs
-	 * combat.teleport_behind (stage 5 only). Deliberately NOT flood-verified reachable from the
+	 * combat.teleport_to_band's own "close"/"behind_player" destination values (stage 5 only - see
+	 * TierGates.teleportDestinationBands), the only two of its band values that specifically need a
+	 * blind-spot placement rather than an ordinary in-band position. Deliberately NOT flood-verified
+	 * reachable from the
 	 * wendigo's own current position, same looseness findCeilingVantagePoint already accepts for
 	 * orbit's own fallback: this is an instant teleport, not something that needs to be walked to, so
 	 * reachability from self is irrelevant here - only "is this a real, dark, unwatched spot near the
@@ -352,9 +557,13 @@ public final class DarkSpotScanner {
 	 * for "don't send it somewhere already in view", not meant to be as precise as
 	 * predicate.player_looking_at_self. Same corner_of_eye threshold (~60 degrees) as that predicate. */
 	private static boolean isPlayerLookingToward(Player player, BlockPos pos) {
+		return isPlayerLookingToward(player, pos, IN_VIEW_ALIGNMENT_DEGREES);
+	}
+
+	private static boolean isPlayerLookingToward(Player player, BlockPos pos, double alignmentDegrees) {
 		Vec3 toPos = Vec3.atCenterOf(pos).subtract(player.getEyePosition()).normalize();
 		double alignment = player.getLookAngle().normalize().dot(toPos);
-		return alignment >= Math.cos(Math.toRadians(60.0));
+		return alignment >= Math.cos(Math.toRadians(alignmentDegrees));
 	}
 
 	// Cap on how far above the player orbit's own ceiling-vantage preference (see
@@ -372,12 +581,39 @@ public final class DarkSpotScanner {
 	 * for orbit's own fallback) - orbit's stuck/trapped detection already handles a genuinely
 	 * unreachable pick. Returns null if the column is open (no solid ceiling) within range. */
 	public static BlockPos findCeilingVantagePoint(Level level, BlockPos player) {
-		int maxY = (int) Math.min(player.getY() + MAX_CEILING_VANTAGE_HEIGHT, level.getMaxY());
-		for (int y = player.getY() + 1; y <= maxY; y++) {
-			BlockPos candidate = new BlockPos(player.getX(), y, player.getZ());
-			if (isAttachable(level, candidate, Direction.DOWN)) {
-				return candidate;
+		return findVerticalAttachablePoint(level, player, Direction.DOWN, MAX_CEILING_VANTAGE_HEIGHT);
+	}
+
+	/** Generalizes findCeilingVantagePoint to the floor case too (normal=UP: straight probe downward
+	 * for real ground; normal=DOWN: the original ceiling case, unchanged). Public specifically for
+	 * PlanRunner.resolveChaseDestination: attachableColumn's own layered-relax search (a handful of
+	 * fixed offset windows, gaps between them) can miss a real surface that's simply further from
+	 * origin than any single window reaches - live-confirmed as still letting a chase destination
+	 * resolve to open air when the target player was flying far enough below a real ceiling that none
+	 * of attachableColumn's own {@code LAYER_Y_OFFSETS} windows happened to reach it. This checks
+	 * every block along the way instead, same as findCeilingVantagePoint already did for its one
+	 * fixed direction. Only meaningful for UP/DOWN - returns null for a horizontal normal (walls
+	 * don't have a single vertical column to walk along the same way). */
+	public static BlockPos findVerticalAttachablePoint(Level level, BlockPos origin, Direction normal, double maxDistance) {
+		if (normal == Direction.DOWN) {
+			int maxY = (int) Math.min(origin.getY() + maxDistance, level.getMaxY());
+			for (int y = origin.getY() + 1; y <= maxY; y++) {
+				BlockPos candidate = new BlockPos(origin.getX(), y, origin.getZ());
+				if (isAttachable(level, candidate, normal)) {
+					return candidate;
+				}
 			}
+			return null;
+		}
+		if (normal == Direction.UP) {
+			int minY = (int) Math.max(origin.getY() - maxDistance, level.getMinY());
+			for (int y = origin.getY() - 1; y >= minY; y--) {
+				BlockPos candidate = new BlockPos(origin.getX(), y, origin.getZ());
+				if (isAttachable(level, candidate, normal)) {
+					return candidate;
+				}
+			}
+			return null;
 		}
 		return null;
 	}
@@ -511,8 +747,15 @@ public final class DarkSpotScanner {
 	 * looking for solid rock above an open block). The relax direction has to invert for correctness
 	 * (searching downward can never find a ceiling), unlike nearbyAttachable's own window, which
 	 * stays unmirrored on purpose (see that method's comment).
+	 *
+	 * <p>Public (not just this file's own findLiveBandPosition3D/tryEnterOrbit-style callers) so
+	 * PlanRunner's own combat.chase/internal.chase_until_light can validate a chase destination
+	 * before ever pathing there - see PlanRunner.resolveChaseDestination's own doc comment for why:
+	 * a player floating in open air near (but not touching) a real surface - flying in creative right
+	 * below a ceiling, live-confirmed as the actual trigger for the recurring ceiling-flip bug - isn't
+	 * itself attachable, but is usually only a few blocks away from a real position that is.
 	 */
-	private static BlockPos attachableColumn(Level level, BlockPos column, Direction normal) {
+	public static BlockPos attachableColumn(Level level, BlockPos column, Direction normal) {
 		int relaxSign = normal == Direction.UP ? -1 : 1;
 		for (int layerOffset : LAYER_Y_OFFSETS) {
 			BlockPos layerStart = column.offset(0, layerOffset, 0);

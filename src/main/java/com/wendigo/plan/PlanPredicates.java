@@ -3,6 +3,7 @@ package com.wendigo.plan;
 import com.google.gson.JsonObject;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
@@ -11,8 +12,12 @@ import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.entity.WendigoEntity;
 
-/** Evaluates a predicate JsonObject (see action_schema.json $defs.predicate) against live game state. */
-final class PlanPredicates {
+/** Evaluates a predicate JsonObject (see action_schema.json $defs.predicate) against live game state.
+ * Public (unlike most of this package - see PositionBands/SchemaBuilder's own precedent for the same
+ * exception) specifically so com.wendigo.wave.WendigoManager can reuse isLookingAtSelf directly to
+ * report whether the player is already looking at an already-active wendigo at plan-build time,
+ * without duplicating the eye-position/dot-product math this class already owns. */
+public final class PlanPredicates {
 	private PlanPredicates() {
 	}
 
@@ -203,8 +208,11 @@ final class PlanPredicates {
 	 * the plan itself ever checks predicate.player_looking_at_self(dead_stare). Same "any player"
 	 * multiplayer semantics as playerLookingAtSelf, but deliberately the RAW (non-graduated) check -
 	 * this is a factual outcome record ("did a real dead stare happen"), not a control-flow predicate
-	 * that should get the graduated-timeout leniency. */
-	static boolean isDeadStare(WendigoEntity self) {
+	 * that should get the graduated-timeout leniency. Public (unlike most of this package - see
+	 * PositionBands/SchemaBuilder/isLookingAtSelf's own precedent for the same exception) specifically
+	 * so com.wendigo.wave.WendigoManager can reuse it directly for its own orbit exposure check
+	 * (checkOrbitExposure's stage-1-only dead_stare trigger). */
+	public static boolean isDeadStare(WendigoEntity self) {
 		return isLookedAtByAnyone(self, "dead_stare");
 	}
 
@@ -213,6 +221,33 @@ final class PlanPredicates {
 	static boolean isLookedAtByAnyone(WendigoEntity self, String band) {
 		for (Player player : Targeting.nearbyPlayers(self)) {
 			if (isLookingAtSelf(player, self, band)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** RAW line-of-sight only - no facing-angle requirement at all, unlike isLookedAtByAnyone/
+	 * isLookingAtSelf above - true if ANY nearby player currently has an unobstructed view of self's
+	 * own live position, purely a geometry question independent of whether they're actually looking
+	 * that way right now. Backs PlanRunner's own pre-stare obstruction check (see its own comment) -
+	 * the user's own explicit request: before committing to a held stare, make sure it would even be
+	 * VISIBLE at all if the player turned to look, not just currently unwatched because of angle
+	 * (which is all isLookedAtByAnyone/predicate.player_looking_at_self can tell you). Package-visible
+	 * for that same PlanRunner consumer. */
+	static boolean isVisibleToAnyPlayer(WendigoEntity self) {
+		return isPositionVisibleToAnyPlayer(self, self.getVisualEyePosition());
+	}
+
+	/** Same raw line-of-sight test as isVisibleToAnyPlayer above, but against a HYPOTHETICAL eye
+	 * position rather than self's own current live one - self itself is only ever used for
+	 * getBbWidth()/self-exclusion inside hasLineOfSightToSelf (see its own doc comment), never its
+	 * live position, so this is safe to call for a candidate spot the entity hasn't actually moved to
+	 * yet. Backs PlanRunner's own stare-reposition candidate search (see its own comment) - each
+	 * candidate is evaluated before committing to walk there for real. */
+	static boolean isPositionVisibleToAnyPlayer(WendigoEntity self, Vec3 candidateEyes) {
+		for (Player player : Targeting.nearbyPlayers(self)) {
+			if (hasLineOfSightToSelf(player, self, candidateEyes)) {
 				return true;
 			}
 		}
@@ -261,11 +296,21 @@ final class PlanPredicates {
 	 * happened trying to raise it instead). The line-of-sight half needs the same substitution - see
 	 * hasLineOfSightToSelf's own comment for why that can no longer just be the simple
 	 * player.hasLineOfSight(self)/4-arg-overload convenience call. */
-	static boolean isLookingAtSelf(Player player, WendigoEntity self, String band) {
+	public static boolean isLookingAtSelf(Player player, WendigoEntity self, String band) {
+		return isLookingAtSelfWithinAngle(player, self, SemanticBands.lookAngleDegrees(band));
+	}
+
+	/** Same facing/line-of-sight check as isLookingAtSelf(band) above, but against a raw angle in
+	 * degrees instead of one of the fixed named bands - for callers that need a value the band
+	 * vocabulary doesn't cover, e.g. PlanRunner's per-spear-tier defense angle (see
+	 * PlanRunner.spearDefenseAngleDegrees), which needs a continuum of values rather than one of
+	 * dead_stare/in_view/corner_of_eye. isLookingAtSelf(band) itself now just resolves its band to a
+	 * degrees value and delegates here - the two are the same check, just different entry points. */
+	public static boolean isLookingAtSelfWithinAngle(Player player, WendigoEntity self, double angleDegrees) {
 		Vec3 selfEyes = self.getVisualEyePosition();
 		Vec3 toSelf = selfEyes.subtract(player.getEyePosition()).normalize();
 		double alignment = player.getLookAngle().normalize().dot(toSelf);
-		double cosThreshold = Math.cos(Math.toRadians(SemanticBands.lookAngleDegrees(band)));
+		double cosThreshold = Math.cos(Math.toRadians(angleDegrees));
 		return alignment >= cosThreshold && hasLineOfSightToSelf(player, self, selfEyes);
 	}
 
@@ -285,27 +330,45 @@ final class PlanPredicates {
 	 * directly - its real X/Z, not just its Y grafted onto the physical anchor's X/Z - so the raycast
 	 * finally checks the same point the alignment math already does; (2) rather than a single point
 	 * even at the right location (still just one specific spot on the model, which a thin corner edge
-	 * could still clip), sample a handful of points spread across the model's own real width
-	 * (self.getBbWidth(), whichever pose is currently active) around that same head position and
-	 * count it as seen if ANY of them has clear sight - "shooting multiple rays at every corner of
-	 * the hitbox" rather than trusting one exact center point to always be representative. */
+	 * could still clip), sample a small ring of points immediately around that same head position (see
+	 * HEAD_RING_POINTS/HEAD_SAMPLE_RADIUS right below) and count it as seen if ANY of them has clear
+	 * sight - "shooting multiple rays at every corner of the hitbox" rather than trusting one exact
+	 * center point to always be representative.
+	 * <p>
+	 * SIMPLIFIED (the user's own explicit later request) from an earlier version that sampled a much
+	 * wider, posture-aware grid spanning the whole body (separate tall/narrow-vs-short/wide vertical-
+	 * offset and horizontal-reach tables for standing vs crawling, matching the entity's own real
+	 * hitbox dimensions) back down to a small, POSTURE-AGNOSTIC ring right at the head itself: "we just
+	 * need to make sure where his head is at in worldspace is visible to the player... maybe still use
+	 * multiple rays but just near his head/eyes." No posture branching is needed here anymore -
+	 * selfEyes (getVisualEyePosition()) already resolves to the correct rig-driven head position for
+	 * whichever pose is currently active, so the sample ring just needs to sit close to that one point,
+	 * not re-derive the whole body's own footprint on top of it. Shared unchanged by both stare
+	 * DETECTION (isLookingAtSelf above, angle + this) and stare OBSTRUCTION checks
+	 * (PlanRunner.ensureVisibleBeforeStaring, via isVisibleToAnyPlayer/isPositionVisibleToAnyPlayer
+	 * below, this alone with no angle requirement) - the same single head-position check now backs
+	 * both, rather than each reasoning about "the wendigo's visibility" independently. */
+	private static final int HEAD_RING_POINTS = 6;
+	private static final double HEAD_SAMPLE_RADIUS = 0.25;
+
 	private static boolean hasLineOfSightToSelf(Player player, WendigoEntity self, Vec3 selfEyes) {
 		Vec3 from = player.getEyePosition();
-		double halfWidth = self.getBbWidth() / 2.0;
-		Vec3[] targets = {
-			selfEyes,
-			selfEyes.add(halfWidth, 0.0, halfWidth),
-			selfEyes.add(halfWidth, 0.0, -halfWidth),
-			selfEyes.add(-halfWidth, 0.0, halfWidth),
-			selfEyes.add(-halfWidth, 0.0, -halfWidth),
-		};
-		for (Vec3 target : targets) {
-			ClipContext context = new ClipContext(from, target, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player);
-			if (player.level().clip(context).getType() == HitResult.Type.MISS) {
+		if (hasClearRayTo(player, from, selfEyes)) {
+			return true;
+		}
+		for (int i = 0; i < HEAD_RING_POINTS; i++) {
+			double angle = 2.0 * Math.PI * i / HEAD_RING_POINTS;
+			Vec3 target = selfEyes.add(Math.cos(angle) * HEAD_SAMPLE_RADIUS, 0.0, Math.sin(angle) * HEAD_SAMPLE_RADIUS);
+			if (hasClearRayTo(player, from, target)) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+	private static boolean hasClearRayTo(Player player, Vec3 from, Vec3 target) {
+		ClipContext context = new ClipContext(from, target, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player);
+		return player.level().clip(context).getType() == HitResult.Type.MISS;
 	}
 
 	/** Backs predicate.player_approaching: true once ANY nearby player has closed at least this
@@ -372,13 +435,46 @@ final class PlanPredicates {
 		return false;
 	}
 
+	// The user's own explicit request: a wendigo hanging on a ceiling directly above a player 15
+	// blocks below reads as "far" under plain 3D distance even though it's one movement.drop away
+	// from being right on top of them - meaning a control.while(farther_than lunge_distance) wait
+	// meant to hold until the player is genuinely close would never resolve while perched up there,
+	// no matter how close the player actually walks underneath. Matches PlanRunner's own
+	// DROP_MAX_SEARCH_HEIGHT (same 30-block reach a real movement.drop's own column scan uses to find
+	// a landing floor) - not literally shared, private to a different class, but deliberately the same
+	// value so this predicate can't read "close" for a drop that DROP_MAX_SEARCH_HEIGHT itself
+	// wouldn't actually be able to find a landing spot for.
+	private static final double CYLINDER_MAX_DROP_HEIGHT = 30.0;
+
+	/** Effective distance-to-player for predicate.player_distance: plain 3D Euclidean while genuinely
+	 * on a floor (getGroundSide()==DOWN, the reliable live signal - see WendigoEntity's own doc
+	 * comment) or while the player isn't below within droppable range, but horizontal-only (straight
+	 * down a vertical cylinder from the wendigo's own column, ignoring the vertical gap entirely)
+	 * whenever it's attached to a wall/ceiling with the player somewhere beneath it within
+	 * CYLINDER_MAX_DROP_HEIGHT - the wendigo's own real option in that situation isn't "walk the
+	 * remaining 3D distance," it's "drop straight down," so distance should reflect what a drop would
+	 * actually close, not the misleading long diagonal a plain climbing route or straight-line
+	 * distance would otherwise report. */
+	private static double effectiveDistanceToPlayer(WendigoEntity self, Player player) {
+		if (self.getGroundSide() == Direction.DOWN) {
+			return self.distanceTo(player);
+		}
+		double verticalGap = self.getY() - player.getY();
+		if (verticalGap < 0.0 || verticalGap > CYLINDER_MAX_DROP_HEIGHT) {
+			return self.distanceTo(player);
+		}
+		double dx = self.getX() - player.getX();
+		double dz = self.getZ() - player.getZ();
+		return Math.sqrt(dx * dx + dz * dz);
+	}
+
 	private static boolean playerDistance(JsonObject predicate, WendigoEntity self) {
 		Player player = Targeting.nearestPlayer(self);
 		if (player == null) {
 			return false;
 		}
 		double threshold = ProximityBands.blocks(predicate.get("distance").getAsString());
-		double actual = self.distanceTo(player);
+		double actual = effectiveDistanceToPlayer(self, player);
 		boolean closer = "closer_than".equals(predicate.get("comparator").getAsString());
 		return closer ? actual < threshold : actual > threshold;
 	}

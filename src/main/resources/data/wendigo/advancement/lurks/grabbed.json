@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/root",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "Stay in the light. Its faster than you are. Spam shift if it grabs you to escape"
+    },
+    "hidden": true,
+    "icon": {
+      "id": "minecraft:soul_torch"
+    },
+    "title": {
+      "text": "It's hungry"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

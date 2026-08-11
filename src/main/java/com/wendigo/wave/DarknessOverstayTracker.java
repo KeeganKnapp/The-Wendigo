@@ -94,7 +94,7 @@ public final class DarknessOverstayTracker {
 			// they're sitting in darkness generally (with no wendigo around at all, or one that's
 			// busy on someone else in a multiplayer group).
 			if (ticks % WARNING_NOISE_INTERVAL_TICKS < SAMPLE_INTERVAL_TICKS && this.wendigoManager.isActiveOn(player)) {
-				WendigoSounds.play(player.level(), player, WendigoSounds.Type.AMBIENT);
+				WendigoSounds.play(player.level(), null, WendigoSounds.Type.AMBIENT);
 			}
 			int percent = this.progressionTracker.percentOf(player);
 			if (percent < AMBUSH_MIN_PERCENT) {

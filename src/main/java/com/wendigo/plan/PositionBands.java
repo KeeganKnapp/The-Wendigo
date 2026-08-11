@@ -36,4 +36,29 @@ public final class PositionBands {
 			default -> 64.0; // "farthest" - open-ended in spirit, capped at the live-band search's own outer radius
 		};
 	}
+
+	/** Classifies a live distance into whichever of the 5 ordinary bands (close/medium/far/farther/
+	 * farthest - NOT close_as_possible, a special situational value with no distance range of its
+	 * own worth classifying into separately) it falls into, using each band's own distanceMin as the
+	 * threshold rather than distanceMax - the two aren't quite contiguous (close's own 9.0 max and
+	 * medium's own 10.0 min leave a 1-block gap, same for every other adjacent pair), so anchoring on
+	 * distanceMin instead is what actually tiles the whole number line with no gap or overlap.
+	 * Backs combat.teleport_to_band's own source-band precondition (TierGates.teleportSourceBands)
+	 * and its matching WaveContext prompt context - both need to classify the wendigo's own current
+	 * live distance the exact same way. */
+	public static String classify(double distance) {
+		if (distance < distanceMin("medium")) {
+			return "close";
+		}
+		if (distance < distanceMin("far")) {
+			return "medium";
+		}
+		if (distance < distanceMin("farther")) {
+			return "far";
+		}
+		if (distance < distanceMin("farthest")) {
+			return "farther";
+		}
+		return "farthest";
+	}
 }

@@ -1,22 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WendigoActionPlan",
-  "description": "One complete engagement for the wendigo: where it positions itself, what it does, and where it withdraws to afterward. The wendigo is a persistent presence, not something that spawns fresh each time - it's usually already nearby, quietly keeping its distance, before this plan ever runs; spawn_at is where it moves to (walking there if not already close - or not moving at all if it's already at a good distance for what the plan is about to do - appearing fresh only for a genuine first encounter) before 'plan' starts, not a guaranteed brand-new appearance every request. Positioning throughout this whole plan works the same way: everywhere a distance band is named (spawn_at, movement.approach_band, combat.break_torch's optional band, despawn_band), it's resolved LIVE, fresh, against wherever the player actually is at that exact moment - never a position frozen from earlier in the request. This one call drives the entire engagement start to finish - there is no mid-engagement re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, the live band distance-from-player ladder, and how many torches currently sit at each band - that context is NOT part of this schema since it's different every request. Where the wendigo withdraws to afterward IS a model choice (see despawn_band) - the engine resolves a live position in that band at the moment it's actually time to flee, re-resolving fresh if the first attempt fails; this is a retreat back into hiding, not vanishing from existence, unless it genuinely can't find anywhere dark to go. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
+  "description": "One complete engagement for the wendigo: where it positions itself, what it does, and where it withdraws to afterward. The wendigo is a persistent presence, not something that spawns fresh each time - it's usually already nearby, quietly keeping its distance, before this plan ever runs; spawn_at is where it moves to (walking there if not already close - or not moving at all if it's already at a good distance for what the plan is about to do - appearing fresh only for a genuine first encounter) before 'plan' starts, not a guaranteed brand-new appearance every request. Positioning throughout this whole plan works the same way: everywhere a distance band is named (spawn_at, movement.approach_band, despawn_band), it's resolved LIVE, fresh, against wherever the player actually is at that exact moment - never a position frozen from earlier in the request. combat.break_torch has no band of its own - it always targets the nearest torch to wherever the wendigo itself currently is. This one call drives the entire engagement start to finish - there is no mid-engagement re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, the live band distance-from-player ladder, and how many torches currently sit at each band - that context is NOT part of this schema since it's different every request. Where the wendigo withdraws to afterward IS a model choice (see despawn_band) - the engine resolves a live position in that band at the moment it's actually time to flee, re-resolving fresh if the first attempt fails; this is a retreat back into hiding, not vanishing from existence, unless it genuinely can't find anywhere dark to go. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
   "type": "object",
   "properties": {
-    "spawn_at": {
+    "previous_encounter_recap": {
       "type": "string",
-      "enum": [
-        "close_as_possible",
-        "close",
-        "medium",
-        "far",
-        "farther",
-        "farthest",
-        "no_players_looking",
-        "spawn_on_torch"
-      ],
-      "description": "Which live distance band from the player the wendigo should position itself at before 'plan' starts - resolved fresh at that moment (walked there if not already close, or not moved at all if the wendigo's current live distance already fits, appearing fresh only for a genuine first encounter), never a position frozen from earlier in the request. Only bands actually offered in the prompt are valid for this request - close_as_possible only ever appears in a tight, mineshaft-like space (see the prompt's caving-scenario note), at any severity, since there's nowhere far to go anyway in a cramped space; close/medium/far/farther otherwise unlock progressively closer to the player as severity climbs (farther earliest, then far, then medium, then close) - which bands are even offered already reflects how bold the wendigo is allowed to be right now. farthest is always available. A resolved position may land on the ceiling or a wall instead of the floor - the wendigo can climb there and back like a spider, so spawn_at and every movement primitive work identically either way, no special handling needed; it's just a different kind of vantage point to stare down from. 'no_players_looking' is a special value instead of naming a distance band: the engine picks a live position the target player isn't currently looking toward - use this whenever the point is a clean, unnoticed first appearance rather than a specific distance. 'spawn_on_torch' - only offered when there's at least one live torch far enough away for the current severity to allow (the same farther/far/medium/close progression, applied to torches instead of empty ground) - spawns already exposed at that torch's position, destroying it the instant it appears, no hiding or staring involved. Below 80% severity it's just an ordinary spawn location choice - plan however fits the moment, no obligation to chase. At 80%+ severity it's a commitment: pair it with an aggressive plan (e.g. sound.ambient_cue(chase) then combat.chase) since there's nothing subtle left once spawning fully exposed at that range. Don't pick it if a genuine dark spot is available and would fit the moment better."
+      "description": "Write this FIRST, before deciding spawn_at/plan below - your own one-sentence, in-character narrative interpretation of what actually happened during the wendigo's most recent encounter with this player, using the prompt's own factual account of it (never caught them, caught them but they got away before any damage landed, or caught them and dealt damage before it ended - three genuinely different outcomes, not one binary caught/not-caught fact - was spotted dead-on or never directly stared at, vanished unnoticed or had to withdraw/flee, how many torches it broke, whether the engine had to cut the encounter short - lost track of them, they went out of reach, or something else forced an early stop, as opposed to a clean ending - and the plan's own shape - e.g. posture.stare then combat.break_torch). Don't just restate those facts mechanically - interpret them as a horror beat, the way a viewer would describe what they just watched: e.g. 'I set a stare jumpscare, but the player never looked - I wasn't seen, the reveal fizzled' or 'Stared until they noticed, then broke a torch right in front of them and vanished before they could react' or 'Lost them mid-chase after they broke away - I'll need to close faster next time.' This sentence becomes YOUR OWN memory of that encounter - it's shown back to you verbatim (as 'what happened last time,' replacing this same factual account) the next time you're asked to plan for this player, so use it to actually pace the story: don't repeat a beat that already landed, build on tension that hasn't paid off yet, or ease up after a string of failed attempts, the way a real haunting would escalate or vary rather than looping the same scare. Empty string if this is the wendigo's first encounter with this player this session (nothing to recap yet) - never invent a past encounter that didn't happen.",
+      "default": ""
     },
     "plan": {
       "type": "array",
@@ -48,7 +39,7 @@
     }
   },
   "required": [
-    "spawn_at",
+    "previous_encounter_recap",
     "plan",
     "despawn_band",
     "global_rules"
@@ -91,6 +82,9 @@
           "$ref": "#/$defs/movement_hold"
         },
         {
+          "$ref": "#/$defs/movement_drop"
+        },
+        {
           "$ref": "#/$defs/memory_store_dark_location"
         },
         {
@@ -110,6 +104,12 @@
         },
         {
           "$ref": "#/$defs/combat_chase"
+        },
+        {
+          "$ref": "#/$defs/combat_teleport_to_band"
+        },
+        {
+          "$ref": "#/$defs/combat_teleport_in_view"
         },
         {
           "$ref": "#/$defs/control_none"
@@ -160,9 +160,10 @@
             "far",
             "farther",
             "farthest",
-            "no_players_looking"
+            "no_players_looking",
+            "spot_above"
           ],
-          "description": "Which live distance band to move to, relative to the player right now. 'no_players_looking' is a special value instead of naming a distance band (same meaning as spawn_at's own): pathfind from wherever the wendigo currently is to a live position roughly at the farther band that the player isn't currently facing toward, always available regardless of severity. Especially useful as the very first step of a plan that's engaging an entity already orbiting nearby - unlike a fresh spawn, an already-alive entity doesn't get repositioned by spawn_at at all, so this is how to explicitly walk it somewhere unwatched before the rest of the plan runs, the same way a fresh spawn_at=no_players_looking would."
+          "description": "Which live distance band to move to, relative to the player right now. 'no_players_looking' is a special value instead of naming a distance band (same meaning as spawn_at's own): pathfind from wherever the wendigo currently is to a live position roughly at the farther band that the player isn't currently facing toward, always available regardless of severity. Especially useful as the very first step of a plan that's engaging an entity already orbiting nearby - unlike a fresh spawn, an already-alive entity doesn't get repositioned by spawn_at at all, so this is how to explicitly walk it somewhere unwatched before the rest of the plan runs, the same way a fresh spawn_at=no_players_looking would. 'spot_above' (60%+ only, same meaning as spawn_at's own) - pathfind to the ceiling directly above the player, staying dark the whole way, settling for the closest reachable spot if light blocks a clean route straight above. Mid-plan repositioning onto the ceiling for a movement.drop, not just a fresh spawn choice - e.g. an already-orbiting entity moving into position for an overhead ambush."
         },
         "speed": {
           "type": "string",
@@ -305,6 +306,20 @@
       ],
       "additionalProperties": false
     },
+    "movement_drop": {
+      "type": "object",
+      "description": "MOVEMENT branch: reserved for the same tier as combat.lunge_attack (60%+) - literally just releases whatever wall/ceiling attachment the wendigo currently has, nothing more. Not a targeted attack by itself and has no destination - if it's on the ceiling above the player when this runs, gravity does the rest; if it's not near the player at all, this just drops it straight down wherever it happens to be. Resolves the instant it's triggered, same as posture.stare or combat.teleport_to_band - the actual fall plays out physically over the next moment regardless of what the plan does right after. Safe to reach for anywhere in a plan, not just right after a deliberate spot_above positioning - if it's already resting on a floor (not attached to any wall/ceiling) when this runs, it's a real no-op, nothing happens, so there's no need to be certain a wall/ceiling attachment is still in effect by the time a later step actually executes. Works well in plenty of shapes beyond the classic spot_above setup: e.g. posture.stare from wherever it currently is, then movement.drop, then combat.chase - letting go mid-stare rather than only ever as a scripted overhead ambush. Pair with spawn_at/movement.approach_band(spot_above) beforehand for the deliberate overhead-ambush version, and combat.lunge_attack or combat.chase right after (either version) to actually close on and catch the player once it lands near them - the three are independent primitives, not one combined action, so mix them with whatever else fits the moment.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "movement.drop"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false
+    },
     "memory_store_dark_location": {
       "type": "object",
       "description": "MEMORY branch: scan nearby and remember the darkest valid position for a later movement.retreat_to_dark(source=stored). Overwrites whatever was previously stored.",
@@ -435,30 +450,11 @@
     },
     "combat_break_torch": {
       "type": "object",
-      "description": "COMBAT branch: destroy a torch, snuffing that light out - like combat.lunge_attack, this is allowed to cross into light since reaching the target is the point. Without 'band', targets the single nearest known light source live from wherever the wendigo currently is (no positioning needed first). With 'band', instead targets the nearest torch whose live distance from the player falls in that band right now - see the prompt's torches_at_<band>_distance counts to know whether that's worth planning around before committing to it. Either way, if no matching torch exists this is a no-op and the plan continues, never fails outright. A good sequence: spawn near a torch, break_torch, then movement.retreat_with_fallback to withdraw before despawning.",
+      "description": "COMBAT branch: destroy a torch, snuffing that light out - like combat.lunge_attack, this is allowed to cross into light since reaching the target is the point. Always targets the single nearest known light source live from wherever the wendigo itself currently is (no positioning needed first, no band choice - picking a torch by its distance from the PLAYER instead used to send the wendigo straight through the lit area around them just to reach one on the far side, exactly the exposure this creature is supposed to avoid). If no torch is found nearby this is a no-op and the plan continues, never fails outright. A good sequence: spawn near a torch, break_torch, then movement.retreat_with_fallback to withdraw before despawning.",
       "properties": {
         "type": {
           "type": "string",
           "const": "combat.break_torch"
-        },
-        "band": {
-          "anyOf": [
-            {
-              "type": "string",
-              "enum": [
-                "close_as_possible",
-                "close",
-                "medium",
-                "far",
-                "farther",
-                "farthest"
-              ]
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional - constrains the torch search to one whose live distance from the player falls in this band. Set to null to just target the nearest torch from the wendigo's own current position instead."
         },
         "speed": {
           "type": "string",
@@ -472,7 +468,6 @@
       },
       "required": [
         "type",
-        "band",
         "speed"
       ],
       "additionalProperties": false
@@ -488,6 +483,61 @@
       },
       "required": [
         "type"
+      ],
+      "additionalProperties": false
+    },
+    "combat_teleport_to_band": {
+      "type": "object",
+      "description": "COMBAT branch: instantly relocates the wendigo to a live-resolved spot at the given band, no travel time, no warning - a teleport, not a movement primitive, so it resolves the same instant it runs, nothing to wait on afterward. Always available at every stage, unlike most of this creature's other combat options - the real gating here is which band value(s) are even offered right now (see 'band' below - the offered set GROWS with stage, cumulative, not replaced: everything unlocked at an earlier stage stays available at every later one too, alongside whatever's new) and a SEPARATE engine-enforced precondition this schema can't show directly: the wendigo can only actually pull this off while ITS OWN current live distance from the player already sits in one of the bands unlocked so far this stage (roughly the inverse of the destination progression, also cumulative - an early-stage wendigo can only blink away while already right on top of the player, a late-stage one has a much wider set of positions it can pull this off from). If that precondition isn't met right now, this is a clean no-op and the plan just continues - never a hard failure. If the chosen band itself can't be live-resolved (nothing dark/valid found there, or no torch nearby for band=torch), the engine automatically falls back to the next best-to-worst option instead of failing outright - the full order, best to worst, is above_player, behind_player, torch, close, medium, far, farther, farthest, so a failed close attempt quietly becomes a medium teleport rather than nothing happening at all; only genuinely offer a band this schema is currently letting you pick, the engine handles the rest of the degradation on its own. Reach for this specifically when the player is sprinting AND the prompt's own account of the wendigo's current distance/band suggests the precondition is likely met - ideally as the very FIRST step of the plan, teleporting straight into position rather than pathing there normally, since a sprinting player is exactly the moment a sudden, silent reposition reads as unsettling rather than redundant. Pair with combat.lunge_attack, combat.chase, or posture.stare right after landing - band=torch specifically should almost always be followed by one of those, not left as the whole beat on its own, since arriving already exposed at a torch only reads as deliberate if something follows it up.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "combat.teleport_to_band"
+        },
+        "band": {
+          "type": "string",
+          "enum": [
+            "farthest",
+            "farther",
+            "far",
+            "medium",
+            "close",
+            "torch",
+            "behind_player",
+            "above_player"
+          ],
+          "description": "Which destination this teleport resolves to - the set of values actually offered grows with stage (cumulative: everything unlocked earlier stays available later too, alongside whatever's new that stage), never shrinks or replaces. farthest/farther/far/medium/close are the ordinary live-resolved positioning bands (same distance ranges as movement.approach_band), dark but not necessarily unwatched. close and behind_player both specifically resolve to a dark spot the player ISN'T currently looking toward - behind_player is the classic blind-spot ambush (right in their blind spot, the original version of this ability); close is the same idea from a slightly less point-blank range. above_player resolves to a ceiling attachment point directly (or as close to directly) above the player, 10-30 blocks straight up - a drop-in vantage rather than a ground-level appearance. torch resolves to the single nearest live torch to the player - just a relocation, no side effect on the torch itself (it isn't destroyed and this doesn't start a chase on its own, unlike how spawning on a torch used to work) - the model decides separately whether to follow up with combat.break_torch, combat.lunge_attack, or combat.chase from there (see this action's own top-level description - a torch teleport with no follow-up reads as pointless, always pair it with something)."
+        }
+      },
+      "required": [
+        "type",
+        "band"
+      ],
+      "additionalProperties": false
+    },
+    "combat_teleport_in_view": {
+      "type": "object",
+      "description": "COMBAT branch: instantly relocates the wendigo to a live-resolved spot at the given band, same no-travel-time mechanic as combat.teleport_to_band, but the resolved spot is one the player CAN currently see (in view), not one they're blind to - the deliberate opposite of that ability's own close/behind_player values. Meant for a reveal: teleport in, then let yourself be seen doing something specific rather than just noticed standing somewhere. Early stages, pair it with an immediate posture.stare right after landing - the reveal-and-stare read of this creature. Later stages, pair it with a stare that quickly turns into combat.chase or combat.lunge_attack (directly, or via a global_rule on predicate.player_looking_at_self) - the stare becomes the wind-up for the strike rather than the whole beat. Always available as an action type, same as combat.teleport_to_band - the offered band(s) grow with stage (see 'band' below), cumulative like that ability's own bands, EXCEPT stage 1 specifically gets every band at once (a deliberate exception - see 'band' below), not just the farthest one the ordinary progression would otherwise give it alone. No separate source-band precondition here, unlike combat.teleport_to_band - this reveal is meant to be pullable off from wherever the wendigo currently is. If nothing in-view/dark is live-resolvable at the requested band, the engine automatically searches outward (progressively farther bands) instead of failing outright, so only ever pick one of the bands this schema is currently offering and let the engine handle the rest.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "combat.teleport_in_view"
+        },
+        "band": {
+          "type": "string",
+          "enum": [
+            "farthest",
+            "farther",
+            "far",
+            "medium",
+            "close"
+          ],
+          "description": "Which distance band this in-view teleport resolves to. Grows with stage like combat.teleport_to_band's own bands (farthest unlocks at stage 1, farther adds at stage 2, far at stage 3, medium at stage 4, close at stage 5 - each stage keeps everything from before too), with one deliberate exception: stage 1 alone is offered every band at once (farthest through close), not just farthest - a one-time allowance so even the very first, most cautious stage has real variety in how far away its single reveal-and-vanish beat happens, rather than always the identical distance. Unlike combat.teleport_to_band's bands, the resolved spot is always one the player can currently see, never a blind spot."
+        }
+      },
+      "required": [
+        "type",
+        "band"
       ],
       "additionalProperties": false
     },
@@ -794,7 +844,7 @@
     },
     "predicate_player_distance": {
       "type": "object",
-      "description": "Compares the player's current distance against a semantic band.",
+      "description": "Compares the player's current distance against a semantic band. While attached to a wall/ceiling with the player somewhere below (within about 30 blocks straight down), 'distance' here means horizontal distance down that same vertical column, not the raw diagonal - a wendigo hanging directly above the player already reads as grab_distance even from well overhead, since a movement.drop is what actually closes that gap, not a walk. This is exactly what makes control.while(farther_than lunge_distance){movement.hold} then combat.lunge_attack work while perched on a ceiling: it resolves the instant the player walks underneath, not once they've somehow closed the full diagonal distance.",
       "properties": {
         "type": {
           "type": "string",
@@ -816,7 +866,7 @@
             "medium",
             "far"
           ],
-          "description": "Shared proximity ladder, nearest to furthest: grab_distance (~0-4 blocks, melee/strike range), lunge_distance (~5-9, the range to commit to combat.lunge_attack from), close_quarters (~10-14), medium (~15-24), far (~25+). These are the same bands used to label each scanned spot's distance in the prompt, so you can tell before committing to spawn_at whether a spot is already inside combat/flee range of the player - e.g. control.while(farther_than lunge_distance) to wait before lunging, or closer_than close_quarters to decide it's time to retreat."
+          "description": "Shared proximity ladder, nearest to furthest: grab_distance (~0-4 blocks, melee/strike range), lunge_distance (~5-9, the range to commit to combat.lunge_attack from), close_quarters (~10-14), medium (~15-24), far (~25+). These are the same bands used to label each scanned spot's distance in the prompt, so you can tell before committing to spawn_at whether a spot is already inside combat/flee range of the player - e.g. control.while(farther_than lunge_distance){movement.hold} then combat.lunge_attack to wait for the player to close in before committing, rather than lunging from too far away or walking straight at them the whole way in, or closer_than close_quarters to decide it's time to retreat. Works from a wall/ceiling perch too (see this predicate's own top-level description on the cylinder distance) - waiting at lunge_distance while attached above a patrol route, then dropping (movement.drop) straight into combat.lunge_attack or combat.chase the instant they walk underneath, is a strong, patient use of this pattern, not just a ground-level one."
         }
       },
       "required": [

@@ -4,10 +4,11 @@ Usage: python3 scratchpad/convert_animation.py [path/to/wendigo-dp.zip]
 
 If no path is given, looks for the hidden export zip Blockbench/Animated Java drops directly
 into src/main/resources (named ".xdp-wendigo-dp.zip-<random>") and uses the newest one.
-Reads three animations out of the datapack's per-tick mcfunction dump:
-  - "stand" (frame 0 only - a static pose, not looped)  -> REST_POSE (not moving, standing hitbox)
-  - "crawl" (every frame, looping)                      -> CRAWL (moving, swim hitbox)
-  - "idlecrawl" (a single held frame)                    -> CRAWL_IDLE (not moving, swim hitbox)
+Reads four animations out of the datapack's per-tick mcfunction dump:
+  - "stand" (every frame, looping)        -> REST_POSE (frame 0 only, a static fallback) + STAND (looping)
+  - "crawl_normal" (every frame, looping) -> CRAWL_NORMAL (moving, swim hitbox, ordinary navigation)
+  - "crawl_angry" (every frame, looping)  -> CRAWL_ANGRY (moving, swim hitbox, chase/lunge/capture)
+  - "idlecrawl" (a single held frame)     -> CRAWL_IDLE (not moving, swim hitbox)
 Frame 0 of each animation must contain every bone (a full pose, not a delta) - later frames of an
 animation may omit unchanged bones (delta-encoded against the previous frame), which parse_animation
 already carries forward, but frame 0 itself has to be complete or there's nothing to carry forward from.
@@ -22,7 +23,7 @@ import zipfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESOURCES = os.path.join(REPO_ROOT, "src/main/resources")
 OUTPUT = os.path.join(REPO_ROOT, "src/main/java/com/wendigo/entity/WendigoAnimationData.java")
-DP_FUNCTION_ROOT = "data/wendigo/function/wendigo"
+DP_FUNCTION_ROOT = "data/aj/function/my_blueprint"
 
 LINE_RE = re.compile(r"\$data merge entity \$\(([a-z0-9]+)\) \{\s*transformation: \[([^\]]+)\]")
 
@@ -74,10 +75,12 @@ def main():
         stand_frames = parse_animation(zf, "stand")
         default_pose = stand_frames[0]
         bones = list(default_pose.keys())
-        crawl_frames = parse_animation(zf, "crawl")
+        crawl_normal_frames = parse_animation(zf, "crawl_normal")
+        crawl_angry_frames = parse_animation(zf, "crawl_angry")
         idlecrawl_frames = parse_animation(zf, "idlecrawl")
 
-    for frames, name in [(crawl_frames, "crawl"), (idlecrawl_frames, "idlecrawl")]:
+    for frames, name in [(stand_frames, "stand"), (crawl_normal_frames, "crawl_normal"),
+                          (crawl_angry_frames, "crawl_angry"), (idlecrawl_frames, "idlecrawl")]:
         for i, frame in enumerate(frames):
             missing = [b for b in bones if b not in frame]
             if missing:
@@ -95,31 +98,61 @@ def main():
     out.append(" * All matrices are row-major 4x4 affine: [r00,r01,r02,tx, r10,r11,r12,ty, r20,r21,r22,tz, 0,0,0,1].")
     out.append(" */")
     out.append("public final class WendigoAnimationData {")
-    out.append(f"    public static final int CRAWL_FRAME_COUNT = {len(crawl_frames)};")
+    out.append(f"    public static final int STAND_FRAME_COUNT = {len(stand_frames)};")
+    out.append(f"    public static final int CRAWL_NORMAL_FRAME_COUNT = {len(crawl_normal_frames)};")
+    out.append(f"    public static final int CRAWL_ANGRY_FRAME_COUNT = {len(crawl_angry_frames)};")
     out.append("")
-    out.append("    /** Bone name -> rest-pose row-major 4x4 transform (not moving, standing hitbox). */")
+    out.append("    /** Bone name -> rest-pose row-major 4x4 transform (stand animation, frame 0 only) - a")
+    out.append("     * static fallback for the brief pre-rig-attach window only; the standing pose itself is")
+    out.append("     * animated now, see STAND. */")
     out.append("    public static final Map<String, float[]> REST_POSE = new LinkedHashMap<>();")
     out.append("")
-    out.append("    /** Bone name -> per-frame row-major 4x4 transforms for the \"crawl\" (moving, swim hitbox) animation. */")
-    out.append("    public static final Map<String, float[][]> CRAWL = new LinkedHashMap<>();")
+    out.append("    /** Bone name -> per-frame row-major 4x4 transforms for the looping \"stand\" (idle,")
+    out.append("     * standing hitbox) animation. */")
+    out.append("    public static final Map<String, float[][]> STAND = new LinkedHashMap<>();")
+    out.append("")
+    out.append("    /** Bone name -> per-frame row-major 4x4 transforms for the \"crawl_normal\" (moving, swim")
+    out.append("     * hitbox, ordinary navigation) animation. */")
+    out.append("    public static final Map<String, float[][]> CRAWL_NORMAL = new LinkedHashMap<>();")
+    out.append("")
+    out.append("    /** Bone name -> per-frame row-major 4x4 transforms for the \"crawl_angry\" (moving, swim")
+    out.append("     * hitbox, chase/lunge/capture) animation. */")
+    out.append("    public static final Map<String, float[][]> CRAWL_ANGRY = new LinkedHashMap<>();")
     out.append("")
     out.append("    /** Bone name -> rest-pose row-major 4x4 transform for the \"crawl idle\" pose (not moving, swim hitbox). */")
     out.append("    public static final Map<String, float[]> CRAWL_IDLE = new LinkedHashMap<>();")
     out.append("")
+    # A single static { } block holding every frame of every bone/animation would exceed the JVM's
+    # 64KB-per-method bytecode limit ("code too large") once STAND grew to 41 real keyframes across
+    # 12 bones on top of the two crawl variants - confirmed live (javac refused to compile the naive
+    # single-block version). Splitting into one private static init method PER (bone, animation) pair
+    # keeps every individual method comfortably small (at most ~41 frames x 16 floats each) regardless
+    # of how long any one animation grows, and a short chain of calls in the actual static { } block
+    # wires them all up - same reasoning as splitting any other oversized generated method.
+    init_calls = []
     out.append("    static {")
     for bone in bones:
         out.append(f'        REST_POSE.put("{bone}", new float[] {fmt_matrix(default_pose[bone])});')
-    out.append("")
-    for bone in bones:
         out.append(f'        CRAWL_IDLE.put("{bone}", new float[] {fmt_matrix(idlecrawl_frames[0][bone])});')
-    out.append("")
-    for bone in bones:
-        out.append(f'        CRAWL.put("{bone}", new float[][] {{')
-        lines = [f"            {fmt_matrix(frame[bone])}" for frame in crawl_frames]
-        out.append(",\n".join(lines))
-        out.append("        });")
+    for frames, target in [(stand_frames, "STAND"), (crawl_normal_frames, "CRAWL_NORMAL"),
+                            (crawl_angry_frames, "CRAWL_ANGRY")]:
+        for bone in bones:
+            method = f"init{target[:1]}{target[1:].lower().replace('_', '')}{bone[:1].upper()}{bone[1:]}"
+            init_calls.append(f"        {method}();")
+    out.extend(init_calls)
     out.append("    }")
     out.append("")
+    for frames, target in [(stand_frames, "STAND"), (crawl_normal_frames, "CRAWL_NORMAL"),
+                            (crawl_angry_frames, "CRAWL_ANGRY")]:
+        for bone in bones:
+            method = f"init{target[:1]}{target[1:].lower().replace('_', '')}{bone[:1].upper()}{bone[1:]}"
+            out.append(f"    private static void {method}() {{")
+            out.append(f'        {target}.put("{bone}", new float[][] {{')
+            lines = [f"            {fmt_matrix(frame[bone])}" for frame in frames]
+            out.append(",\n".join(lines))
+            out.append("        });")
+            out.append("    }")
+            out.append("")
     out.append("    private WendigoAnimationData() {}")
     out.append("}")
 
@@ -127,7 +160,9 @@ def main():
         f.write("\n".join(out) + "\n")
 
     print("bones:", bones)
-    print("crawl frames:", len(crawl_frames))
+    print("stand frames:", len(stand_frames))
+    print("crawl_normal frames:", len(crawl_normal_frames))
+    print("crawl_angry frames:", len(crawl_angry_frames))
     print("idlecrawl frames:", len(idlecrawl_frames))
     print(f"wrote {OUTPUT}")
 

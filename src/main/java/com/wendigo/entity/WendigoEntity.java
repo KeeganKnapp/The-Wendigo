@@ -1,12 +1,14 @@
 package com.wendigo.entity;
 
 import java.util.List;
+import java.util.function.Predicate;
 
 import com.google.gson.JsonObject;
 
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.Vec3i;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
@@ -16,6 +18,7 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.Pose;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
@@ -25,11 +28,12 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
-import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.DamageTypeTags;
 import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.pathfinder.PathType;
 import net.minecraft.world.phys.Vec3;
@@ -41,6 +45,7 @@ import com.nyfaria.awcapi.entity.IAdvancedClimber;
 import com.wendigo.WendigoMod;
 import com.wendigo.debug.WendigoDebug;
 import com.wendigo.plan.PlanRunner;
+import com.wendigo.plan.Targeting;
 import com.wendigo.spatial.DarkSpotScanner;
 
 /**
@@ -95,6 +100,11 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     // exactly what keeps that box safely inside the entity's own collision box everywhere else in the
     // engine that relies on it. The rig's real (taller) visual head position is handled entirely
     // separately - see getVisualEyePosition, used only by stare-detection, never touching this.
+    // Live-tested and ruled out: temporarily widened to 1.4 (matching a real vanilla spider's own
+    // hitbox) to test whether AdvancedClimberPathNavigator.followThePath()'s own bbWidth-derived
+    // arrival tolerance was load-bearing for the ceiling-flip bug - the user's own live testing
+    // confirmed it wasn't (the "doesn't fall off the ceiling anymore" behavior it seemed to produce
+    // predates this change entirely, from early in this whole investigation). Back to the original 0.8.
     private static final EntityDimensions CRAWLING_DIMENSIONS = EntityDimensions.scalable(0.8F, 0.9F);
     // Deliberately shorter than the model's real proportions (which stand about 3 blocks tall) - this
     // is the physical collision box only, sized for easy pathfinding through ordinary 2-tall corridors
@@ -106,7 +116,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     // hitbox alone would fit) still forces crawl pose instead of letting the model clip the ceiling.
     // Deliberately plain scalable() - see CRAWLING_DIMENSIONS' own comment just above.
     private static final EntityDimensions STANDING_DIMENSIONS = EntityDimensions.scalable(0.6F, 2.0F);
-    private static final double CRAWL_SPEED_THRESHOLD_SQR = 1.0E-4;
+    private static final double CRAWL_SPEED_THRESHOLD_SQR = 1.0E-3;
     // Flipping pose (and its bounding-box resize via refreshDimensions()) on every single tick's
     // raw velocity reading flickers rapidly while walking down slopes/stairs. Requiring the desired
     // pose to be stable for a few consecutive ticks before actually committing to it damps that
@@ -176,7 +186,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     // Full cut to the base MOVEMENT_SPEED attribute, reached only at CLIMBING_PENALTY_RAMP_END_PITCH -
     // first pass, not derived from anything more rigorous than "clearly slower reduces how far a
     // single tick can overshoot a surface edge" - adjust by feel once live-tested.
-    private static final double CLIMBING_SPEED_PENALTY_MAX_FRACTION = -0.4;
+    private static final double CLIMBING_SPEED_PENALTY_MAX_FRACTION = -0.2;
     // TEMPORARY diagnostic threshold only - see updateClimbingSpeedPenalty's own debug logging.
     private static final float PITCH_LOG_JUMP_THRESHOLD_DEGREES = 20.0f;
     // How many consecutive ticks forceDetach forces onGround() to read false for - matches
@@ -248,10 +258,6 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     // purely to detect that specific thrashing pattern.
     private Direction lastGroundDirection;
     private int groundDirectionChangeTicks;
-    // See getGroundSide's own override/doc comment - the last reading that WASN'T flagged as a
-    // spurious AWCAPI fallback, used to paper over the exact ticks that fallback fires on. Defaults
-    // to UP (floor) - harmless before any real probe has ever run (matches ordinary floor spawn).
-    private Direction lastGoodGroundSide = Direction.UP;
     // TEMPORARY diagnostic only (see updateOrientationConvergence's own debug logging) - whether that
     // method was actively correcting a mismatch as of the last tick, used purely to log once per real
     // transition instead of every single tick the mismatch persists.
@@ -259,6 +265,9 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     // TEMPORARY diagnostic only - see updateClimbingSpeedPenalty's own debug logging. NaN means "no
     // reading logged yet" (harmless first-tick skip, not a real jump).
     private float lastLoggedPitch = Float.NaN;
+    // null (not false) until logDiagnostics' first real call, so a fresh debug session never logs a
+    // spurious "transition" for whatever onGround() already happened to read on tick one.
+    private Boolean lastLoggedOnGround;
     private final PlanRunner planRunner = new PlanRunner(this);
     private BlockPos storedDarkLocation;
     private boolean navigationFailed;
@@ -292,6 +301,13 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         // ServerLevel.playSound directly - unaffected by isSilent() either way.
         this.setSilent(true);
         ClimberHelper.initClimber(this);
+        // TEMPORARILY DISABLED again - the user's own explicit rule: nothing here that isn't also in
+        // Nyf's Spiders' own SpiderMixin (fully audited this session - it never substitutes its own
+        // move controller at all, just AWCAPI's stock ClimberMoveController, confirmed via javap). A
+        // custom move controller working around a stuck orientation is exactly the kind of bandaid
+        // that rule rules out - the real fix has to be whatever structural difference makes AWCAPI
+        // itself behave differently for this entity than for a spider using the identical stock code.
+        // this.moveControl = new WendigoMoveController(this);
         // Live-reported bug, root-caused via decompiling ClimberComponent.onTravel: AWCAPI defaults
         // canClimbInWater to false, and while it's false, onTravel bails out of its own climbing
         // physics entirely the instant the mob is in water it can't stand on (isTravelingInFluid=true,
@@ -314,32 +330,39 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         // exact 0 regardless of whatever the real base default happens to be, not a relative
         // adjustment from it.
         this.getAttribute(Attributes.FALL_DAMAGE_MULTIPLIER).setBaseValue(0.0);
-        // Previously tried raising this (initClimber leaves it at AWCAPI's own 0.1 default) to speed up
-        // ordinary floor ledge-crossing, then reverted - it was the one thing that changed between a
-        // live test where wall/ceiling attachment tilt worked and a later one where the rig stayed flat
-        // everywhere. Retried now with a real reason to believe it's safe, not just a blind guess: per
-        // ClimberComponent.onTravel (decompiled, not guessed), the mob's OWN maxUpStep() reading (which
-        // reads straight from this same attribute - confirmed via decompiling LivingEntity.maxUpStep -
-        // is captured into a local once per call) is used for AWCAPI's own step math, and this exact
-        // attribute's BASE VALUE is then explicitly reset to 0 every time any attachedSides axis just
-        // changed (a real transition between surfaces) specifically so vanilla's own separate step-up
-        // code doesn't also fire and double up on the same movement that tick - a value set here only
-        // actually reads through to vanilla's ordinary flat-ground stepping outside of a transition tick,
-        // it never overrides AWCAPI's transition-specific behavior. If the flat-rig symptom reappears
-        // anyway, this line (not the search-range widening below, which is unrelated) is the first thing
-        // to revert - the user's own explicit request to test 1.0 (a full block) rather than something
-        // smaller.
+        // REVERTED back to AWCAPI's own initClimber default (0.1, not 0) - the user's own explicit
+        // "do both" request (alongside the new FLOOR_COLUMN logging), testing a new theory this exact
+        // 0.0 value likely caused. Was set to exactly 0 earlier this session for a DIFFERENT bug (the
+        // "flips on the ceiling" issue, live-described as "glitched into the block, then corrected
+        // below on the next block over" - a textbook vanilla auto-step-up-collision-into-solid-rock
+        // symptom - see this file's own git history for that reasoning in full). But live-captured
+        // WDIAG/ONGROUND_TRANSITION data THIS session then caught a NEW, previously-unseen symptom:
+        // the entity repeatedly losing all real collision (hColl/vColl/vCollBelow all false, onGround
+        // false) for a tick or two, every ~1-1.4s, while walking across completely FLAT floor - no
+        // wall or ceiling involved at all, pitch staying exactly 0.0 throughout. That's exactly the
+        // shape of symptom a STEP_HEIGHT of precisely 0 would produce: zero tolerance for even a
+        // hairline bump crossing an ordinary block boundary during normal walking, where vanilla's own
+        // step-up assist would otherwise silently absorb it. If this doesn't help, 0.0 is still worth
+        // revisiting for the original ceiling-flip case it was targeting - just not while also causing
+        // this new flat-floor stumble.
         this.getAttribute(Attributes.STEP_HEIGHT).setBaseValue(0.1);
         //
-        // Widened from AWCAPI's own defaults (2.0/1.25, verified via javap against ClimberComponent's
-        // constructor) - live testing found the wendigo sometimes losing its wall/ceiling attachment
-        // entirely (falling) specifically crossing an outside/convex corner (e.g. ceiling wrapping
-        // onto a wall around a protruding edge). These are exactly the search-range parameters
-        // ClimberComponent.updateOffsetsAndOrientation uses (via CollisionSmoothingUtil.findClosestPoint)
-        // to find a nearby surface to refine attachment against each tick - a convex corner is
-        // precisely the geometry where a short search radius can come up empty on both adjoining
-        // faces at once. First pass, adjust by feel - this is a genuine AWCAPI-side edge case being
-        // mitigated, not something confirmed fixed outright (no way to test this live from here).
+        // WIDENED again, back to 4.0/2.5 (AWCAPI's own defaults are 2.0/1.25, verified via javap
+        // against ClimberComponent's constructor). Live-testing this session briefly reverted these to
+        // the plain defaults - the user's own explicit "widen it [back] and add logging, then we can
+        // unwiden it later if it doesn't work" request - after WDIAG data caught the entity's
+        // orientation.pitch sweeping through the full floor-to-ceiling range while genuinely just
+        // walking a flat floor with no real wall/ceiling nearby, which a too-wide search radius
+        // snagging a distant surface would explain. But reverting to the plain default turned out to
+        // break something real and already covered by this repo's own GameTest suite: with 2.0/1.25,
+        // WendigoGameTests' injectedApproachSpotAbovePlanReachesTheCeiling/
+        // injectedSpotAboveThenDropPlanReachesCeilingThenFalls started failing intermittently but
+        // reproducibly (3 out of 4 full-suite runs) with the wendigo never reaching the ceiling at all
+        // in some room geometries - not a new symptom, a REGRESSION of the exact convex-corner case
+        // 4.0/2.5 was originally introduced to fix. Back to 4.0/2.5 confirmed clean again. The flat-
+        // floor pitch-sweep symptom above is real too, but whatever's causing it isn't simply "the
+        // search radius is too wide" - something else is going on, worth chasing with the new
+        // onGround()-transition logging (see logDiagnostics) rather than this parameter.
         this.setCollisionsInclusionRange(4.0F);
         this.setCollisionsSmoothingRange(2.5F);
         // PathType.FENCE carries a baked-in -1.0F (BLOCKED-equivalent) default malus (confirmed via
@@ -465,16 +488,25 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         }
     }
 
-    /** See playHurtSound's own comment - same isSilent()-bypass reasoning. Uses a fixed sound
-     * (SoundEvents.STONE_STEP, user's own explicit choice) rather than the generic per-block
-     * SoundType footstep every other mob gets (confirmed via javap: Entity.playStepSound's default
-     * body always uses the walked-on block's own SoundType, never a per-entity override). Volume/
-     * pitch match vanilla's own typical footstep loudness (SoundType's ~0.15 volume scale), not a
-     * per-step random pitch vanilla doesn't apply here either. */
+    /** See playHurtSound's own comment - same isSilent()-bypass reasoning. Now uses the walked-on
+     * block's own SoundType (state.getSoundType()) - the user's own explicit "sound like whatever
+     * he's walking on, just like other entities" correction to an earlier version of this that
+     * always played a fixed SoundEvents.STONE_STEP regardless of surface. Same volume/pitch formula
+     * vanilla's own default Entity.playStepSound body uses (confirmed via javap: soundType.getVolume()
+     * * 0.15F, soundType.getPitch(), no per-step random variance) - just routed through a direct
+     * serverLevel.playSound call instead of the isSilent()-gated Entity.playSound(SoundEvent,F,F)
+     * that default body actually calls, so setSilent(true) (see the constructor) doesn't swallow it. */
     @Override
     protected void playStepSound(BlockPos pos, BlockState state) {
+        // The user's own explicit "no sound at all in stage 1" - matches remove()'s own stage-1 sound
+        // suppression (see STAGE1_MAX_PERCENT's own comment for the exact cutoff/severity source).
+        if (this.severityPercent < STAGE1_MAX_PERCENT) {
+            return;
+        }
         if (this.level() instanceof ServerLevel serverLevel) {
-            serverLevel.playSound(null, pos, SoundEvents.STONE_STEP, SoundSource.HOSTILE, 0.15F, 1.0F);
+            SoundType soundType = state.getSoundType();
+            serverLevel.playSound(null, pos, soundType.getStepSound(), SoundSource.HOSTILE,
+                soundType.getVolume() * 0.15F, soundType.getPitch());
         }
     }
 
@@ -520,6 +552,13 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     public void aiStep() {
         float realZza = this.zza;
         boolean realOnGround = this.onGround();
+        // See startCeilingSettle's own doc comment - re-nudges into the ceiling every one of these real
+        // ticks (not just once) so ClimberHelper.livingTickClimber right below keeps seeing genuine,
+        // fresh per-tick collision against it the whole window, the same way a real walked climb would.
+        if (this.ceilingSettleTicksRemaining > 0) {
+            this.ceilingSettleTicksRemaining--;
+            nudgeTowardAttachedSurface(Direction.DOWN);
+        }
         boolean forceDetaching = this.forceDetachTicksRemaining > 0;
         if (forceDetaching) {
             this.forceDetachTicksRemaining--;
@@ -588,14 +627,43 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         return this.climberComponent;
     }
 
-    /** AWCAPI's own default (true unless a deny-list tag is set - see IAdvancedClimber's own doc
-     * comment, verified via javap) treats a fence post as just another climbable vertical surface,
-     * the same as a real wall - reads wrong for a large creature climbing on a thin, spindly fence.
-     * Excluded explicitly rather than via a deny-list tag since this is the only exclusion needed
-     * so far - extends rather than replaces whatever the default already covers. */
+    /** IAdvancedPathFindingEntity.getPathingMalus (the interface IAdvancedClimber itself extends,
+     * confirmed via javap) is a real, expected-to-be-overridden hook - its own default implementation
+     * is a trivial pass-through (return mob.getPathfindingMalus(pathType), no validation at all) that
+     * this class had silently been using unmodified this entire investigation. Ported directly from
+     * Nyf's Spiders (AWCAPI's own author's reference implementation, decompiled from
+     * nyfsspiders-fabric-26.1-3.0.0.jar's own SpiderMixin - the one piece of reference code actually
+     * built on this same library, not an independent reimplementation like Stormy's Spiders): for any
+     * VERTICAL move (delta.getY() != 0 - i.e. climbing up or down onto a new surface, exactly the
+     * wall-to-ceiling transition this whole investigation has centered on), this now requires a real,
+     * genuinely climbable block to exist adjacent to the candidate position in at least one direction
+     * the pathfinder has already confirmed reachable (canReach) - BLOCKED (-1.0F) otherwise. Without
+     * this, nothing ever validated that a vertical path node actually corresponded to a real surface
+     * before accepting it into a path - a very plausible direct explanation for the recurring
+     * "degenerate single-node path, cutting through open air" symptom this session's own PATH_NODES
+     * logging caught directly. Horizontal moves (delta.getY() == 0) are untouched, same as the
+     * default. */
     @Override
-    public boolean canClimbOnBlock(BlockState state, BlockPos pos) {
-        return IAdvancedClimber.super.canClimbOnBlock(state, pos) && !state.is(BlockTags.FENCES);
+    public float getPathingMalus(BlockGetter level, Mob mob, PathType pathType, BlockPos pos, Vec3i delta,
+            Predicate<Direction> canReach) {
+        if (delta.getY() != 0) {
+            BlockPos.MutableBlockPos check = new BlockPos.MutableBlockPos();
+            boolean foundClimbable = false;
+            for (Direction dir : Direction.values()) {
+                if (!canReach.test(dir)) {
+                    continue;
+                }
+                check.set(pos.getX() + dir.getStepX(), pos.getY() + dir.getStepY(), pos.getZ() + dir.getStepZ());
+                if (this.canClimbOnBlock(level.getBlockState(check), check)) {
+                    foundClimbable = true;
+                    break;
+                }
+            }
+            if (!foundClimbable) {
+                return -1.0F;
+            }
+        }
+        return mob.getPathfindingMalus(pathType);
     }
 
     @Override
@@ -639,25 +707,33 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * IAdvancedClimber's own default implementation is a raw pass-through to ClimberComponent.
      * getGroundDirection().getKey() - the same per-tick "closest colliding face" probe
      * getGroundDirection() reads, which falls back to a plain Direction.DOWN default whenever
-     * nothing registers within its own reach, not because it actually found a floor. Live debug
-     * logging (since removed - see WendigoEntity's git history for the exact transcript) confirmed
-     * this value stays correct and stable through an entire reproduction of the "flips to the wrong
-     * normal" bug on a wide-open ceiling, ruling this specific mechanism out as the cause on its
-     * own - kept anyway as a real, independently-justified correction (a spurious empty-probe
-     * fallback is still possible on small/edge geometry, just not what this particular bug turned
-     * out to be), and because updateOrientationConvergence below now also depends on this value
-     * being trustworthy. A raw reading of DOWN is only trusted if hasRealFloorNearby() (the same
-     * real, independent block-collision check recoverFromSpuriousAttachmentLoss already uses for
-     * exactly this "is this floor reading actually real" question) backs it up; otherwise the last
-     * reading that WAS trusted (lastGoodGroundSide) is returned instead. */
+     * nothing registers within its own reach, not because it actually found a floor. An EARLIER live
+     * debug session (see WendigoEntity's git history) found this raw reading stable through one
+     * particular ceiling-flip repro and concluded it wasn't the cause - but a later live
+     * CHASE_REPATH/WDIAG capture directly contradicts that: for an entire chase spanning a full wall
+     * climb and a long ceiling traversal,
+     * the raw passthrough reported DOWN on literally every single sampled tick (never once UP or a
+     * wall direction), even on the exact same ticks getGroundDirection() itself (WDIAG's own
+     * groundDir field) correctly read "south" through the wall climb and "up" through 278 of 316
+     * ceiling-traversal ticks. AWCAPI's own pathfinder (AdvancedWalkNodeProcessor.isValidStartingSide,
+     * confirmed via decompile) gates every direction a FRESH search is allowed to start from on this
+     * exact value: {@code side == groundSide || side.getAxis() != groundSide.getAxis()} - with
+     * groundSide stuck at DOWN, any wall direction passes (different axis) but UP is explicitly
+     * rejected (same axis, doesn't equal DOWN) - so every repath issued while genuinely
+     * ceiling-attached had its one correct starting direction stripped before the search even began,
+     * collapsing to the single-node best-effort result this whole investigation has been chasing. The
+     * very first path (started from the floor, where DOWN really was correct) was never affected,
+     * which is exactly why it alone succeeded.
+     * <p>
+     * Rebuilt directly on getGroundDirection() instead - the same per-tick, reach-independent
+     * geometric probe forceDetach() already trusts for this identical "which surface is real" question
+     * (see that method's own comment), not the separately-probed (and evidently unreliable, per the
+     * capture above) updateWalkingSide-based raw passthrough. No hasRealFloorNearby()/
+     * lastGoodGroundSide fallback layer needed anymore - that machinery existed specifically to paper
+     * over the old source's own unreliability; the new source is already correct fresh every tick. */
     @Override
     public Direction getGroundSide() {
-        Direction raw = IAdvancedClimber.super.getGroundSide();
-        if (raw == Direction.DOWN && !hasRealFloorNearby()) {
-            return this.lastGoodGroundSide;
-        }
-        this.lastGoodGroundSide = raw;
-        return raw;
+        return this.getGroundDirection().getLeft();
     }
 
     // --- end IAdvancedClimber physics wiring --------------------------------------------------
@@ -691,6 +767,65 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         return this.severityPercent;
     }
 
+    // The user's own explicit "5 seconds" request - a rolling window of real distance-to-target
+    // samples, one per real server tick, so a fresh context build (WaveContext.playerDirection) can
+    // read "closer/farther than 5 seconds ago" without needing to have started sampling right at that
+    // exact moment - see samplePlayerDirection, called every tick from tick() (unconditionally, not
+    // just while a plan/orbit is active), so history is already warm by the time anything actually
+    // asks for it.
+    private static final int PLAYER_DIRECTION_WINDOW_TICKS = 100; // 5s
+    private final double[] recentDistances = new double[PLAYER_DIRECTION_WINDOW_TICKS];
+    private int recentDistanceIndex;
+    // Capped at PLAYER_DIRECTION_WINDOW_TICKS - distinguishes "genuinely not enough history yet"
+    // (fresh spawn, or the buffer's own oldest slot is still default/never-written) from a real
+    // reading; playerDirection() returns null until this reaches the window size.
+    private int recentDistanceSampleCount;
+
+    /** Overwrites the oldest sample in the ring buffer with the current distance to Targeting.
+     * nearestPlayer (the same locked-target-aware lookup every other distance/movement call site
+     * already uses) - skips this tick entirely (leaves the buffer untouched) if no target is
+     * currently resolvable, rather than feeding a false zero/stale reading into the window. */
+    private void samplePlayerDirection() {
+        Player target = Targeting.nearestPlayer(this);
+        if (target == null) {
+            return;
+        }
+        this.recentDistances[this.recentDistanceIndex] = this.distanceTo(target);
+        this.recentDistanceIndex = (this.recentDistanceIndex + 1) % PLAYER_DIRECTION_WINDOW_TICKS;
+        if (this.recentDistanceSampleCount < PLAYER_DIRECTION_WINDOW_TICKS) {
+            this.recentDistanceSampleCount++;
+        }
+    }
+
+    // Below this net change (in blocks) over the window, the player reads as "steady" rather than
+    // movingCloser/movingAway - real player movement is essentially never at EXACTLY zero net change,
+    // so a strict positive/negative split would flicker on tiny drift for someone who's mostly just
+    // standing still. User-confirmed choice (see this feature's own planning discussion).
+    private static final double PLAYER_DIRECTION_STEADY_THRESHOLD_BLOCKS = 1.0;
+
+    /** "movingCloser" / "movingAway" / "steady" (general change in distance to the current target over
+     * the last PLAYER_DIRECTION_WINDOW_TICKS real ticks), or null if the buffer hasn't been filled that
+     * long yet (a fresh spawn, or the target only just became resolvable) - see WaveContext.
+     * toPromptText's own null handling for how that's presented (or omitted) in the prompt. */
+    public String playerDirection() {
+        if (this.recentDistanceSampleCount < PLAYER_DIRECTION_WINDOW_TICKS) {
+            return null;
+        }
+        Player target = Targeting.nearestPlayer(this);
+        if (target == null) {
+            return null;
+        }
+        // recentDistanceIndex currently points at the OLDEST sample (the next one due to be
+        // overwritten) - exactly PLAYER_DIRECTION_WINDOW_TICKS old once the buffer is full.
+        double oldest = this.recentDistances[this.recentDistanceIndex];
+        double current = this.distanceTo(target);
+        double delta = current - oldest;
+        if (Math.abs(delta) < PLAYER_DIRECTION_STEADY_THRESHOLD_BLOCKS) {
+            return "steady";
+        }
+        return delta > 0 ? "movingAway" : "movingCloser";
+    }
+
     @Override
     protected void registerGoals() {
         // Deliberately NOT calling super.registerGoals() -- Enderman's own goal set (teleport
@@ -721,8 +856,10 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         updateGroundDirectionStability();
         updateRestingOnFloorDebounce();
         updatePose();
+        logDiagnostics();
 
         if (!this.level().isClientSide()) {
+            samplePlayerDirection();
             this.planRunner.tick();
         }
     }
@@ -755,15 +892,159 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         // groundSide/normal.y together the instant pitch jumps by more than PITCH_LOG_JUMP_THRESHOLD_DEGREES
         // in one tick, to catch the exact moment and real numbers live instead of guessing again.
         // Remove once the real mechanism is confirmed.
-        if (WendigoDebug.anyEnabled() && !Float.isNaN(this.lastLoggedPitch)
+        if (WendigoDebug.verboseEnabled() && !Float.isNaN(this.lastLoggedPitch)
                 && Math.abs(pitch - this.lastLoggedPitch) > PITCH_LOG_JUMP_THRESHOLD_DEGREES
                 && this.level() instanceof ServerLevel serverLevel) {
             WendigoDebug.say(serverLevel, "pitch jumped " + String.format("%.1f", this.lastLoggedPitch)
                 + " -> " + String.format("%.1f", pitch) + " (rampFraction=" + String.format("%.2f", rampFraction)
                 + ", groundSide=" + this.getGroundSide() + ", normal.y=" + String.format("%.3f", this.getOrientation().normal.y)
                 + ", zza=" + this.zza + ", onGround=" + this.onGround() + ")");
+            logNearbyClimbableSurfaces();
         }
         this.lastLoggedPitch = pitch;
+    }
+
+    /** Dumps every solid, climbable-per-canClimbOnBlock block within the CURRENT live
+     * collisionsInclusionRange (read via getCollisionsInclusionRange(), so this automatically tracks
+     * whatever value the constructor sets - see its own doc comment for the live collision-range A/B
+     * test this supports) of the entity's own position, each one's offset from the entity. AWCAPI's
+     * own CollisionSmoothingUtil.findClosestPoint (used internally by updateOffsetsAndOrientation to
+     * blend attachmentNormal toward whatever's nearby, confirmed via RigMatrices' own doc comment)
+     * isn't itself instrumentable - closed-source, no accessor exposes which surface it actually picked
+     * - so this is the closest indirect proxy: if a spurious, far-off wall/ceiling patch shows up here
+     * right when something goes wrong (especially one that isn't part of the floor the entity is
+     * visibly standing on), that's strong evidence the search radius itself is grabbing the wrong
+     * surface, not the blending math downstream of it. Writes to the SERVER LOG (not chat - this can
+     * be a wide, multi-block dump). Called from two rare triggers - updateClimbingSpeedPenalty's own
+     * big-pitch-jump log and logDiagnostics' own onGround() transition log - both of those. */
+    private void logNearbyClimbableSurfaces() {
+        if (!(this.level() instanceof ServerLevel)) {
+            return;
+        }
+        BlockPos center = this.blockPosition();
+        int range = (int) Math.ceil(this.getCollisionsInclusionRange());
+        StringBuilder found = new StringBuilder();
+        for (int dx = -range; dx <= range; dx++) {
+            for (int dy = -range; dy <= range; dy++) {
+                for (int dz = -range; dz <= range; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    BlockState state = this.level().getBlockState(pos);
+                    if (state.isAir() || state.getCollisionShape(this.level(), pos).isEmpty()) {
+                        continue;
+                    }
+                    if (!this.canClimbOnBlock(state, pos)) {
+                        continue;
+                    }
+                    if (found.length() > 0) {
+                        found.append(", ");
+                    }
+                    found.append(String.format("(%+d,%+d,%+d)=", dx, dy, dz)).append(state.getBlock());
+                }
+            }
+        }
+        WendigoMod.LOGGER.info("NEARBY_SURFACES id={} range={} center={} blocks=[{}]",
+            this.getId(), range, center.toShortString(), found);
+    }
+
+    /** Rich per-tick physics/orientation dump to the SERVER LOG (not chat - this is meant to run for a
+     * whole live test session without flooding anyone's screen, then be grepped afterward the same way
+     * every debug session this far has already used logs/latest.log). Gated on WendigoDebug.anyEnabled()
+     * the same way every other diagnostic in this class is. Built for a live wendigo-vs-(Stormy's
+     * Spiders climbing spider) A/B comparison - see SpiderDiagnostics for a matching per-tick dump on
+     * the spider side, in a directly comparable format, and WendigoDebugItems' bookmark item for
+     * marking the exact moment something visibly goes wrong so it can be found in this log afterward.
+     * Every field here is something the ceiling-flip investigation has directly cared about at some
+     * point (see this class's own git history): both the raw and corrected getGroundSide(), the live
+     * getGroundDirection() probe (direction AND the actual collision-point vector, not just which
+     * axis), the orientation normal/pitch/yaw calculateOrientation actually produced, onGround() plus
+     * the three raw collision flags it's derived from, zza (the "is a move actually being commanded
+     * this tick" signal that correlated with the pitch collapse in the last live repro), velocity, and
+     * the live MOVEMENT_SPEED attribute value (read after updateClimbingSpeedPenalty already ran this
+     * tick, so it reflects what speed the entity will ACTUALLY move at, not just what pitch implies it
+     * should). "WDIAG" prefix - greppable, and distinct from the unrelated pitch-jump logging above. */
+    private void logDiagnostics() {
+        // verboseEnabled(), not anyEnabled() - see that flag's own doc comment. This one gate also
+        // covers logNearbyClimbableSurfaces/logFloorColumn (NEARBY_SURFACES/FLOOR_COLUMN), both only
+        // ever called from within this method's own ONGROUND_TRANSITION branch below - the exact
+        // giant per-block dump live-reported as overwhelming an unrelated log-reading session.
+        if (!WendigoDebug.verboseEnabled() || !(this.level() instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        Direction groundSideRaw = IAdvancedClimber.super.getGroundSide();
+        Direction groundSide = this.getGroundSide();
+        var groundDirection = this.getGroundDirection();
+        var orientation = this.getOrientation();
+        Vec3 vel = this.getDeltaMovement();
+        Vec3 pos = this.position();
+        WendigoMod.LOGGER.info("WDIAG id={} t={} pos=({},{},{}) groundSideRaw={} groundSide={} groundDir={} groundDirVec=({},{},{}) "
+                + "normal=({},{},{}) pitch={} yaw={} onGround={} hColl={} vColl={} vCollBelow={} zza={} vel=({},{},{}) speed={} navInProgress={}",
+            this.getId(),
+            String.format("%.2f", serverLevel.getServer().getTickCount() / 20.0),
+            String.format("%.3f", pos.x), String.format("%.3f", pos.y), String.format("%.3f", pos.z),
+            groundSideRaw, groundSide, groundDirection.getLeft(),
+            String.format("%.2f", groundDirection.getRight().x), String.format("%.2f", groundDirection.getRight().y),
+                String.format("%.2f", groundDirection.getRight().z),
+            String.format("%.3f", orientation.normal.x), String.format("%.3f", orientation.normal.y),
+                String.format("%.3f", orientation.normal.z),
+            String.format("%.1f", orientation.pitch), String.format("%.1f", orientation.yaw),
+            this.onGround(), this.horizontalCollision, this.verticalCollision, this.verticalCollisionBelow,
+            this.zza,
+            String.format("%.3f", vel.x), String.format("%.3f", vel.y), String.format("%.3f", vel.z),
+            String.format("%.3f", this.getAttributeValue(Attributes.MOVEMENT_SPEED)),
+            this.getNavigation().isInProgress());
+
+        // Catches the ACTUAL moment real collision is gained/lost, not just the later moment
+        // calculateOrientation gives up and resets to its no-attachment default (which is what the
+        // pitch-jump trigger above catches) - the live-captured evidence this session found the
+        // orientation reset happening AFTER onGround already went false, meaning the true point of
+        // failure (why did a real collision probe come up empty right here) was already a few ticks in
+        // the past by the time the pitch jump fired. Firing NEARBY_SURFACES on the transition itself
+        // instead should show what was/wasn't in reach at the exact tick contact was lost or regained.
+        boolean onGroundNow = this.onGround();
+        if (this.lastLoggedOnGround != null && this.lastLoggedOnGround != onGroundNow) {
+            WendigoMod.LOGGER.info("ONGROUND_TRANSITION id={} t={} {} -> {} (pitch={}, hColl={}, vColl={}, vCollBelow={}, zza={})",
+                this.getId(), String.format("%.2f", serverLevel.getServer().getTickCount() / 20.0),
+                this.lastLoggedOnGround, onGroundNow, String.format("%.1f", orientation.pitch),
+                this.horizontalCollision, this.verticalCollision, this.verticalCollisionBelow, this.zza);
+            logNearbyClimbableSurfaces();
+            logFloorColumn();
+        }
+        this.lastLoggedOnGround = onGroundNow;
+    }
+
+    /** Unfiltered companion to logNearbyClimbableSurfaces, added after that method's own output threw
+     * up something genuinely puzzling live: at several real onGround() true->false transitions on
+     * what otherwise reads as flat, ordinary floor (pitch staying 0.0 throughout, nothing exotic about
+     * the room), NEARBY_SURFACES found zero solid blocks anywhere from 4 blocks below the entity up to
+     * its own level - only the ceiling well above showed up - despite onGround() having read true with
+     * real vertical collision just one tick earlier. That result depends on canClimbOnBlock (always
+     * true per AWCAPI's own default, confirmed via javap - not the filter) and getCollisionShape().
+     * isEmpty() both agreeing nothing solid exists in a 4-block radius, which shouldn't be possible one
+     * tick after genuinely standing on something - so before trusting that as a real finding, this logs
+     * the raw block state (id, isAir, collision-empty) of every position in a plain 3x7x3 column
+     * straight down from the entity's own feet (dx/dz -1..1, dy 0..-6), completely unfiltered, to
+     * either confirm the gap is real or reveal where the filtered scan above is going wrong. */
+    private void logFloorColumn() {
+        if (!(this.level() instanceof ServerLevel)) {
+            return;
+        }
+        BlockPos center = this.blockPosition();
+        StringBuilder found = new StringBuilder();
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = 0; dy >= -6; dy--) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    BlockState state = this.level().getBlockState(pos);
+                    boolean collisionEmpty = state.getCollisionShape(this.level(), pos).isEmpty();
+                    if (found.length() > 0) {
+                        found.append(", ");
+                    }
+                    found.append(String.format("(%+d,%+d,%+d)=", dx, dy, dz)).append(state.getBlock())
+                        .append("[air=").append(state.isAir()).append(",collisionEmpty=").append(collisionEmpty).append(']');
+                }
+            }
+        }
+        WendigoMod.LOGGER.info("FLOOR_COLUMN id={} center={} entries=[{}]", this.getId(), center.toShortString(), found);
     }
 
     /** Whether the current position physically has room to stand - see DarkSpotScanner's own
@@ -868,8 +1149,17 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         if (!restingNow) {
             this.lastClimbingNormal = this.getOrientation().normal;
         } else if (!suppressed && !this.wasRestingOnFloorRawLastTick && !hasRealFloorNearby()) {
-            Vec3 towardSurface = this.lastClimbingNormal.normalize().scale(-SPURIOUS_LOSS_RECOVERY_PUSH_DISTANCE);
-            this.move(MoverType.SELF, towardSurface);
+            // TEMPORARILY DISABLED again - re-enabling this push caused a confirmed GameTest
+            // regression (injected_approach_spot_above_plan_reaches_the_ceiling/
+            // injected_spot_above_then_drop_plan_reaches_ceiling_then_falls both broke), the same
+            // category of harm every other custom mitigation this session has tried has caused. The
+            // user's own explicit rule: nothing here that isn't also in Nyf's Spiders' own SpiderMixin
+            // (fully audited this session - it carries no custom move controller and no reactive
+            // orientation-recovery code at all, just stock AWCAPI). Bandaids on top of a stuck
+            // orientation aren't the fix; the fix has to be whatever structural difference makes
+            // AWCAPI itself behave differently for this entity than for a spider in the first place.
+            // Vec3 towardSurface = this.lastClimbingNormal.normalize().scale(-SPURIOUS_LOSS_RECOVERY_PUSH_DISTANCE);
+            // this.move(MoverType.SELF, towardSurface);
         }
         this.wasRestingOnFloorRawLastTick = restingNow;
     }
@@ -907,15 +1197,18 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     private void updateOrientationConvergence() {
         Direction groundSide = this.getGroundSide();
         boolean converging = groundSide != Direction.DOWN && this.getOrientation().normal.y > 0.9;
-        if (converging) {
-            Vec3 towardSurface = new Vec3(groundSide.getStepX(), groundSide.getStepY(), groundSide.getStepZ())
-                .scale(ORIENTATION_CONVERGENCE_PUSH_DISTANCE);
-            this.move(MoverType.SELF, towardSurface);
-        }
+        // TEMPORARILY DISABLED again - same confirmed GameTest regression and same "not in Nyf's
+        // Spiders, so not the fix" reasoning as recoverFromSpuriousAttachmentLoss's own updated
+        // comment right above.
+        // if (converging) {
+        //     Vec3 towardSurface = new Vec3(groundSide.getStepX(), groundSide.getStepY(), groundSide.getStepZ())
+        //         .scale(ORIENTATION_CONVERGENCE_PUSH_DISTANCE);
+        //     this.move(MoverType.SELF, towardSurface);
+        // }
         // TEMPORARY - live-debugging this fix itself, same as getGroundSide's own removed logging -
         // logs once per real start/stop transition, not every tick the mismatch persists, so a real
         // repro doesn't get buried in spam. Remove once this is confirmed fixed.
-        if (converging != this.wasConvergingOrientationLastTick && WendigoDebug.anyEnabled()
+        if (converging != this.wasConvergingOrientationLastTick && WendigoDebug.verboseEnabled()
                 && this.level() instanceof ServerLevel serverLevel) {
             WendigoDebug.say(serverLevel, "orientation convergence " + (converging ? "STARTED" : "stopped")
                 + " (groundSide=" + groundSide + ", normal.y=" + String.format("%.3f", this.getOrientation().normal.y)
@@ -972,9 +1265,12 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
             return;
         }
         this.groundDirectionChangeTicks = 0;
-        Vec3 towardCurrentSurface = new Vec3(current.getStepX(), current.getStepY(), current.getStepZ())
-            .scale(GROUND_DIRECTION_STABILITY_PUSH_DISTANCE);
-        this.move(MoverType.SELF, towardCurrentSurface);
+        // TEMPORARILY DISABLED - the user's own explicit request, to observe the raw, unmasked AWCAPI
+        // fall behavior with none of this class's own reactive corrections in the way, as a live
+        // diagnostic. Re-enable once that's done.
+        // Vec3 towardCurrentSurface = new Vec3(current.getStepX(), current.getStepY(), current.getStepZ())
+        //     .scale(GROUND_DIRECTION_STABILITY_PUSH_DISTANCE);
+        // this.move(MoverType.SELF, towardCurrentSurface);
     }
 
     /**
@@ -996,8 +1292,36 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * deliberate one. What happens after is ordinary physics from here - ordinary gravity, and AWCAPI's
      * own reattachment search picking back up wherever it next finds solid ground (or the player, if
      * this is used as an ambush).
-     */
+     * <p>
+     * No-op while genuinely already resting on a floor (getGroundSide()==DOWN, cross-checked against
+     * hasRealFloorNearby() - see that method's own doc comment and the paragraph right below for why
+     * the cross-check is now needed) - the user's own explicit request, once movement.drop's own schema
+     * was opened up to be used speculatively at any point in a plan (not just right after a deliberate
+     * spot_above positioning): a plan built without knowing for certain what surface an EARLIER step
+     * will have left the wendigo on shouldn't have to guess right or risk a visible, pointless little
+     * upward hop out of an ordinary floor stance just because it tried this anyway. Genuinely nothing to
+     * detach FROM when already on a floor, so this is a real, complete no-op, not a diminished version
+     * of the push below.
+     * <p>
+     * Real bug, live-debugged via a GameTest diagnostic: getGroundSide()==DOWN alone isn't actually
+     * reliable enough for this specific check, despite that method's own doc comment's confidence -
+     * right after a combat.teleport_to_band(band="above_player") ceiling landing specifically, both
+     * getGroundSide() AND onGround() can spuriously read as an ordinary floor (normal.y reading ~1.0
+     * too) while the entity is still physically sitting at ceiling height with nothing solid anywhere
+     * near it - confirmed by dumping exactly that state mid-test (y unchanged from the ceiling contact
+     * point, groundSide=DOWN, onGround=true, in a room with no floor for another 10+ open blocks below).
+     * Since this method's own early return already treats getGroundSide()==DOWN as "nothing to do,"
+     * that spurious reading was silently no-op'ing every single movement.drop attempt right at this
+     * first line, regardless of anything else (nudge direction, settle timing) - explaining why several
+     * earlier fix attempts elsewhere all measurably changed nothing. hasRealFloorNearby() (already used
+     * for exactly this kind of "is this floor reading actually explained by real ground" distinction by
+     * recoverFromSpuriousAttachmentLoss elsewhere in this class) is the cross-check: a real floor
+     * landing has solid ground directly beneath, a spurious ceiling-flip doesn't, so only skip the push
+     * when BOTH agree. */
     public void forceDetach() {
+        if (this.getGroundSide() == Direction.DOWN && hasRealFloorNearby()) {
+            return;
+        }
         // Deliberately getGroundDirection() (ClimberComponent.updateWalkingSide's own real, per-tick
         // geometric collision probe) here, NOT getOrientation().normal - live-debugged the difference:
         // orientation.normal only updates once updateOffsetsAndOrientation's own attachment SEARCH has
@@ -1175,6 +1499,52 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         this.setDeltaMovement(normal.normalize().scale(-SPAWN_SURFACE_NUDGE_SPEED));
     }
 
+    // How many REAL ticks settleCeilingAttachment holds for - order of magnitude as FORCE_DETACH_TICKS
+    // (5), rounded up since this is walking a SEARCH bias toward convergence rather than a fixed
+    // physical countdown, so a little slack is cheap insurance. Real ticks, not a same-tick loop - see
+    // this field's own trigger's doc comment for why a synchronous loop (tried first, empirically
+    // failed a real GameTest) doesn't work here.
+    private static final int CEILING_SETTLE_TICKS = 10;
+    private int ceilingSettleTicksRemaining;
+
+    /**
+     * Real, separate follow-up to nudgeTowardAttachedSurface, live-debugged via a real GameTest
+     * failure: a fresh ceiling teleport (combat.teleport_to_band(band="above_player") - see
+     * PlanRunner's own call site) DOES stick after the nudge above (getGroundSide() genuinely reads
+     * UP), but a movement.drop issued right after it still couldn't detach - the entity just sat at
+     * ceiling height for the rest of the test. Root cause, from this class's own established
+     * "chicken-and-egg" finding (see forceDetach's own doc comment): ClimberComponent.
+     * updateOffsetsAndOrientation's attachment SEARCH is seeded from whatever orientation.normal
+     * already is, and a single nudge tick's one real collision isn't reliably enough for that search to
+     * fully walk the bias away from its stale plain-floor seed before the very next plan step already
+     * runs - forceDetach's own push direction is independently correct (getGroundDirection(), not
+     * orientation.normal), but AWCAPI's own per-tick travelOnGround still uses that still-stale
+     * orientation.normal to snap the entity right back to the ceiling regardless.
+     * <p>
+     * First attempt at a fix called ClimberHelper.livingTickClimber - the same per-tick call aiStep
+     * already makes once per real tick - several times synchronously, right here, on the theory that
+     * repeated passes over the same already-correct collision geometry would be enough to converge the
+     * search. Empirically wrong - a real GameTest re-run afterward showed no change at all (still stuck
+     * at ceiling height). Nothing about the entity's position/collision geometry changes between
+     * same-tick calls with no real movement in between, so the search was evidently seeing byte-for-byte
+     * identical input every pass and producing the same (still-biased) result each time - it needs
+     * genuinely new per-tick collision data, the same thing a real walked climb naturally provides step
+     * by step, not more passes over stale data.
+     * <p>
+     * Real fix: hold a REAL multi-tick window instead (see ceilingSettleTicksRemaining, decremented in
+     * aiStep alongside forceDetachTicksRemaining's own countdown) - re-nudges into the ceiling every one
+     * of those real ticks (not just once), keeping genuine per-tick collision happening the whole time,
+     * same as a real climb would. isCeilingSettling() lets PlanRunner's own movement.drop hold off on
+     * calling forceDetach() until this window actually closes - see isDropResolved().
+     */
+    public void startCeilingSettle() {
+        this.ceilingSettleTicksRemaining = CEILING_SETTLE_TICKS;
+    }
+
+    public boolean isCeilingSettling() {
+        return this.ceilingSettleTicksRemaining > 0;
+    }
+
     /**
      * Starts a wave's plan body, running to completion and then attempting a live-resolved despawn
      * move (see PlanRunner) - every position a step needs, including despawn's own farthest-band
@@ -1188,6 +1558,26 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     /** True once the current wave's plan body and despawn move have both finished. */
     public boolean isWaveComplete() {
         return this.planRunner.isWaveComplete();
+    }
+
+    /** See PlanRunner.isReEvaluateRequested. */
+    public boolean isReEvaluateRequested() {
+        return this.planRunner.isReEvaluateRequested();
+    }
+
+    /** See PlanRunner.reEvaluateStepLog. */
+    public List<String> reEvaluateStepLog() {
+        return this.planRunner.reEvaluateStepLog();
+    }
+
+    /** See PlanRunner.cancelReEvaluate. */
+    public void cancelReEvaluate() {
+        this.planRunner.cancelReEvaluate();
+    }
+
+    /** See PlanRunner.resumeFromReEvaluate. */
+    public void resumeFromReEvaluate(JsonObject subPlan) {
+        this.planRunner.resumeFromReEvaluate(subPlan);
     }
 
     /** Enters orbit mode (no active plan - see PlanRunner.startOrbit) around target. */
@@ -1245,6 +1635,11 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     /** See PlanRunner.consumeSpearRepelJustHappened. */
     public boolean consumeSpearRepelJustHappened() {
         return this.planRunner.consumeSpearRepelJustHappened();
+    }
+
+    /** See PlanRunner.consumeSnuffedTorches. */
+    public List<BlockPos> consumeSnuffedTorches() {
+        return this.planRunner.consumeSnuffedTorches();
     }
 
     /** Resolves a still-forced rider (damage or a clean release) before this entity is discarded -
@@ -1366,12 +1761,16 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         this.ejectPassengers();
         if (this.level() instanceof ServerLevel serverLevel) {
             boolean stage1 = this.severityPercent < STAGE1_MAX_PERCENT;
-            float scale = stage1 ? STAGE1_DESPAWN_EFFECT_SCALE : 1.0F;
             int particleCount = stage1 ? Math.round(DESPAWN_PARTICLE_COUNT * STAGE1_DESPAWN_EFFECT_SCALE) : DESPAWN_PARTICLE_COUNT;
             serverLevel.sendParticles(ParticleTypes.SMOKE, this.getX(), this.getY(), this.getZ(),
                 particleCount, DESPAWN_PARTICLE_DX, DESPAWN_PARTICLE_DY, DESPAWN_PARTICLE_DZ, 0.0);
-            serverLevel.playSound(null, this.getX(), this.getY(), this.getZ(),
-                SoundEvents.WARDEN_ATTACK_IMPACT, SoundSource.HOSTILE, scale, 0.0F);
+            // The user's own explicit "no sound at all in stage 1" - a step up from the previous
+            // quieter-but-still-audible STAGE1_DESPAWN_EFFECT_SCALE volume scaling. Particles still
+            // play (scaled down, unchanged) - only the sound itself is now a full stage-1 no-op.
+            if (!stage1) {
+                serverLevel.playSound(null, this.getX(), this.getY(), this.getZ(),
+                    SoundEvents.WARDEN_ATTACK_IMPACT, SoundSource.HOSTILE, 1.0F, 0.0F);
+            }
         }
         super.remove(reason);
     }
@@ -1413,6 +1812,14 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         return this.debugForceChasing || this.planRunner.isChasing();
     }
 
+    /** See PlanRunner.isCapturing - broader than isChasing (also true during a lunge or while
+     * forcing a ride), used by WendigoVisual to pick the angry vs normal crawl animation.
+     * Deliberately does NOT fold in debugForceChasing - that flag exists specifically for
+     * /wendigo headtest's own chase-visibility dummies, unrelated to which crawl variant plays. */
+    public boolean isCapturing() {
+        return this.planRunner.isCapturing();
+    }
+
     /** Set by memory.store_dark_location, read by predicate.dark_location_stored and retreat_to_dark(source=stored). */
     public BlockPos getStoredDarkLocation() {
         return this.storedDarkLocation;
@@ -1440,12 +1847,12 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     }
 
     /** Which rig layer(s) {@link WendigoVisual} should actually give real items to at construction
-     * time - see /wendigo summon's own comment. ALL is the normal in-game appearance (base +
-     * growth overlay + eyes all stacked); the other three isolate a single texture so it can be
-     * inspected without the other two layers drawn on top of it. Must be set before the entity is
+     * time - see /wendigo summon's own comment. ALL is the normal in-game appearance (base + the
+     * head-only emissive glow, stacked); the other two isolate a single texture so it can be
+     * inspected without the other layer drawn on top of it. Must be set before the entity is
      * added to the level (WendigoVisual reads it once, in its constructor, off WendigoMod's
      * ENTITY_LOAD hook - changing it after spawn has no effect). */
-    public enum TexturePreviewMode { ALL, BASE_ONLY, GROWTH_ONLY, EYES_ONLY }
+    public enum TexturePreviewMode { ALL, BASE_ONLY, EYES_ONLY }
 
     private TexturePreviewMode texturePreviewMode = TexturePreviewMode.ALL;
 

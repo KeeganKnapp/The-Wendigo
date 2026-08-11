@@ -69,13 +69,33 @@ public final class WendigoProgressionTracker {
 	private static final int ELIGIBILITY_TICKS_REQUIRED = 2000;
 
 	// Index by stage (1-5); index 0 unused, kept only so stage numbers can index directly without an
-	// off-by-one everywhere. Stage 5's goal is intentionally unreachable - see isGoalMet.
-	private static final int[] STAGE_GOALS = {0, 10, 10, 6, 4, Integer.MAX_VALUE};
+	// off-by-one everywhere. Stage 5's goal is intentionally unreachable - see isGoalMet. Stage 1's
+	// own progress field is stare count only now (was a combined "10 of anything" figure) - see
+	// STAGE1_SOUND_GOAL/ActiveRun.soundProgress right below for its own separate second axis.
+	private static final int[] STAGE_GOALS = {0, 4, 10, 6, 4, Integer.MAX_VALUE};
 	private static final int[] STAGE_PERCENTS = {0, 10, 30, 50, 70, 90};
+
+	// Stage 1's own compound goal - the user's own explicit "4 stares AND 4 noises" request, replacing
+	// the old single "10 successful stares" figure. Only stage 1 has a second axis at all (every other
+	// stage's own STAGE_GOALS entry is still a single number checked against ActiveRun.progress alone -
+	// see isGoalMet), so this doesn't generalize into an array the way STAGE_GOALS does.
+	private static final int STAGE1_SOUND_GOAL = 4;
+	// A THIRD axis, this one applying to every stage 1-4 uniformly (not just stage 1) - the user's own
+	// explicit "1 successful breathe on stage 1, 1 on stage 2... and so on" request. Stage 5 is
+	// deliberately exempt ("it doesn't really matter" there, the user's own words) - matching its own
+	// separate kill-triggered stop condition (endStage5Hunt) that bypasses isGoalMet's own ordinary
+	// progress check entirely anyway, so this would never actually be reachable there regardless.
+	private static final int BREATHE_GOAL = 1;
 
 	private static final class ActiveRun {
 		final int stage;
 		int progress;
+		// Stage 1's own "noises" axis (see STAGE1_SOUND_GOAL) - every sound.ambient_cue that actually
+		// played this run, across however many waves it took. Stays 0 and unused for every other stage.
+		int soundProgress;
+		// Every stage 1-4's own "successful breathe" axis (see BREATHE_GOAL) - stays 0 and unused for
+		// stage 5.
+		int breatheProgress;
 
 		ActiveRun(int stage) {
 			this.stage = stage;
@@ -260,9 +280,13 @@ public final class WendigoProgressionTracker {
 		return run != null ? run.stage : stageFor(completedRunsOf(player));
 	}
 
-	/** Stage-to-spawn-count mapping, confirmed with the user: spawns 1-2 -> stage 1, 3 -> stage 2,
-	 * 4 -> stage 3, 5 -> stage 4, 6+ -> stage 5 (permanent). completedRuns is 0-indexed (how many are
-	 * already fully done), so this answers "what stage does the NEXT/current run belong to". */
+	/** Stage-to-spawn-count mapping: spawns 1-2 -> stage 1, 3 -> stage 2, 4 -> stage 3, 5 -> stage 4,
+	 * 6+ -> stage 5 (permanent). Reverted back to giving stage 1 both spawns 1 and 2, the user's own
+	 * explicit "revert to two runs in stage 1" request (same session as the original "cut stage 1 to
+	 * only be the first run" change this undoes - stage 1's own loosened prose/sound-cue-unlock/
+	 * combat.breathe additions from that same stretch of changes all stay, only this run-count mapping
+	 * reverts). completedRuns is 0-indexed (how many are already fully done), so this answers "what
+	 * stage does the NEXT/current run belong to". */
 	public static int stageFor(int completedRuns) {
 		if (completedRuns <= 1) {
 			return 1;
@@ -312,12 +336,45 @@ public final class WendigoProgressionTracker {
 		}
 	}
 
+	/** Stage 1's own second axis (see STAGE1_SOUND_GOAL) - a no-op for every other stage's ActiveRun
+	 * (nothing ever reads soundProgress outside isGoalMet's own stage==1 check), but harmless to call
+	 * unconditionally rather than requiring every caller to check the stage first. */
+	public void addSecondaryProgress(ServerPlayer player, int amount) {
+		ActiveRun run = this.activeRuns.get(player.getUUID());
+		if (run != null) {
+			run.soundProgress += amount;
+		}
+	}
+
+	/** Every stage 1-4's own third axis (see BREATHE_GOAL) - a no-op for stage 5's ActiveRun (nothing
+	 * ever reads breatheProgress outside isGoalMet's own stage!=5 check), same "harmless to call
+	 * unconditionally" reasoning addSecondaryProgress above already has. */
+	public void addBreatheProgress(ServerPlayer player, int amount) {
+		ActiveRun run = this.activeRuns.get(player.getUUID());
+		if (run != null) {
+			run.breatheProgress += amount;
+		}
+	}
+
 	/** Stage 5 never reads true here (STAGE_GOALS[5] is Integer.MAX_VALUE) - it has its own separate
 	 * stop condition entirely (see endStage5Hunt): the player has to actually kill it, not accumulate
-	 * a counted goal, so a "progress" number has nothing to compare against here at all. */
+	 * a counted goal, so a "progress" number has nothing to compare against here at all (breatheMet is
+	 * still explicitly exempted for stage 5 too, for clarity, even though primaryMet alone already
+	 * blocks it from ever reading true). Stage 1 is the one DOUBLY-compound case - the user's own
+	 * explicit "4 stares AND 4 noises" request layered under a THIRD "1 successful breathe" axis that
+	 * now applies to every stage 1-4 (not just stage 1) - requiring progress (stares/torch-breaks/
+	 * lunges/grab, whichever that stage's own primary metric is), soundProgress (stage 1 only), and
+	 * breatheProgress (stages 1-4) to each independently clear their own goal, not a combined total of
+	 * any kind. */
 	public boolean isGoalMet(ServerPlayer player) {
 		ActiveRun run = this.activeRuns.get(player.getUUID());
-		return run != null && run.progress >= STAGE_GOALS[run.stage];
+		if (run == null) {
+			return false;
+		}
+		boolean primaryMet = run.progress >= STAGE_GOALS[run.stage];
+		boolean soundMet = run.stage != 1 || run.soundProgress >= STAGE1_SOUND_GOAL;
+		boolean breatheMet = run.stage == 5 || run.breatheProgress >= BREATHE_GOAL;
+		return primaryMet && soundMet && breatheMet;
 	}
 
 	/** Marks the active run as genuinely, permanently over - completedRuns advances (deciding the

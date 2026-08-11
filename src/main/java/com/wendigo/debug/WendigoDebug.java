@@ -49,11 +49,56 @@ public final class WendigoDebug {
 		return standingHeadYawOverrideDegrees;
 	}
 
+	// Same live-tunable idea as standingHeadYawOverrideDegrees, for the active-tracking (stare/chase,
+	// crawl pose, floor) head-yaw correction instead - set via /wendigo trackheadoffset <degrees>.
+	// Unlike the standing case, this one isn't reachable through headoffset at all (see
+	// WendigoVisual.onTick's own comment on why crawl-tracking needs its own separately-tuned value) -
+	// texture/UV changes have needed this constant re-flipped more than once historically, so this
+	// exists to let that be found by eye again instead of another blind edit/compile/restart guess.
+	private static volatile float trackingHeadYawOverrideDegrees = Float.NaN;
+
+	public static void setTrackingHeadYawOverride(float degrees) {
+		trackingHeadYawOverrideDegrees = degrees;
+	}
+
+	public static void clearTrackingHeadYawOverride() {
+		trackingHeadYawOverrideDegrees = Float.NaN;
+	}
+
+	public static float getTrackingHeadYawOverride() {
+		return trackingHeadYawOverrideDegrees;
+	}
+
+	// Same live-tunable idea again, for the CLIMBING (wall/ceiling/slope attachment) active-tracking
+	// yaw correction specifically - set via /wendigo climbheadoffset <degrees>. Confirmed live at 180
+	// for the new rig (WendigoVisual.CLIMB_TRACKING_HEAD_LOOK_YAW_CORRECTION_DEGREES, now the NaN
+	// fallback here too) - the exact opposite of the floor branch's own correction flip (180 -> 0).
+	// Left live-adjustable rather than fully hardcoded, same as every other head-yaw correction in this
+	// file, in case a future geometry/UV change needs it revisited again.
+	private static volatile float climbTrackingHeadYawOverrideDegrees = Float.NaN;
+
+	public static void setClimbTrackingHeadYawOverride(float degrees) {
+		climbTrackingHeadYawOverrideDegrees = degrees;
+	}
+
+	public static void clearClimbTrackingHeadYawOverride() {
+		climbTrackingHeadYawOverrideDegrees = Float.NaN;
+	}
+
+	public static float getClimbTrackingHeadYawOverride() {
+		return climbTrackingHeadYawOverrideDegrees;
+	}
+
 	// Live-toggle for WendigoVisual's flat-floor crawl-tracking pitch negation, set via
-	// /wendigo crawlpitch - true (the current code default) matches the negation already in place;
-	// flipping it to false lets a player instantly A/B the un-negated behavior without a rebuild, in
-	// case the negation turns out not to be the actual fix after all.
-	private static volatile boolean floorCrawlPitchInverted = true;
+	// /wendigo crawlpitch. Was true (negated) for the OLD rig - live testing after the new per-bone-
+	// textured rig swap found this backwards (looking down as the player gained height, should be
+	// looking up) for BOTH floor-crawl-staring AND standing-staring (the latter only started sharing
+	// this exact same pitch computation once standing-tracking got wired up - see WendigoVisual.onTick's
+	// own comment on dropping the crawlPoseActive requirement), so this now defaults to false (raw,
+	// un-negated) instead - same class of "front/back convention changed with the new export" fix as
+	// HEAD_LOOK_YAW_CORRECTION_DEGREES's own default flip. Still live-adjustable in case a future
+	// geometry change needs it revisited again.
+	private static volatile boolean floorCrawlPitchInverted = false;
 
 	public static void setFloorCrawlPitchInverted(boolean inverted) {
 		floorCrawlPitchInverted = inverted;
@@ -71,7 +116,7 @@ public final class WendigoDebug {
 	// disturb how the pitch visually composes even though the pitch formula itself didn't change,
 	// which is the best working theory for why climbing pitch reads backwards now. Best-guess
 	// default, not yet live-confirmed - toggle to compare against the un-negated value.
-	private static volatile boolean climbPitchInverted = true;
+	private static volatile boolean climbPitchInverted = false;
 
 	public static void setClimbPitchInverted(boolean inverted) {
 		climbPitchInverted = inverted;
@@ -79,6 +124,26 @@ public final class WendigoDebug {
 
 	public static boolean isClimbPitchInverted() {
 		return climbPitchInverted;
+	}
+
+	// The user's own explicit "too much fluff" request: the per-tick diagnostic dumps (WDIAG,
+	// PATH_NODES, CHASE_REPATH, NEARBY_SURFACES, FLOOR_COLUMN, ONGROUND_TRANSITION - all
+	// WendigoMod.LOGGER.info calls to the server log) and the high-volume chat commentary
+	// (PlanRunner's own debugSay - "chase:", "issue:", "drop check:", etc.) were both live-reported
+	// as overwhelming useful signal (the log dumps specifically made an unrelated log-reading session
+	// hard to follow). Defaults OFF, independent of anyEnabled()/toggle above - a debug session is
+	// still on and still gets the two things the user explicitly asked to always see (plan structure,
+	// the AI's own previous_encounter_recap - see WendigoManager/PlanRunner's own always-on prints),
+	// just without the rest, until this is flipped back on. Set via /wendigo verbose, mirroring
+	// /wendigo debug's own toggle pattern exactly.
+	private static volatile boolean verboseEnabled = false;
+
+	public static void setVerbose(boolean enabled) {
+		verboseEnabled = enabled;
+	}
+
+	public static boolean verboseEnabled() {
+		return verboseEnabled;
 	}
 
 	/** Flips this player's debug session, returns the new state (true = now enabled). */
