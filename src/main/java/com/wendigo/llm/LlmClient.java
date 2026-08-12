@@ -105,7 +105,8 @@ public class LlmClient {
 	// regardless of what a given panel supports, since file-manager/SFTP access is already required
 	// just to install the mod jar in the first place. Returns null (not throwing) if none of the
 	// three have anything - callers decide what "no key configured" means for their own request
-	// path. Never logged, never written back anywhere - purely read-only resolution.
+	// path. Never logged, never written back anywhere except the placeholder file itself (see
+	// below) - otherwise purely read-only resolution.
 	private static String resolveApiKey(String envVarName, String fileBaseName) {
 		String fromEnv = System.getenv(envVarName);
 		if (fromEnv != null && !fromEnv.isBlank()) {
@@ -116,15 +117,32 @@ public class LlmClient {
 			return fromProperty.trim();
 		}
 		Path path = FabricLoader.getInstance().getConfigDir().resolve("wendigo-" + fileBaseName + "-api-key.txt");
-		if (Files.exists(path)) {
+		// A real, live-reported gap: this used to only ever READ the file, never create it - so on
+		// a fresh install there was nothing for an admin to find or edit at all, no matter how they
+		// looked for it. Same "auto-write a discoverable default on first load" shape
+		// LlmConfig.load() already uses for the JSON config, just plain text instead of JSON -
+		// write a commented placeholder (never a real key) the first time this file doesn't exist,
+		// so a server admin has something concrete to open and edit via SFTP/file manager.
+		if (!Files.exists(path)) {
 			try {
-				String fromFile = Files.readString(path).trim();
-				if (!fromFile.isBlank()) {
-					return fromFile;
-				}
+				Files.createDirectories(path.getParent());
+				Files.writeString(path, "# Paste your " + envVarName + " value on its own line below (no "
+					+ "quotes), then restart the server for it to take effect.\n"
+					+ "# Lines starting with # are ignored.\n");
 			} catch (IOException e) {
-				throw new RuntimeException("Failed to read " + path, e);
+				throw new RuntimeException("Failed to write placeholder " + path, e);
 			}
+			return null;
+		}
+		try {
+			for (String line : Files.readAllLines(path)) {
+				String trimmed = line.trim();
+				if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
+					return trimmed;
+				}
+			}
+		} catch (IOException e) {
+			throw new RuntimeException("Failed to read " + path, e);
 		}
 		return null;
 	}
