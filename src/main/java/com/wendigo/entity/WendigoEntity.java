@@ -80,17 +80,27 @@ import com.wendigo.spatial.DarkSpotScanner;
  * instant it joins ("Received N registry entries that are unknown to this client"), regardless of
  * whether {@link WendigoVisual}'s own separate item-display rig is properly Polymer-virtualized -
  * registry-sync runs at login, well before any entity ever actually spawns. getPolymerEntityType
- * resolving to vanilla's own real EntityType.ENDERMAN (not just any invisible carrier) is what lets
- * PolymerEntityUtils.registerType (see ModEntities.init) exclude WENDIGO from that sync entirely and
- * have Polymer present this entity to a non-Polymer client AS a real, ordinary (if invisible, same
- * as always - see isInvisible below) Enderman instead - matching this class's own EnderMan
- * inheritance, so a non-mod client's hitbox/physics/sound-category assumptions for it stay
- * consistent with what it actually is.
+ * resolving to vanilla's own real EntityType.MARKER (not EntityType.ENDERMAN, tried first) is what
+ * lets PolymerEntityUtils.registerType (see ModEntities.init) exclude WENDIGO from that sync
+ * entirely and have Polymer present this entity to a non-Polymer client as something genuinely
+ * invisible. Enderman was tried first (matching this class's own EnderMan inheritance, and
+ * preserving real hitbox/click-targeting for a non-mod client), but real live-testing found a
+ * well-known vanilla EndermanRenderer quirk: its glowing eyes are drawn via a separate emissive
+ * layer that bypasses the normal invisibility alpha fade entirely, so an invisible Enderman still
+ * shows floating eyes - no per-entity data flag can suppress that without a client-side renderer
+ * change, which this project's own "no client mod required" design rules out. Marker is a real,
+ * genuinely invisible-by-design vanilla type with none of that - the user's own explicit choice,
+ * made with the accepted tradeoff that Marker has zero client-side collision, so a real vanilla
+ * client's own left-click attack-targeting (client-side raycast against a KNOWN local hitbox)
+ * likely can't select it anymore even though the SERVER's own real hitbox (used for arrow physics,
+ * the grab mechanic, etc.) is completely unaffected - melee is a real, functional (if
+ * secondary/incidental) damage path in hurtServer below, worth live-retesting if it turns out to
+ * matter.
  */
 public class WendigoEntity extends EnderMan implements IAdvancedClimber, PolymerEntity {
     @Override
     public EntityType<?> getPolymerEntityType(PacketContext context) {
-        return EntityType.ENDERMAN;
+        return EntityType.MARKER;
     }
 
     // Enderman's own tall/narrow hitbox doesn't suit a low horizontal crawl -- swap to a low
@@ -327,17 +337,17 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
         // getAmbientSound() to a custom value, since WendigoSounds.play() goes through
         // ServerLevel.playSound directly - unaffected by isSilent() either way.
         this.setSilent(true);
-        // A real, live-reported bug: the isInvisible() override below only affects server-side Java
-        // logic that calls it directly - it does NOT touch the actual DATA_SHARED_FLAGS_ID byte that
-        // gets synced to clients (confirmed via javap: vanilla's own real isInvisible()/setInvisible()
-        // are just getSharedFlag(5)/setSharedFlag(5, ...), completely bypassed by a plain method
-        // override). The client never instantiates a WendigoEntity at all - Polymer just tells it
-        // "this is a real EntityType.ENDERMAN" (see getPolymerEntityType) and the client renders its
-        // OWN plain vanilla EnderMan instance from whatever entity data it actually receives over the
-        // wire, invisibility included. Without this real setInvisible(true) call, that synced flag
-        // was never actually set, so every client (Polymer-aware or fully vanilla) rendered a normal,
-        // fully visible, walking/arm-swinging Enderman right alongside WendigoVisual's own rig instead
-        // of just the rig alone.
+        // A real, live-reported bug: a plain isInvisible() getter override only affects server-side
+        // Java logic that calls it directly - it does NOT touch the actual DATA_SHARED_FLAGS_ID byte
+        // that gets synced to clients (confirmed via javap: vanilla's own real isInvisible()/
+        // setInvisible() are just getSharedFlag(5)/setSharedFlag(5, ...), completely bypassed by a
+        // plain method override). The client never instantiates a WendigoEntity at all - Polymer just
+        // tells it "this is a real vanilla EntityType" (see getPolymerEntityType) and the client
+        // renders its OWN plain vanilla instance of whatever that type is from actual entity data
+        // received over the wire, invisibility included. Without this real setInvisible(true) call,
+        // that synced flag was never actually set, so every client (Polymer-aware or fully vanilla)
+        // rendered the fully visible, animated stand-in (an Enderman at the time this was found) right
+        // alongside WendigoVisual's own rig instead of just the rig alone.
         this.setInvisible(true);
         ClimberHelper.initClimber(this);
         // TEMPORARILY DISABLED again - the user's own explicit rule: nothing here that isn't also in
