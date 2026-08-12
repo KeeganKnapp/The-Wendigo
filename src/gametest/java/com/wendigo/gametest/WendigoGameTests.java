@@ -367,7 +367,11 @@ public final class WendigoGameTests {
 	 * position, which this test would have caught. Builds its own small sealed stone room (floor,
 	 * ceiling, four walls) rather than relying on the default test platform's own bounds/lighting, so
 	 * the ceiling height here is known and the room is guaranteed dark. */
-	@GameTest
+	// padding bumped past the @GameTest default (1) for the same reason
+	// findLiveBandPositionInViewFindsAFacingSpot right below needed it - this file's default empty
+	// structure is only 8x8x8, smaller than this test's own 7x7x10 (roomHeight=9, so y spans 0-9
+	// inclusive) built room.
+	@GameTest(padding = 20)
 	public void findLiveBandPosition3DFindsBothFloorAndCeiling(GameTestHelper helper) {
 		int roomHeight = 9;
 		for (int x = 0; x <= 6; x++) {
@@ -397,34 +401,31 @@ public final class WendigoGameTests {
 		player.teleportTo(playerAbsolute.getX() + 0.5, playerAbsolute.getY(), playerAbsolute.getZ() + 0.5);
 		BlockPos playerPos = player.blockPosition();
 
-		// maxDistance generous relative to the room's own 8-block floor-to-ceiling gap (straight-up
-		// distance alone is already 8) - leaves real horizontal slack for a sampled point to land
-		// anywhere across the room's footprint and still fall inside the band. The room's own
-		// footprint (7x7) is small relative to a full sphere of radius up to 12, so any single
-		// findLiveBandPosition3D call has a real chance of exhausting its 80 samples without one
-		// landing inside the room at all (a sample missing the room isn't a bug - see the method's own
-		// doc comment, it's not flood-guaranteed reachable/discoverable, by design) - retry a handful
-		// of times, same as any other randomized-search caller in this codebase already does
-		// (findUnwatchedPosition's own UNWATCHED_POSITION_ATTEMPTS), rather than requiring a single
-		// call to succeed against a small test room.
-		BlockPos ceiling = null;
-		BlockPos floor = null;
-		for (int attempt = 0; attempt < 20 && (ceiling == null || floor == null); attempt++) {
-			if (ceiling == null) {
-				ceiling = DarkSpotScanner.findLiveBandPosition3D(helper.getLevel(), playerPos, 0.0, 12.0, Direction.DOWN);
+		// succeedWhen (retried every tick), not a same-tick manual retry loop - a real, live-confirmed
+		// flake (caught by GitHub Actions CI on a fresh checkout): a freshly-placed room's own lighting
+		// hasn't actually settled dark yet on the very tick helper.setBlock runs, so MAX_DARK_LIGHT's
+		// own check inside findLiveBandPosition3D read stale/lit values regardless of how many same-tick
+		// attempts were made - see findLiveBandPositionInViewFindsAFacingSpot's own doc comment right
+		// below, which already documented and fixed this exact class of bug for its own sibling test;
+		// this one just hadn't been converted to match yet. ceiling/floor accumulate across ticks (a
+		// 1-element array, not a plain local - succeedWhen's lambda re-invokes every tick and needs
+		// something mutable to carry a once-found pick forward instead of re-rolling it away).
+		BlockPos[] ceiling = new BlockPos[1];
+		BlockPos[] floor = new BlockPos[1];
+		helper.succeedWhen(() -> {
+			if (ceiling[0] == null) {
+				ceiling[0] = DarkSpotScanner.findLiveBandPosition3D(helper.getLevel(), playerPos, 0.0, 12.0, Direction.DOWN);
 			}
-			if (floor == null) {
-				floor = DarkSpotScanner.findLiveBandPosition3D(helper.getLevel(), playerPos, 0.0, 12.0, Direction.UP);
+			if (floor[0] == null) {
+				floor[0] = DarkSpotScanner.findLiveBandPosition3D(helper.getLevel(), playerPos, 0.0, 12.0, Direction.UP);
 			}
-		}
-
-		helper.assertTrue(ceiling != null, "expected a ceiling position to be found");
-		helper.assertTrue(floor != null, "expected a floor position to be found");
-		helper.assertTrue(ceiling.getY() > playerPos.getY() + 2,
-			"expected the ceiling pick to sit well above the player, got " + ceiling);
-		helper.assertTrue(floor.getY() <= playerPos.getY() + 1,
-			"expected the floor pick to sit at/near the player's own floor level, got " + floor);
-		helper.succeed();
+			helper.assertTrue(ceiling[0] != null, "expected a ceiling position to be found");
+			helper.assertTrue(floor[0] != null, "expected a floor position to be found");
+			helper.assertTrue(ceiling[0].getY() > playerPos.getY() + 2,
+				"expected the ceiling pick to sit well above the player, got " + ceiling[0]);
+			helper.assertTrue(floor[0].getY() <= playerPos.getY() + 1,
+				"expected the floor pick to sit at/near the player's own floor level, got " + floor[0]);
+		});
 	}
 
 	/** Direct check of DarkSpotScanner.findLiveBandPositionInView (the "in_view" destination type's own
