@@ -327,6 +327,18 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
         // getAmbientSound() to a custom value, since WendigoSounds.play() goes through
         // ServerLevel.playSound directly - unaffected by isSilent() either way.
         this.setSilent(true);
+        // A real, live-reported bug: the isInvisible() override below only affects server-side Java
+        // logic that calls it directly - it does NOT touch the actual DATA_SHARED_FLAGS_ID byte that
+        // gets synced to clients (confirmed via javap: vanilla's own real isInvisible()/setInvisible()
+        // are just getSharedFlag(5)/setSharedFlag(5, ...), completely bypassed by a plain method
+        // override). The client never instantiates a WendigoEntity at all - Polymer just tells it
+        // "this is a real EntityType.ENDERMAN" (see getPolymerEntityType) and the client renders its
+        // OWN plain vanilla EnderMan instance from whatever entity data it actually receives over the
+        // wire, invisibility included. Without this real setInvisible(true) call, that synced flag
+        // was never actually set, so every client (Polymer-aware or fully vanilla) rendered a normal,
+        // fully visible, walking/arm-swinging Enderman right alongside WendigoVisual's own rig instead
+        // of just the rig alone.
+        this.setInvisible(true);
         ClimberHelper.initClimber(this);
         // TEMPORARILY DISABLED again - the user's own explicit rule: nothing here that isn't also in
         // Nyf's Spiders' own SpiderMixin (fully audited this session - it never substitutes its own
@@ -1980,11 +1992,6 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
             return STANDING_DIMENSIONS;
         }
         return super.getDefaultDimensions(pose);
-    }
-
-    @Override
-    public boolean isInvisible() {
-        return true;
     }
 
     // Same particle/sound beat as spawnWave's own spawn-side call (see WendigoManager -
