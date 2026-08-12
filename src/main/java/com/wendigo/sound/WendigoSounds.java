@@ -3,10 +3,6 @@ package com.wendigo.sound;
 import java.util.HashMap;
 import java.util.Map;
 
-import net.minecraft.core.Registry;
-import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvent;
@@ -87,20 +83,27 @@ public final class WendigoSounds {
 		JUMPSCARE
 	}
 
-	// Registered eagerly (see init(), called from WendigoMod.onInitialize) rather than left as bare
-	// Identifiers - same ResourceKey/Registry.register pattern ModEntities.WENDIGO already uses, so
-	// these show up as real registry entries before the registry freezes, not lazily on first play().
-	private static final SoundEvent CHASE_EVENT = register("chase");
-	private static final SoundEvent FLEE_EVENT = register("flee");
-	private static final SoundEvent AMBIENT_EVENT = register("ambient");
-	private static final SoundEvent STARE_EVENT = register("stare");
-	private static final SoundEvent SPAWN_EVENT = register("spawn");
-	private static final SoundEvent JUMPSCARE_EVENT = register("jumpscare");
-
-	private static SoundEvent register(String name) {
-		ResourceKey<SoundEvent> key = ResourceKey.create(Registries.SOUND_EVENT, WendigoMod.id(name));
-		return Registry.register(BuiltInRegistries.SOUND_EVENT, key, SoundEvent.createVariableRangeEvent(WendigoMod.id(name)));
-	}
+	// Deliberately NEVER Registry.register()'d - a real, live-reported bug: a genuinely custom
+	// registry entry gets synced to every connecting client via fabric-registry-sync-v0's own
+	// mandatory handshake (unrelated to and unaffected by Polymer's own separate resource-pack push),
+	// which flatly rejects any real vanilla client that doesn't already recognize it
+	// ("Received N registry entries that are unknown to this client"). Left as a bare, unregistered
+	// SoundEvent instead: Level.playSound's own SoundEvent overload resolves a Holder via
+	// Registry.wrapAsHolder (confirmed via javap), which for anything NOT actually present in the
+	// registry falls back to Holder.direct(value) - a holder that serializes the full identifier
+	// inline in the packet instead of a registry-index reference, exactly the same "raw identifier,
+	// no shared registry required" mechanism vanilla's own /playsound command relies on. That's why
+	// this still works at all: assets/wendigo/sounds.json (this mod's own resource pack, pushed via
+	// Polymer to every connecting client regardless of whether they have this mod) maps each of these
+	// bare identifiers to a real curated pool of vanilla ambient/cave files - see the class doc
+	// comment - so any client that accepted the pack, mod or fully vanilla, resolves and plays the
+	// real audio from that raw ID alone, with zero dependency on a synced SoundEvent registry entry.
+	private static final SoundEvent CHASE_EVENT = SoundEvent.createVariableRangeEvent(WendigoMod.id("chase"));
+	private static final SoundEvent FLEE_EVENT = SoundEvent.createVariableRangeEvent(WendigoMod.id("flee"));
+	private static final SoundEvent AMBIENT_EVENT = SoundEvent.createVariableRangeEvent(WendigoMod.id("ambient"));
+	private static final SoundEvent STARE_EVENT = SoundEvent.createVariableRangeEvent(WendigoMod.id("stare"));
+	private static final SoundEvent SPAWN_EVENT = SoundEvent.createVariableRangeEvent(WendigoMod.id("spawn"));
+	private static final SoundEvent JUMPSCARE_EVENT = SoundEvent.createVariableRangeEvent(WendigoMod.id("jumpscare"));
 
 	// Minimum real time between any two sounds this mod plays in the same level, so a burst of
 	// triggers can never overlap into noise. Sized to the longest cave file actually referenced by

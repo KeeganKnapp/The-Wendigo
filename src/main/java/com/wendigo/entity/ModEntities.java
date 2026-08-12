@@ -2,6 +2,8 @@ package com.wendigo.entity;
 
 import net.fabricmc.fabric.api.object.builder.v1.entity.FabricDefaultAttributeRegistry;
 
+import eu.pb4.polymer.core.api.entity.PolymerEntityUtils;
+
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
@@ -43,5 +45,12 @@ public final class ModEntities {
         // instead of one or two draining the whole thing.
         FabricDefaultAttributeRegistry.register(WENDIGO,
             EnderMan.createAttributes().add(Attributes.MAX_HEALTH, 50.0));
+        // A real, live-reported bug otherwise: without this, WENDIGO (a genuinely custom
+        // EntityType) gets synced to every connecting client via fabric-registry-sync-v0's own
+        // mandatory login handshake, which flatly rejects any real vanilla client that doesn't
+        // already recognize it - see WendigoEntity's own PolymerEntity doc comment for the full
+        // explanation. This is what actually excludes it from that sync and routes it through
+        // Polymer's own virtualization (getPolymerEntityType) instead.
+        PolymerEntityUtils.registerType(WENDIGO);
     }
 }

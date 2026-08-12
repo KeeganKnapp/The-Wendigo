@@ -46,6 +46,10 @@ import com.nyfaria.awcapi.ClimberHelper;
 import com.nyfaria.awcapi.entity.ClimberComponent;
 import com.nyfaria.awcapi.entity.IAdvancedClimber;
 
+import net.fabricmc.fabric.api.networking.v1.context.PacketContext;
+
+import eu.pb4.polymer.core.api.entity.PolymerEntity;
+
 import com.wendigo.WendigoMod;
 import com.wendigo.advancement.WendigoAdvancements;
 import com.wendigo.debug.WendigoDebug;
@@ -69,8 +73,26 @@ import com.wendigo.spatial.DarkSpotScanner;
  * how vanilla Spider is wired - a ClimberComponent decides ground vs. attached travel per tick on
  * its own; there's no separate "climbing mode" to switch into). See
  * DarknessAwareClimberNavigation's own doc comment for the pathfinding side.
+ *
+ * <p>Also implements {@link PolymerEntity} - a real, live-reported bug otherwise: {@code
+ * ModEntities.WENDIGO} is a genuinely custom {@link EntityType}, and without this, Fabric's own
+ * registry-sync (fabric-registry-sync-v0) unconditionally rejects any real vanilla client the
+ * instant it joins ("Received N registry entries that are unknown to this client"), regardless of
+ * whether {@link WendigoVisual}'s own separate item-display rig is properly Polymer-virtualized -
+ * registry-sync runs at login, well before any entity ever actually spawns. getPolymerEntityType
+ * resolving to vanilla's own real EntityType.ENDERMAN (not just any invisible carrier) is what lets
+ * PolymerEntityUtils.registerType (see ModEntities.init) exclude WENDIGO from that sync entirely and
+ * have Polymer present this entity to a non-Polymer client AS a real, ordinary (if invisible, same
+ * as always - see isInvisible below) Enderman instead - matching this class's own EnderMan
+ * inheritance, so a non-mod client's hitbox/physics/sound-category assumptions for it stay
+ * consistent with what it actually is.
  */
-public class WendigoEntity extends EnderMan implements IAdvancedClimber {
+public class WendigoEntity extends EnderMan implements IAdvancedClimber, PolymerEntity {
+    @Override
+    public EntityType<?> getPolymerEntityType(PacketContext context) {
+        return EntityType.ENDERMAN;
+    }
+
     // Enderman's own tall/narrow hitbox doesn't suit a low horizontal crawl -- swap to a low
     // profile while crawling. Reuses Pose.SWIMMING as the "crawling" signal since Enderman never
     // naturally enters it (no swim/sneak AI), rather than trying to swap the entity's actual Java
