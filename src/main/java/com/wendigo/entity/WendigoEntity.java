@@ -1122,6 +1122,17 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
         logDiagnostics();
 
         if (!this.level().isClientSide()) {
+            // Defensive re-assert, not just the constructor's own setInvisible(true) call - a real,
+            // live-reported case where the constructor-time set alone still wasn't enough (the flag is
+            // set well before this entity is ever actually added to a tracked ServerLevel/chunk, so
+            // whatever snapshot Polymer's own entity-type-spoofing spawn packet captures may not
+            // reflect data set that early). Re-setting here happens on an entity that's DEFINITELY
+            // already being tracked (this is a live tick), so it goes through the ordinary
+            // tracked-data-changed path and generates a real update packet - isInvisible() guards it to
+            // a genuine no-op after the first tick, not a per-tick resync spam.
+            if (!this.isInvisible()) {
+                this.setInvisible(true);
+            }
             samplePlayerDirection();
             this.planRunner.tick();
             checkSpectralArrowDetection();
