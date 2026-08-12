@@ -162,7 +162,13 @@ public final class SemanticBands {
 	public static double orbitMaxDistance(CaveScale caveScale) {
 		return switch (caveScale) {
 			case TIGHT -> 16.0;
-			case MASSIVE -> 34.0;
+			// Was 34.0 - WendigoManager's own constructor enforces this must stay strictly below
+			// WendigoTuningConfig.orbitDespawnDistance (32.0 by default, tightened down from 64.0 in
+			// a later pass than this value's own last tuning), so this needed to come down too or a
+			// legitimately in-band MASSIVE-cave orbit could trip the "too far, relocate" despawn
+			// check. Pulled in 4 blocks, same modest adjustment size the TIGHT/NORMAL bands' own
+			// prior tightening passes already used.
+			case MASSIVE -> 30.0;
 			default -> 24.0; // NORMAL
 		};
 	}
