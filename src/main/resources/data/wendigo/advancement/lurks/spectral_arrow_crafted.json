@@ -1,0 +1,37 @@
+{
+  "parent": "wendigo:lurks/grabbed",
+  "criteria": {
+    "crafted_from_glow_berries": {
+      "conditions": {
+        "recipe_id": "wendigo:spectral_arrow_from_glow_berries"
+      },
+      "trigger": "minecraft:recipe_crafted"
+    },
+    "crafted_from_glow_ink_sac": {
+      "conditions": {
+        "recipe_id": "wendigo:spectral_arrow_from_glow_ink_sac"
+      },
+      "trigger": "minecraft:recipe_crafted"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "Craft a spectral arrow. You'll want the light on your side before the next hunt"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:spectral_arrow"
+    },
+    "title": {
+      "text": "Glow-Getter"
+    }
+  },
+  "requirements": [
+    [
+      "crafted_from_glow_berries"
+    ],
+    [
+      "crafted_from_glow_ink_sac"
+    ]
+  ]
+}

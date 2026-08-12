@@ -11,10 +11,10 @@ import com.wendigo.spatial.CaveScaleScanner.CaveScale;
 
 /** Engine-built context for one wave: the target player, their severity, and a live snapshot of
  * torch counts per distance band - NOT pre-scanned positions. Every actual position a plan resolves
- * against (spawn_at, movement.approach_band, despawn/retreat) is looked up fresh, live, at the
- * moment it's needed (see DarkSpotScanner.findLiveBandPosition) - this class only carries what the
- * PROMPT needs to know at request time (necessarily a snapshot, since there's exactly one LLM call
- * per plan), never a stored position a later step would resolve against. */
+ * against (movement.approach_spot, combat.teleport, despawn/retreat) is looked up fresh, live, at
+ * the moment it's needed - this class only carries what the PROMPT needs to know at request time
+ * (necessarily a snapshot, since there's exactly one LLM call per plan), never a stored position a
+ * later step would resolve against. */
 public final class WaveContext {
 	/** The 6 live distance bands, nearest to furthest - see SemanticBands.bandDistanceMin/Max. Public
 	 * so WendigoManager's torch-count scan and this class's own prompt text share one label list. */
@@ -43,6 +43,16 @@ public final class WaveContext {
 	// Rough classification of the open space around the player right now (see CaveScaleScanner) -
 	// meant as general-purpose context, not tied to any one use.
 	private final CaveScale caveScale;
+	// The user's own explicit request: tell the model when the player has a container/other UI open
+	// (chest, furnace, minecart chest, crafting table, anvil, etc. - not just their own plain inventory,
+	// which every player always technically "has" via Player.inventoryMenu) or recently broke a block
+	// (the closest live signal to "was mining something" - see WendigoManager.recentlyMined's own
+	// comment on why this is an approximation, not a precise mid-swing check), so it can lean toward
+	// combat.teleport/movement.approach_spot(destination=behind/unwatched/in_view) while their
+	// attention is elsewhere instead of assuming they're free to notice a reveal right now. null
+	// openMenuId means no non-inventory UI is open.
+	private final String openMenuId;
+	private final boolean recentlyMining;
 
 	/** The wendigo's own live distance from the player, whether it's currently perched on a ceiling
 	 * roughly above them (see DarkSpotScanner.findCeilingVantagePoint), whether it's currently
@@ -67,7 +77,8 @@ public final class WaveContext {
 	}
 
 	public WaveContext(ServerPlayer player, int severity, int severityCap, Map<String, Integer> torchCountsByBand,
-			CurrentPosition currentPosition, List<EncounterHistory.Entry> history, int nowTick, CaveScale caveScale) {
+			CurrentPosition currentPosition, List<EncounterHistory.Entry> history, int nowTick, CaveScale caveScale,
+			String openMenuId, boolean recentlyMining) {
 		this.player = player;
 		this.severity = severity;
 		this.severityCap = severityCap;
@@ -76,6 +87,8 @@ public final class WaveContext {
 		this.history = history;
 		this.nowTick = nowTick;
 		this.caveScale = caveScale;
+		this.openMenuId = openMenuId;
+		this.recentlyMining = recentlyMining;
 	}
 
 	public CaveScale caveScale() {
@@ -123,24 +136,50 @@ public final class WaveContext {
 		return horizontalSpeedSqr > WALKING_SPEED_THRESHOLD_SQR ? "walking" : "standing still";
 	}
 
+	/** The user's own explicit request: tell the model when the player's attention is genuinely
+	 * elsewhere (a container/other UI open, or they just broke a block) so it can lean into
+	 * combat.teleport/movement.approach_spot(destination=behind/unwatched/in_view) while the opening
+	 * lasts, instead of assuming a reveal has to compete with the player's full attention. Both facts
+	 * can be true at once (broke a block right before opening a UI, e.g. mining then storing the
+	 * drops) - reported independently, not merged into one combined sentence. Empty string if neither
+	 * applies right now. */
+	private String describeDistraction() {
+		StringBuilder sb = new StringBuilder();
+		if (this.openMenuId != null) {
+			sb.append("The player currently has a UI open (").append(this.openMenuId)
+				.append(" - a chest/furnace/minecart chest/crafting table/anvil/etc.) and can't see or react to "
+					+ "anything right now - a good moment to reposition somewhere behind/unwatched/in_view via "
+					+ "combat.teleport/movement.approach_spot while it lasts, rather than assuming a reveal has "
+					+ "to compete with their full attention. ");
+		}
+		if (this.recentlyMining) {
+			sb.append("The player just broke a block (was mining) - their attention was on the block in front of "
+				+ "them, not scanning around - another good moment to close distance or reposition somewhere "
+				+ "behind/unwatched via combat.teleport/movement.approach_spot before they look up. ");
+		}
+		return sb.toString();
+	}
+
 	/** Renders this context as the user-prompt text the LLM sees alongside the action schema. */
 	public String toPromptText() {
 		StringBuilder sb = new StringBuilder();
 		sb.append("Target player: ").append(this.player.getGameProfile().name()).append(". ");
 		sb.append("They are currently ").append(describePlayerMovement()).append(". ");
+		sb.append(describeDistraction());
 		sb.append("Dweller severity for this player: ").append(this.severity).append("/").append(this.severityCap)
 			.append(" (a slow-burning escalation across many separate encounters with this player over "
 				+ "time - higher means this relationship with the dark is more established, not something "
 				+ "to try to advance within a single wave). ");
 		sb.append("Current caving scenario: ").append(describeCaveScale())
 			.append(" - how tight or open the space around the player is right now. ");
-		sb.append("Positioning distance bands (movement.approach_band, combat.break_torch's optional "
-			+ "band), nearest to furthest - resolved LIVE against wherever the player actually is at the moment "
-			+ "each one is used, never a frozen position from right now: close_as_possible (0-4 blocks), close "
-			+ "(5-9), medium (10-16), far (17-24), farther (25-35), farthest (36+, also the natural despawn/"
-			+ "retreat distance). These are a DIFFERENT ladder from predicate.player_distance's own bands below - "
-			+ "same-sounding names (medium/far) mean different ranges in each one, so don't mix them up: this "
-			+ "ladder is only for movement.approach_band/combat.break_torch's band field. ");
+		sb.append("Distance-from-player bands, nearest to furthest, used only for REPORTING (torch "
+			+ "counts below, and the wendigo's own current distance if already active) - not something "
+			+ "you pick from directly anymore (movement.approach_spot/combat.teleport resolve against a "
+			+ "destination TYPE instead, with distance driven by cave size, not a band you choose): "
+			+ "close_as_possible (0-4 blocks), close (5-9), medium (10-16), far (17-24), farther (25-35), "
+			+ "farthest (36+). These are a DIFFERENT ladder from predicate.player_distance's own bands "
+			+ "below - same-sounding names (medium/far) mean different ranges in each one, so don't mix "
+			+ "them up. ");
 		sb.append("Combat/predicate distance bands (predicate.player_distance only), nearest to furthest: "
 			+ "grab_distance (0-3 blocks), lunge_distance (4-9), close_quarters (10-14), medium (15-24), far "
 			+ "(25+). ");
@@ -159,10 +198,7 @@ public final class WaveContext {
 				.append(" blocks from the player (").append(currentBand).append(" band)")
 				.append(this.currentPosition.isOnTopPlayer() ? ", currently perched on a ceiling roughly above them" : "")
 				.append(" - if that's already a good position for what this plan is about to do, the plan can just "
-					+ "start straight into it with no travel at all; there's no obligation to move first just "
-					+ "because a band exists. Also relevant for combat.teleport_to_band's own source-band "
-					+ "precondition (see its own schema description) - it currently being in the ").append(currentBand)
-				.append(" band is exactly what that precondition checks against. ");
+					+ "start straight into it with no travel at all; there's no obligation to move first. ");
 			sb.append(this.currentPosition.isPlayerLookingAtSelf()
 				? "The player is ALREADY looking straight at it right now, this instant, before the plan has even "
 					+ "started - this is not a fresh, unseen appearance, so don't open with a stare-hold gated on "
@@ -173,12 +209,12 @@ public final class WaveContext {
 					+ "reveal/stare-hold the normal way. ");
 			sb.append(this.currentPosition.onWallOrCeiling()
 				? "It's currently attached to a wall/ceiling somewhere (not resting on the floor) - a plain "
-					+ "movement.drop right at the start of this plan would let go and fall for real, no spot_above "
-					+ "positioning needed first since it's already off the floor. "
+					+ "movement.drop right at the start of this plan would let go and fall for real, no "
+					+ "destination=above positioning needed first since it's already off the floor. "
 				: "It's currently on the floor, not attached to any wall/ceiling - movement.drop would do nothing "
-					+ "if used right now; only reach for it once something earlier in THIS plan (spawn_at/"
-					+ "movement.approach_band with band=spot_above, or ordinary climbing along the way) has "
-					+ "actually put it back on a surface first. ");
+					+ "if used right now; only reach for it once something earlier in THIS plan "
+					+ "(movement.approach_spot/combat.teleport with destination=above, or ordinary climbing "
+					+ "along the way) has actually put it back on a surface first. ");
 			if (this.currentPosition.playerDirection() != null) {
 				sb.append(switch (this.currentPosition.playerDirection()) {
 					case "movingCloser" -> "Over roughly the last 5 seconds the player has been closing the "

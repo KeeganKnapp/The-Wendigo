@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/grabbed",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "You survived its first taste of you, but it knows your scent now. It'll start snuffing the torches around you next time - keep your escape route lit from more than one source"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:leather_chestplate"
+    },
+    "title": {
+      "text": "Appetizer"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

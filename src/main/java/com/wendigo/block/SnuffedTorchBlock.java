@@ -8,6 +8,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.player.Player;
@@ -27,6 +28,8 @@ import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
 import eu.pb4.polymer.core.api.block.PolymerBlock;
+
+import com.wendigo.advancement.WendigoAdvancements;
 
 /**
  * A standing torch the wendigo has snuffed out - light level 0, same standing-column hitbox a real
@@ -92,6 +95,11 @@ public class SnuffedTorchBlock extends Block implements PolymerBlock {
 				1.0F, level.getRandom().nextFloat() * 0.4F + 0.8F);
 			level.gameEvent(player, GameEvent.BLOCK_CHANGE, pos);
 			itemStack.hurtAndBreak(1, player, hand.asEquipmentSlot());
+			// The new "Learn to live with it" advancement, soul torch only - see
+			// WendigoAdvancements.SOUL_LIGHT_RELIT's own doc comment.
+			if (this.relightBlock == Blocks.SOUL_TORCH && player instanceof ServerPlayer serverPlayer) {
+				WendigoAdvancements.grant(serverPlayer, WendigoAdvancements.SOUL_LIGHT_RELIT);
+			}
 		}
 		return InteractionResult.SUCCESS;
 	}

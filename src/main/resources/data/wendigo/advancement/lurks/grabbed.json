@@ -7,14 +7,14 @@
   },
   "display": {
     "description": {
-      "text": "Stay in the light. Its faster than you are. Spam shift if it grabs you to escape"
+      "text": "Stay in the light. Its faster than you are. Spam sneak if it grabs you to get away before its too late!"
     },
     "hidden": true,
     "icon": {
-      "id": "minecraft:soul_torch"
+      "id": "minecraft:torch"
     },
     "title": {
-      "text": "It's hungry"
+      "text": "The Wendigo"
     }
   },
   "requirements": [

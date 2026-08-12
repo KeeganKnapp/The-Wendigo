@@ -1,5 +1,5 @@
 {
-  "parent": "wendigo:lurks/grabbed",
+  "parent": "wendigo:lurks/spectral_arrow_crafted",
   "criteria": {
     "impossible": {
       "trigger": "minecraft:impossible"
@@ -7,14 +7,14 @@
   },
   "display": {
     "description": {
-      "text": "Meet its charge with a spear, and drive it back. The better your spear, the more likely you'll live to see tomorrow"
+      "text": "Land a spectral arrow on the wendigo to thwart its attacks! Close range pierces the skin better."
     },
     "hidden": false,
     "icon": {
-      "id": "minecraft:iron_spear"
+      "id": "minecraft:spectral_arrow"
     },
     "title": {
-      "text": "Point Taken"
+      "text": "Glow Back To Where You Came From"
     }
   },
   "requirements": [

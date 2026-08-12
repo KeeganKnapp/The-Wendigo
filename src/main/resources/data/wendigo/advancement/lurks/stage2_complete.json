@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/stage1_complete",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "It's grown bolder - now it can blink itself right onto a lit torch and choke it out from under you. Remember dark spots you've already scouted, they won't stay safe forever either"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:copper_chestplate"
+    },
+    "title": {
+      "text": "Playing With Fire"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

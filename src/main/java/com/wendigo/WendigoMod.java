@@ -8,6 +8,7 @@ import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.wendigo.advancement.WendigoAdvancements;
 import com.wendigo.block.WendigoBlocks;
 import com.wendigo.command.WendigoCommands;
 import com.wendigo.debug.SpiderDiagnostics;
@@ -56,6 +57,7 @@ public class WendigoMod implements ModInitializer {
 		WendigoBlocks.init();
 		WendigoSounds.init();
 		WendigoDebugItems.init();
+		WendigoAdvancements.init();
 		SpiderDiagnostics.init();
 		StareHeadTest.register();
 

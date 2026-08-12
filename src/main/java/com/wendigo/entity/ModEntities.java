@@ -38,9 +38,9 @@ public final class ModEntities {
         // LivingEntity's constructor NPEs on this.supplier the moment one is summoned
         // (getMaxHealth() etc. have nothing to read from). Reuse Enderman's attribute set
         // since WendigoEntity keeps its stats/combat behavior unchanged, just with its own max
-        // health (50, up from Enderman's vanilla 40 - user-specified, tune by feel) so the new
-        // spear-defense damage (see PlanRunner.repelWithSpear) has real room to matter across a
-        // few hits instead of one or two draining the whole thing.
+        // health (50, up from Enderman's vanilla 40 - user-specified, tune by feel) so a spectral
+        // arrow hit (see WendigoEntity.hurtServer) has real room to matter across a few hits
+        // instead of one or two draining the whole thing.
         FabricDefaultAttributeRegistry.register(WENDIGO,
             EnderMan.createAttributes().add(Attributes.MAX_HEALTH, 50.0));
     }

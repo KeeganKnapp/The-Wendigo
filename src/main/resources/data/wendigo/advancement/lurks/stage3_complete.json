@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/stage2_complete",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "It's done stalking from a distance - it can lunge now, and drop on you straight from the ceiling. Never let your guard down just because you don't see it in front of you"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:iron_chestplate"
+    },
+    "title": {
+      "text": "Within Arm's Reach"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

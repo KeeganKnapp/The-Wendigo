@@ -15,6 +15,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.Pose;
@@ -24,6 +25,8 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.monster.EnderMan;
+import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
+import net.minecraft.world.entity.projectile.arrow.SpectralArrow;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
@@ -36,6 +39,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.pathfinder.PathType;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import com.nyfaria.awcapi.ClimberHelper;
@@ -43,6 +47,7 @@ import com.nyfaria.awcapi.entity.ClimberComponent;
 import com.nyfaria.awcapi.entity.IAdvancedClimber;
 
 import com.wendigo.WendigoMod;
+import com.wendigo.advancement.WendigoAdvancements;
 import com.wendigo.debug.WendigoDebug;
 import com.wendigo.plan.PlanRunner;
 import com.wendigo.plan.Targeting;
@@ -319,6 +324,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         // setCanClimbInWater (default method, delegates straight to ClimberComponent) keeps the real
         // climbing/stepping physics active in water too, the same as on dry land.
         this.setCanClimbInWater(true);
+        this.getAttribute(Attributes.FOLLOW_RANGE).setBaseValue(64.0);
         this.getAttribute(Attributes.FOLLOW_RANGE).addPermanentModifier(FOLLOW_RANGE_CLIMB_BONUS);
         this.getAttribute(Attributes.WATER_MOVEMENT_EFFICIENCY).addPermanentModifier(FAST_SWIM_BONUS);
         // Immune to fall damage entirely - user's own explicit request, and also just practical given
@@ -395,6 +401,19 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         // one.
         this.setPathfindingMalus(PathType.WATER, 0.0F);
         this.setPathfindingMalus(PathType.WATER_BORDER, 0.0F);
+        // Same fix, same class of problem, this time for minecart rails - the user's own live "he
+        // still gets stuck [on rails]... is there no way to completely allow pathfinding through this
+        // block always? Just like air?" follow-up. PathType.RAIL already carries the same 0.0F
+        // default malus as WALKABLE (confirmed via javap), but PathType.UNPASSABLE_RAIL carries -1.0F
+        // (BLOCKED-equivalent) - AdvancedWalkNodeProcessor's own rail-downgrade heuristic silently
+        // reclassifies a rail tile to UNPASSABLE_RAIL unless this entity's OWN current position (or
+        // the block below it) is also a rail, the exact same false-blocked heuristic vanilla's
+        // WalkNodeEvaluator has (see DarknessAwareClimberNodeEvaluator's own override for where that
+        // gets undone at the classification level). Setting both explicitly to 0.0F here is pure
+        // defense in depth on top of that override - belt and suspenders, not a substitute for it,
+        // in case some other code path reads either PathType's malus directly.
+        this.setPathfindingMalus(PathType.RAIL, 0.0F);
+        this.setPathfindingMalus(PathType.UNPASSABLE_RAIL, 0.0F);
     }
 
     @Override
@@ -456,14 +475,207 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * IN_FIRE/ON_FIRE/LAVA/HOT_FLOOR/FIREBALL and friends in one check rather than enumerating each
      * DamageTypes constant by hand) landing here means real damage actually applied (super's own
      * return value - invulnerability/damage-immunity ticks already filtered out anything that didn't
-     * really land), not just an attempted hit. */
+     * really land), not just an attempted hit.
+     * <p>
+     * Only a SpectralArrow can ever damage this entity at all - every other arrow (ordinary,
+     * tipped, etc.) just misses/flies off it, the user's own explicit request. Melee and every
+     * other damage source (including tridents/other projectiles) is deliberately untouched - the
+     * user's own ask was specifically about arrows. A landed spectral hit also starts the visible
+     * glow (see startGlow), grants the advancement previously tied to the now-removed spear
+     * defense (see WendigoAdvancements' own class doc comment for the current tree shape), and
+     * immediately abandons whatever this wave was doing to flee back into darkness/orbit (see
+     * PlanRunner.forceFleeToOrbit).
+     * <p>
+     * A real, previously-invisible discovery made while wiring this up: EnderMan.hurtServer
+     * (confirmed via javap) has a genuine vanilla mechanic where ANY DamageTypeTags.IS_PROJECTILE
+     * source (arrows included) makes it try to teleport away instead of ever reaching real damage
+     * application at all - it never calls Monster/LivingEntity's own actual hurt logic for a
+     * projectile hit. Combined with this class's own teleport() override just above (always false,
+     * unrelated pre-existing removal of Enderman's random-teleport-on-hurt reaction), that means
+     * EVERY arrow hit - spectral included - would silently do nothing if simply forwarded to
+     * super.hurtServer as-is, natural collision hits against the real hitbox included, not just
+     * checkSpectralArrowDetection's own fallback scan. rehostSpectralHitSource below re-wraps a
+     * landed spectral hit as a non-projectile-tagged source before forwarding, which skips past
+     * just that one Enderman-specific special case while leaving every other piece of vanilla's
+     * real damage pipeline (invulnerability cooldown, knockback, criteria triggers, death handling)
+     * completely intact - not hand-replicating any of that logic. */
     @Override
     public boolean hurtServer(ServerLevel level, DamageSource source, float amount) {
-        boolean result = super.hurtServer(level, source, amount);
+        Entity directEntity = source.getDirectEntity();
+        if (directEntity instanceof AbstractArrow arrow && !(arrow instanceof SpectralArrow)) {
+            return false;
+        }
+        boolean spectralHit = directEntity instanceof SpectralArrow;
+        float effectiveAmount = spectralHit ? computeSpectralHitDamage((SpectralArrow) directEntity) : amount;
+        DamageSource forwardedSource = spectralHit ? rehostSpectralHitSource(source) : source;
+        boolean result = super.hurtServer(level, forwardedSource, effectiveAmount);
         if (result && source.is(DamageTypeTags.IS_FIRE)) {
             this.tookFireDamage = true;
         }
+        if (result && spectralHit) {
+            startGlow();
+            if (source.getEntity() instanceof ServerPlayer serverPlayer) {
+                WendigoAdvancements.grant(serverPlayer, WendigoAdvancements.SPECTRAL_HIT);
+            }
+            // The user's own explicit follow-up: a landed spectral hit immediately abandons whatever
+            // this wave was doing and flees back into darkness/orbit - EXCEPT the user's own later
+            // refinement here, a glancing hit under 2 damage (a far, slow shot near
+            // computeSpectralHitDamage's own low end) isn't worth abandoning a plan over.
+            if (effectiveAmount >= MIN_SPECTRAL_HIT_DAMAGE_TO_INTERRUPT_PLAN) {
+                this.planRunner.forceFleeToOrbit();
+            }
+        }
         return result;
+    }
+
+    /** See hurtServer's own doc comment for why this exists. Keeps the real shooter attached (as a
+     * plain mob-attack source) when there is one, purely so death-message/attribution-style vanilla
+     * bookkeeping still has someone to point at - functionally all that matters here is that the
+     * resulting DamageType isn't DamageTypeTags.IS_PROJECTILE. */
+    private DamageSource rehostSpectralHitSource(DamageSource source) {
+        Entity shooter = source.getEntity();
+        return shooter instanceof LivingEntity livingShooter
+            ? damageSources().mobAttack(livingShooter)
+            : damageSources().generic();
+    }
+
+    // The user's own live-measured full-draw arrow velocity (chat-logged via /data get entity):
+    // [-2.69178824328316, -0.4834272812606592, 0.030120139212706194]. Its magnitude is the "1.0x"
+    // reference speed computeSpectralHitDamage's own speed multiplier scales against - 0 speed maps
+    // to 0x, this speed maps to 1.0x, clamped so nothing legitimately fired in survival can ever
+    // exceed 1.0x (full draw is vanilla's own hard cap on a player-fired arrow's speed - the user's
+    // own explicit "a half-charged shot shouldn't deal a huge blow" request).
+    private static final double FULL_DRAW_ARROW_SPEED = Math.sqrt(
+        2.69178824328316 * 2.69178824328316
+            + 0.4834272812606592 * 0.4834272812606592
+            + 0.030120139212706194 * 0.030120139212706194);
+
+    // The user's own explicit anchor points for spectral hit damage: 2 blocks away -> 10 damage,
+    // 12+ blocks away -> 1 damage, exponential (not linear) in between - "the goal is to make sure
+    // the player can't do much damage when the wendigo is far away but somehow still visible due to
+    // sheer luck or his silhouette being visible." Decay rate solved so the curve passes through
+    // both anchors exactly: MAX * e^(-rate*(FAR-NEAR)) = MIN -> rate = ln(MAX/MIN)/(FAR-NEAR).
+    private static final double SPECTRAL_HIT_NEAR_DISTANCE = 2.0;
+    private static final double SPECTRAL_HIT_FAR_DISTANCE = 12.0;
+    private static final double SPECTRAL_HIT_MAX_DAMAGE = 10.0;
+    private static final double SPECTRAL_HIT_MIN_DAMAGE = 1.0;
+    private static final double SPECTRAL_HIT_DISTANCE_DECAY_RATE =
+        Math.log(SPECTRAL_HIT_MAX_DAMAGE / SPECTRAL_HIT_MIN_DAMAGE) / (SPECTRAL_HIT_FAR_DISTANCE - SPECTRAL_HIT_NEAR_DISTANCE);
+    // The user's own explicit threshold below which a landed spectral hit is too glancing to bother
+    // abandoning the current plan over - see hurtServer's own call site. Below SPECTRAL_HIT_MIN_DAMAGE
+    // (1.0) is impossible for distance alone but reachable once speedMultiplier is factored in (a slow,
+    // far shot), so this isn't dead code even though it sits above the curve's own single-anchor floor.
+    private static final float MIN_SPECTRAL_HIT_DAMAGE_TO_INTERRUPT_PLAN = 2.0F;
+
+    /** Distance-and-speed-scaled spectral hit damage - the user's own explicit redesign, replacing
+     * vanilla's own real computed arrow damage entirely for this damage type (a real hitbox collision
+     * goes through this now too, not just checkSpectralArrowDetection's own wider-net fallback -
+     * AbstractArrow has no public getter for its own real computed damage anyway, confirmed via
+     * javap, so there was never a way to read vanilla's own value here regardless). Distance is
+     * measured from the shooter's own current position to this entity, not the arrow's travel
+     * distance (the arrow ends up right here regardless; the shooter's position at impact is what
+     * "how far away were they" actually means) - clamped to [SPECTRAL_HIT_NEAR_DISTANCE,
+     * SPECTRAL_HIT_FAR_DISTANCE] before the exponential is applied, so the curve's own two anchor
+     * points double as hard floor/ceiling bounds beyond either end. speedMultiplier can drive the
+     * final result below the distance curve's own 1-damage floor entirely - a slow shot from any
+     * distance should still barely hurt, same "half-charged shouldn't deal a huge blow" reasoning.
+     * No living shooter to measure distance from (e.g. a dispenser-fired arrow) falls back to the
+     * farthest-distance floor - can't reasonably treat an unattributed shot as close-range. */
+    private float computeSpectralHitDamage(SpectralArrow arrow) {
+        double distance = arrow.getOwner() instanceof LivingEntity shooter
+            ? this.distanceTo(shooter)
+            : SPECTRAL_HIT_FAR_DISTANCE;
+        double clampedDistance = Math.clamp(distance, SPECTRAL_HIT_NEAR_DISTANCE, SPECTRAL_HIT_FAR_DISTANCE);
+        double distanceDamage = SPECTRAL_HIT_MAX_DAMAGE
+            * Math.exp(-SPECTRAL_HIT_DISTANCE_DECAY_RATE * (clampedDistance - SPECTRAL_HIT_NEAR_DISTANCE));
+        double speedMultiplier = Math.clamp(arrow.getDeltaMovement().length() / FULL_DRAW_ARROW_SPEED, 0.0, 1.0);
+        return (float) (distanceDamage * speedMultiplier);
+    }
+
+    // 9 seconds (180 ticks) of visible glow after a landed spectral arrow hit - see startGlow.
+    private static final int SPECTRAL_HIT_GLOW_TICKS = 80;
+    private int glowTicksRemaining;
+
+    /** Starts (or refreshes) the post-hit glow window - see hurtServer above. setGlowingTag/
+     * isCurrentlyGlowing are real vanilla Entity API (confirmed via javap); WendigoVisual's own
+     * applyGlow reads isCurrentlyGlowing() every tick to mirror this onto the item-display rig. */
+    private void startGlow() {
+        this.glowTicksRemaining = SPECTRAL_HIT_GLOW_TICKS;
+        this.setGlowingTag(true);
+    }
+
+    /** Ticks down the glow window started by startGlow, clearing the tag once it runs out - called
+     * once per server tick from tick()'s own server-only block below. */
+    private void updateGlow() {
+        if (this.glowTicksRemaining <= 0) {
+            return;
+        }
+        this.glowTicksRemaining--;
+        if (this.glowTicksRemaining == 0) {
+            this.setGlowingTag(false);
+        }
+    }
+
+    // Detection-only volumes for the spectral-arrow scan below - deliberately NOT the real collision
+    // hitbox (CRAWLING_DIMENSIONS/STANDING_DIMENSIONS stay untouched - see checkSpectralArrowDetection's
+    // own comment for why a wider REAL hitbox would break AWCAPI pathing). Crawling: width is roughly
+    // a real spider's own size (EntityType.SPIDER is 1.4 wide), but height is deliberately NOT just
+    // the spider's own flat 0.9 anymore - the user's own live-playtest report that it needed to be
+    // taller. CRAWLING_DIMENSIONS' real height is only 0.9, and a player firing at roughly center-
+    // mass/head height was routinely aiming well above that tiny slice - doubled to 1.8, the same
+    // ~2x margin-over-real-height ratio the standing case already uses (STANDING_DIMENSIONS 2.0 ->
+    // ARROW_DETECTION_STANDING 2.9 is a smaller relative bump only because 2.0 was already tall to
+    // begin with; 0.9 needs a proportionally bigger one to read as "generous," not "basically the
+    // real hitbox"). Standing: roughly a real (vanilla) Enderman's own size (0.6 wide/2.9 tall) -
+    // noticeably taller than this project's own STANDING_DIMENSIONS (0.6x2.0), which is the point: a
+    // real, generous margin over the actual hitbox, not a no-op restatement of it.
+    private static final EntityDimensions ARROW_DETECTION_CRAWLING = EntityDimensions.scalable(1.4F, 1.8F);
+    private static final EntityDimensions ARROW_DETECTION_STANDING = EntityDimensions.scalable(0.6F, 2.9F);
+
+    private AABB arrowDetectionBox() {
+        EntityDimensions dims = isCrawling() ? ARROW_DETECTION_CRAWLING : ARROW_DETECTION_STANDING;
+        return dims.makeBoundingBox(position());
+    }
+
+    // A grounded (stuck-in-a-block) arrow is functionally motionless - confirmed via javap against
+    // AbstractArrow.tick's own real bytecode: the exact instant it transitions into the ground, it
+    // calls setDeltaMovement(Vec3.ZERO) immediately before setInGround(true), the same tick. isInGround()
+    // itself is protected (inaccessible cross-package on an arbitrary instance, not just from a
+    // subclass), so this checks the public, always-in-sync symptom instead of the private cause -
+    // still airborne is "moving fast enough that this isn't just floating-point residue," not
+    // "exactly zero," since isNoPhysics()/other paths could leave a tiny nonzero remainder.
+    private static final double ARROW_AIRBORNE_VELOCITY_SQR_THRESHOLD = 1.0E-4;
+
+    /** Fallback "wider net" scan for spectral arrows that pass through the generous detection volume
+     * without ever actually clipping the tiny real hitbox (CRAWLING_DIMENSIONS is deliberately only
+     * 0.8 wide/0.9 tall, chosen to fit through narrow mineshaft corridors while climbing - see its
+     * own comment - so a real arrow would rarely ever intersect it on its own). A real hit against
+     * the actual hitbox already goes through vanilla's own AbstractArrow.onHitEntity -> hurtServer
+     * flow for free and needs no help from this method. Deliberately not widening the real hitbox
+     * instead: AdvancedWalkNodeProcessor's own getSafePoints/checkAabbCollision builds each movement
+     * candidate's physical footprint straight from getBbWidth(), so a genuinely wider entity simply
+     * doesn't fit through the same 1-block-wide corridors it navigates today - ordinary physics, not
+     * an AWCAPI bug, and not fixable without actually making the entity that much wider for real.
+     * <p>
+     * Only counts a STILL-AIRBORNE arrow - the user's own explicit "not damaged by grounded spectral
+     * arrows" follow-up: without this, an arrow that missed and stuck in a nearby wall/floor would
+     * silently deal a free hit the moment the wendigo happened to wander back within range, long
+     * after it was actually shot, which isn't "getting shot" anymore. */
+    private void checkSpectralArrowDetection() {
+        if (!(this.level() instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        for (SpectralArrow arrow : serverLevel.getEntitiesOfClass(SpectralArrow.class, arrowDetectionBox())) {
+            if (!arrow.isAlive() || arrow.getDeltaMovement().lengthSqr() < ARROW_AIRBORNE_VELOCITY_SQR_THRESHOLD) {
+                continue;
+            }
+            // The "amount" argument here is unused - hurtServer now computes the real distance/speed
+            // -scaled damage itself for any spectral hit (see computeSpectralHitDamage), uniformly for
+            // both this fallback path and a real hitbox collision. Passed as 0.0F rather than removed
+            // entirely since hurtServer's own signature still has to match its @Override contract.
+            hurtServer(serverLevel, damageSources().arrow(arrow, arrow.getOwner()), 0.0F);
+            arrow.discard();
+        }
     }
 
     /** Reads and clears tookFireDamage in one step - see its own field comment. */
@@ -486,6 +698,23 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         if (this.level() instanceof ServerLevel serverLevel) {
             serverLevel.playSound(null, this.blockPosition(), SoundEvents.ALLAY_HURT, SoundSource.HOSTILE, 1.0F, 0.0F);
         }
+    }
+
+    /** Same isSilent()-bypass reasoning as playHurtSound/playStepSound above, extended to death:
+     * vanilla's own death sound doesn't have a dedicated playXSound-style hook the way hurt/step do
+     * (confirmed via javap - LivingEntity.die() reaches it through hurtServer's own makeSound(
+     * getDeathSound()) call, which routes through the exact same isSilent()-gated
+     * Entity.playSound(SoundEvent,F,F) as everything else this class already works around), so this
+     * overrides die() itself instead to get the same direct-call bypass. Volume/pitch per the user's
+     * own explicit request (2.0/0.0 - same allay-pitch-reads-too-cheerful reasoning as
+     * playHurtSound's own pitch=0, louder than the ordinary hurt sound since this only ever plays
+     * once, right at the very end). */
+    @Override
+    public void die(DamageSource source) {
+        if (this.level() instanceof ServerLevel serverLevel) {
+            serverLevel.playSound(null, this.blockPosition(), SoundEvents.ALLAY_DEATH, SoundSource.HOSTILE, 2.0F, 0.0F);
+        }
+        super.die(source);
     }
 
     /** See playHurtSound's own comment - same isSilent()-bypass reasoning. Now uses the walked-on
@@ -861,6 +1090,8 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         if (!this.level().isClientSide()) {
             samplePlayerDirection();
             this.planRunner.tick();
+            checkSpectralArrowDetection();
+            updateGlow();
         }
     }
 
@@ -1305,7 +1536,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      * <p>
      * Real bug, live-debugged via a GameTest diagnostic: getGroundSide()==DOWN alone isn't actually
      * reliable enough for this specific check, despite that method's own doc comment's confidence -
-     * right after a combat.teleport_to_band(band="above_player") ceiling landing specifically, both
+     * right after a combat.teleport(destination="above") ceiling landing specifically, both
      * getGroundSide() AND onGround() can spuriously read as an ordinary floor (normal.y reading ~1.0
      * too) while the entity is still physically sitting at ceiling height with nothing solid anywhere
      * near it - confirmed by dumping exactly that state mid-test (y unchanged from the ceiling contact
@@ -1509,7 +1740,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
 
     /**
      * Real, separate follow-up to nudgeTowardAttachedSurface, live-debugged via a real GameTest
-     * failure: a fresh ceiling teleport (combat.teleport_to_band(band="above_player") - see
+     * failure: a fresh ceiling teleport (combat.teleport(destination="above") - see
      * PlanRunner's own call site) DOES stick after the nudge above (getGroundSide() genuinely reads
      * UP), but a movement.drop issued right after it still couldn't detach - the entity just sat at
      * ceiling height for the rest of the test. Root cause, from this class's own established
@@ -1553,6 +1784,13 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
      */
     public void startWave(JsonObject plan, int severityPercent, boolean tierGatingBypassed) {
         this.planRunner.start(plan, severityPercent, tierGatingBypassed);
+    }
+
+    /** See PlanRunner.startOverride - WendigoManager's own hardcoded, circumstance-triggered
+     * overrides (darkness-overstay chase, too-close lunge), which preserve this wave's own
+     * already-earned task progress instead of resetting it like startWave does. */
+    public void startWaveOverride(JsonObject plan, int severityPercent) {
+        this.planRunner.startOverride(plan, severityPercent);
     }
 
     /** True once the current wave's plan body and despawn move have both finished. */
@@ -1622,6 +1860,11 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
         return this.planRunner.isForcingRide();
     }
 
+    /** True while fleeing from a landed spectral hit - see PlanRunner.isFleeingFromSpectralHit. */
+    public boolean isFleeingFromSpectralHit() {
+        return this.planRunner.isFleeingFromSpectralHit();
+    }
+
     /** WendigoManager's grab_distance override - see PlanRunner.forceGrabNow. */
     public void forceGrabNow(ServerPlayer target) {
         this.planRunner.forceGrabNow(target);
@@ -1630,16 +1873,6 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber {
     /** See PlanRunner.consumeRideJustEnded. */
     public boolean consumeRideJustEnded() {
         return this.planRunner.consumeRideJustEnded();
-    }
-
-    /** See PlanRunner.consumeSpearRepelJustHappened. */
-    public boolean consumeSpearRepelJustHappened() {
-        return this.planRunner.consumeSpearRepelJustHappened();
-    }
-
-    /** See PlanRunner.consumeSnuffedTorches. */
-    public List<BlockPos> consumeSnuffedTorches() {
-        return this.planRunner.consumeSnuffedTorches();
     }
 
     /** Resolves a still-forced rider (damage or a clean release) before this entity is discarded -

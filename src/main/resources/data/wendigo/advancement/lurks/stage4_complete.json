@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/stage3_complete",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "It's done waiting for an opening - it'll chase you down in the open now, from any angle, even the one behind you. This is the last stage before the real hunt. Craft a spectral arrow and finish it, or it'll finish you"
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:diamond_chestplate"
+    },
+    "title": {
+      "text": "No Escape"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

@@ -4,7 +4,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -21,7 +20,6 @@ import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
-import net.minecraft.tags.ItemTags;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
@@ -43,6 +41,7 @@ import com.wendigo.spatial.CaveScaleScanner.CaveScale;
 import com.wendigo.WendigoTuningConfig;
 import com.wendigo.spatial.DarkSpotScanner;
 import com.wendigo.spatial.LightSourceScanner;
+import com.wendigo.spatial.SoulLightScanner;
 
 /**
  * Per-entity interpreter for a WendigoActionPlan (see action_schema.json). Advances at most one
@@ -103,11 +102,11 @@ public class PlanRunner {
 	// SemanticBands.APPROACH_BASELINE_CAP_BLOCKS) - backs predicate.player_approaching/
 	// player_undetected's approach_band. NaN when there's no active while (see PlanPredicates.evaluate).
 	private double whileBaselineDistance = Double.NaN;
-	// Consecutive ticks ANY nearby player has continuously satisfied at least this look-angle band -
-	// see updateLookStreaks (polled every tick, not just during an active control.while, so a streak
+	// Consecutive ticks the TARGET has continuously satisfied at least this look-angle band - see
+	// updateLookStreaks (polled every tick, not just during an active control.while, so a streak
 	// that started before a stare-hold loop even began still counts) and PlanPredicates.
-	// isLookedAtByAnyoneGraduated (what actually reads these). Reset to 0 the instant nobody currently
-	// satisfies that band.
+	// isLookedAtByTargetGraduated (what actually reads these). Reset to 0 the instant the target
+	// doesn't currently satisfy that band.
 	private int inViewStreakTicks;
 	private int cornerOfEyeStreakTicks;
 	// How many times the current control.while has actually run a body containing an approach-type
@@ -128,22 +127,8 @@ public class PlanRunner {
 	// into. Every real wave (spawnWave/engageExistingWendigo/the hand-built override plans) always
 	// has one.
 	private boolean despawnEnabled = true;
-	// Which live band beginNextDespawnAttempt resolves against - the model's own plan-level choice
-	// now (see the schema's despawn_band field), not hardcoded to "farthest" - the user's own
-	// explicit request to hand withdrawal distance back to the AI instead of always maxing it out.
-	// Only ever medium/far/farther/farthest (see the schema enum - no closer option is offered at
-	// all, so there's no severity/tier floor to enforce here beyond that), defaulting to "far" (a
-	// real but moderate distance, not the map-relative maximum) if the field is missing (every
-	// hand-built override plan in WendigoManager, plus a spear-repel that fires straight out of
-	// orbit via forceGrabNow with no active plan to have ever set this) or invalid - was "farthest"
-	// until the user's own explicit follow-up request not to always max out the flee distance after
-	// a spear repel specifically; changed the one shared fallback rather than special-casing
-	// repelWithSpear alone, since every other user of this default is an engine-authored plan with
-	// the same "no real AI choice was ever made here" situation.
-	private static final String DEFAULT_DESPAWN_BAND = "far";
-	private String despawnBand = DEFAULT_DESPAWN_BAND;
-	// How many live despawn/retreat attempts have been tried this wave - each one re-resolves
-	// despawnBand fresh, seeded from wherever the entity actually is at that moment (naturally a
+	// How many live despawn/retreat attempts have been tried this wave - each one re-resolves a
+	// fresh target, seeded from wherever the entity actually is at that moment (naturally a
 	// different search each retry, since the entity moved), rather than walking a pre-scanned
 	// candidate list. Bounded so a wave can't retry forever if genuinely nothing is ever found.
 	private int despawnAttemptCount;
@@ -252,23 +237,14 @@ public class PlanRunner {
 	// combat.chase bookkeeping - see isChaseResolved/maybeDestroyNearbyTorches.
 	private int chaseUnreachableTicks;
 	private static final int CHASE_GIVE_UP_TICKS = 100; // ~5s of sustained unreachability
-	// Repath cadence for combat.chase/internal.chase_until_light - see isChaseResolved's own doc
-	// comment for why this replaced the old reactive isStuck()/navigationFinished()-triggered repath
-	// entirely. Originally mirrored vanilla's own MeleeAttackGoal.tick() cadence exactly (4 + random(7)
-	// ticks, well-known vanilla behavior - the same pathing SpiderAttackGoal, a plain MeleeAttackGoal
-	// subclass, already uses for a real spider's own melee-follow chase), per the user's own earlier
-	// explicit request to match how "other hostile mobs"/"the spiders melee follow methods" repath.
-	// Slowed down later (the user's own later explicit "throttle recalculations to prevent him
-	// spinning as he battles with equivalent paths" request, "maybe like every 20 ticks") - that fast
-	// a cadence works fine for a real spider's much simpler open-ground pathing, but this entity's own
-	// wall/ceiling-climbing node evaluator has more roughly-tied candidate routes to flip between near
-	// obstacles, and repathing every 4-10 ticks gave it too little time to actually commit to one
-	// before the next recalculation could pick a different (but equally valid) alternative.
-	private int chaseRepathTicks;
 	private static final int CHASE_MAX_TICKS = 600; // 30s hard backstop even if never fully unreachable
 	private static final double CHASE_TORCH_RADIUS = 10.0;
 	private static final int CHASE_TORCH_MAX_PER_SCAN = 6;
 	private static final int CHASE_TORCH_SCAN_INTERVAL_TICKS = 10; // throttle the light-source scan
+	// The user's own explicit hardcoded combat.break_torch cutoff - see that action's own dispatch.
+	private static final float BREAK_TORCH_MAX_HEALTH_FRACTION = 0.75F;
+	// The user's own explicit hardcoded posture.stare cutoff at stage 5 - see that action's own dispatch.
+	private static final float STAGE5_STARE_MAX_HEALTH_FRACTION = 0.5F;
 	// combat.lunge_attack precondition - don't commit to a lunge with nowhere dark enough nearby to
 	// retreat to afterward. Scales with severity (see lungeSafeLightRadius) rather than a single
 	// fixed value - these are its bounds.
@@ -285,7 +261,7 @@ public class PlanRunner {
 	// stare-hold mechanic: startAction resets self.isStaring() at the top of every real movement
 	// action (see isMovementType) so the rig faces its actual travel direction instead of staying
 	// artificially locked onto the player mid-approach - correct for the visual, but a "creep closer
-	// and stare" control.while's own body is typically movement.approach_band, so its
+	// and stare" control.while's own body is typically movement.approach_spot, so its
 	// very first iteration was silently clearing isStaring() and permanently disabling the hold
 	// extension for the rest of that loop, even though the model clearly still intends to be staring
 	// (real logs showed exactly this: a while loop burning through its whole iteration budget in a
@@ -295,10 +271,11 @@ public class PlanRunner {
 	private boolean modelIntendedStaring;
 	// The type of whichever action most recently finished (see tick()'s own "String finishedType"
 	// Non-zero while a stare must keep holding regardless of what the plan/control.while would
-	// otherwise do. Originally only applied right after a resolved combat.teleport_in_view (the user's
-	// own explicit original request) - broadened to EVERY fresh posture.stare(enabled=true) session
-	// after a real live bug: a plan that went straight from combat.teleport_to_band (a different,
-	// similarly-instant reposition action) into posture.stare then immediately into sound.breathe/
+	// otherwise do. Originally only applied right after a resolved combat.teleport(destination=
+	// in_view) (the user's own explicit original request) - broadened to EVERY fresh
+	// posture.stare(enabled=true) session after a real live bug: a plan that went straight from a
+	// different combat.teleport destination type (also a similarly-instant reposition) into
+	// posture.stare then immediately into sound.breathe/
 	// movement.retreat_with_fallback, with no control.while in between, showed the stare for
 	// effectively zero real time - the old narrower trigger only ever covered the teleport_in_view
 	// pairing specifically, not this equally-plausible one. Now set on every fresh stare start
@@ -398,24 +375,25 @@ public class PlanRunner {
 	// "4 stares AND 4 noises" request. Any cue value counts, not just "stare" specifically.
 	private int soundCueCount;
 	// Counts every sound.breathe that actually played within BREATHE_SUCCESS_RADIUS of any player
-	// (see playBreathe) - the user's own explicit "1 successful breathe" goal on every stage 1-4 (see
-	// WendigoProgressionTracker), independent of whatever else that stage's own progress already
-	// tracks. A breathe played from farther away still plays (never a no-op), it just doesn't count
+	// (see playBreathe) - the user's own explicit "1 successful breathe" goal on stages 2-4 (see
+	// WendigoProgressionTracker - sound.breathe isn't even offered at stage 1 anymore), independent of
+	// whatever else that stage's own progress already tracks. A breathe played from farther away still
+	// plays (never a no-op), it just doesn't count
 	// toward this - same "always plays, only sometimes counts" shape torchBreakCount/
 	// successfulStareCount above already have for their own success conditions.
 	private int successfulBreatheCount;
+	// The soul-light progression redesign - the user's own explicit "track if the target was within a
+	// safe distance to a soul light... when a task was satisfied" request. Bumped once per task-
+	// counter increment above (successfulStareCount/torchBreakCount/lungeAttemptCount/soundCueCount/
+	// successfulBreatheCount/grabbedSuccessfully - see recordSoulLightTally's own call sites), checking
+	// SoulLightScanner.isNearSoulLight at that exact moment. Fed into WendigoProgressionTracker.
+	// ActiveRun via WendigoManager's own wave-end accounting (same shape as the counters above),
+	// where the whole RUN's cumulative tally (not just this one wave's) finally decides whether
+	// completing the run's goal advances or regresses the stage - see
+	// WendigoProgressionTracker.resolveRunOutcome.
+	private int tasksNearSoulLight;
+	private int tasksNotNearSoulLight;
 	private boolean currentStareCounted;
-	// Every position snuffByWendigo has touched this wave via combat.chase's own passive
-	// maybeDestroyNearbyTorches collateral ONLY - the user's own explicit correction: a deliberate
-	// combat.break_torch (performTorchBreak, see its own doc comment) is deliberately NOT added here
-	// anymore, since that torch is meant to stay off for good, unlike a chase's own incidental
-	// collateral damage, which still gets relit after the wave. A LinkedHashSet, not a List: the same
-	// torch can get re-snuffed by a later scan while already dark (still a snuffed instance,
-	// snuffByWendigo just no-ops onto the same state), and insertion order is what the post-wave
-	// relight queue walks through (see WendigoManager.processPendingTorchRelights). Consumed (read +
-	// cleared) exactly once per wave via consumeSnuffedTorches - same one-shot idiom as
-	// consumeRideJustEnded/consumeSpearRepelJustHappened.
-	private final LinkedHashSet<BlockPos> snuffedTorches = new LinkedHashSet<>();
 
 	public PlanRunner(WendigoEntity self) {
 		this.self = self;
@@ -434,17 +412,38 @@ public class PlanRunner {
 	 * it's safe to remove the entity.
 	 */
 	public void start(JsonObject fullPlan, int severityPercent, boolean tierGatingBypassed) {
-		startInternal(fullPlan, severityPercent, tierGatingBypassed, true);
+		startInternal(fullPlan, severityPercent, tierGatingBypassed, true, true);
 	}
 
 	/** /wendigo plantest's own entry point - same as start() but with no despawn phase at all,
 	 * matching its own "run this plan body raw, independent of the wave system" purpose (see
 	 * WendigoEntity.debugInjectPlan) - there's no wave lifecycle backing it to flee/despawn into. */
 	public void startRaw(JsonObject fullPlan) {
-		startInternal(fullPlan, 100, true, false);
+		startInternal(fullPlan, 100, true, false, true);
 	}
 
-	private void startInternal(JsonObject fullPlan, int severityPercent, boolean tierGatingBypassed, boolean despawnEnabled) {
+	/**
+	 * WendigoManager's own hardcoded, circumstance-triggered overrides (darkness-overstay
+	 * internal.chase_until_light, a too-close bounded lunge) - interrupts whatever this wave was
+	 * already doing, WITHOUT resetting the wave's own already-earned task progress the way an
+	 * ordinary start() would (resetProgress=false - see startInternal's own new parameter). The
+	 * user's own explicit "plans that are hardcoded and dependent on specific circumstances
+	 * (darkness, too close) should not affect the current run's tasks" request. Real bug this fixes:
+	 * neither override ever went through WendigoManager.tickLevel's own normal wave-end accounting
+	 * before firing (they interrupt mid-tick, not at a clean wave boundary), so whatever this wave
+	 * had already earned before being interrupted (successfulStareCount, torchBreakCount, a real
+	 * grabbedSuccessfully/dealtDamage/reachedDeadStare fact, planShape's own "story so far") was
+	 * silently wiped by startInternal's own ordinary reset, well before the (now-overridden) wave
+	 * eventually did end and get accounted for - the earlier fact simply never got recorded anywhere.
+	 * Always bypasses tier gating (these overrides are engine-synthesized, never model-authored, so
+	 * there's nothing to gate) and always keeps despawnEnabled=true (an override always eventually
+	 * needs to resolve back into a real despawn attempt, same as an ordinary wave). */
+	public void startOverride(JsonObject plan, int severityPercent) {
+		startInternal(plan, severityPercent, true, true, false);
+	}
+
+	private void startInternal(JsonObject fullPlan, int severityPercent, boolean tierGatingBypassed,
+			boolean despawnEnabled, boolean resetProgress) {
 		// Generalizes overrideIntoChaseUntilLight's existing "interrupt whatever's currently running,
 		// reuse the same still-alive entity" idiom to also interrupt orbit, not just an already-active
 		// plan - the one line that lets WendigoManager start a plan on an orbiting entity the exact
@@ -465,21 +464,29 @@ public class PlanRunner {
 		this.severityPercent = severityPercent;
 		this.tierGatingBypassed = tierGatingBypassed;
 		this.despawnEnabled = despawnEnabled;
-		this.despawnBand = isValidDespawnBand(fullPlan.has("despawn_band") ? fullPlan.get("despawn_band").getAsString() : null)
-			? fullPlan.get("despawn_band").getAsString() : DEFAULT_DESPAWN_BAND;
 		this.despawnAttemptCount = 0;
 		this.despawnSucceeded = false;
 		this.currentDespawnTarget = null;
 		this.consecutiveNoProgressGiveUps = 0;
-		this.grabbedSuccessfully = false;
-		this.dealtDamage = false;
-		this.reachedDeadStare = false;
-		this.withdrewInstantly = false;
-		this.successfulStareCount = 0;
-		this.torchBreakCount = 0;
-		this.lungeAttemptCount = 0;
-		this.soundCueCount = 0;
-		this.successfulBreatheCount = 0;
+		// The user's own explicit "hardcoded, circumstance-triggered plans shouldn't affect the
+		// current run's tasks" request - see startOverride's own doc comment for the real bug this
+		// resetProgress=false path fixes. Everything else in this method still resets unconditionally
+		// even for an override - only these facts/counters (and planShape, below) represent real
+		// earned progress toward this wave's own outcome/goal, worth preserving across an interrupt;
+		// everything else here is plan-EXECUTION state, which genuinely should restart fresh either way.
+		if (resetProgress) {
+			this.grabbedSuccessfully = false;
+			this.dealtDamage = false;
+			this.reachedDeadStare = false;
+			this.withdrewInstantly = false;
+			this.successfulStareCount = 0;
+			this.torchBreakCount = 0;
+			this.lungeAttemptCount = 0;
+			this.soundCueCount = 0;
+			this.successfulBreatheCount = 0;
+			this.tasksNearSoulLight = 0;
+			this.tasksNotNearSoulLight = 0;
+		}
 		this.currentStareCounted = false;
 		this.modelIntendedStaring = false;
 		this.meaningfulActionCompletedThisWave = false;
@@ -491,7 +498,11 @@ public class PlanRunner {
 		// glowing eyes/face-lock" case for whatever path doesn't (e.g. a debug-injected plan straight
 		// after another debug-injected plan, bypassing the normal wave-end flow).
 		this.self.setStaring(false);
-		List<String> shape = new ArrayList<>();
+		// Extended (not replaced) when resetProgress is false - same "connect the two" shape
+		// resumeFromReEvaluate already established for splicing a sub-plan onto an in-progress wave,
+		// so EncounterHistory/the "tasks completed this run" debug line still show the whole real
+		// story, including whatever ran before this override took over.
+		List<String> shape = resetProgress ? new ArrayList<>() : new ArrayList<>(this.planShape);
 		for (var element : this.topLevelSteps) {
 			shape.add(element.getAsJsonObject().get("type").getAsString());
 		}
@@ -647,8 +658,8 @@ public class PlanRunner {
 	}
 
 	/** The success path: a real sub-plan response came back. Splices it in as the new remainder of the
-	 * plan - same field-setting shape startInternal uses for a genuinely fresh plan (plan/despawn_band/
-	 * global_rules all fully replaced), EXCEPT the cumulative wave-level goal-progress counters
+	 * plan - same field-setting shape startInternal uses for a genuinely fresh plan (plan/global_rules
+	 * both fully replaced), EXCEPT the cumulative wave-level goal-progress counters
 	 * (successfulStareCount, torchBreakCount, lungeAttemptCount, soundCueCount, successfulBreatheCount)
 	 * and reEvaluateStepLog itself are deliberately left untouched - those persist across the splice for
 	 * the whole wave, not reset per sub-plan. planShape is EXTENDED (not replaced) with the sub-plan's
@@ -663,8 +674,6 @@ public class PlanRunner {
 		this.actionQueue.clear();
 		this.activeWhile = null;
 		this.whileBaselineDistance = Double.NaN;
-		this.despawnBand = isValidDespawnBand(subPlan.has("despawn_band") ? subPlan.get("despawn_band").getAsString() : null)
-			? subPlan.get("despawn_band").getAsString() : DEFAULT_DESPAWN_BAND;
 		JsonElement globalRulesElement = subPlan.get("global_rules");
 		this.globalRules = globalRulesElement != null && !globalRulesElement.isJsonNull()
 			? globalRulesElement.getAsJsonArray() : null;
@@ -686,7 +695,8 @@ public class PlanRunner {
 	public EncounterOutcome outcome() {
 		return new EncounterOutcome(this.planShape, this.grabbedSuccessfully, this.dealtDamage, this.reachedDeadStare,
 			this.withdrewInstantly, this.successfulStareCount, this.torchBreakCount, this.lungeAttemptCount,
-			this.soundCueCount, this.successfulBreatheCount, currentActionType());
+			this.soundCueCount, this.successfulBreatheCount, this.tasksNearSoulLight, this.tasksNotNearSoulLight,
+			currentActionType());
 	}
 
 	/** Whatever action was actually in flight the instant this snapshot was taken, or null if nothing
@@ -700,7 +710,58 @@ public class PlanRunner {
 
 	public record EncounterOutcome(List<String> planShape, boolean grabbedSuccessfully, boolean dealtDamage,
 			boolean reachedDeadStare, boolean withdrewInstantly, int successfulStareCount, int torchBreakCount,
-			int lungeAttemptCount, int soundCueCount, int successfulBreatheCount, String interruptedDuringAction) {
+			int lungeAttemptCount, int soundCueCount, int successfulBreatheCount, int tasksNearSoulLight,
+			int tasksNotNearSoulLight, String interruptedDuringAction) {
+
+		/** Human-readable "what actually happened" checklist - only the parts that actually happened,
+		 * not a wall of false/0 fields - for WendigoManager's own always-on (not verbose-gated) per-run
+		 * debug print, the user's own explicit "list what tasks have been completed per run in the
+		 * debug, non-verbose mode" request. Distinct from EncounterHistory's own synthesized recap
+		 * fallback (WaveContext.describeEntry) - that one's written for the MODEL to read back as prose;
+		 * this one's written for a person watching chat mid-session, so it's terser and lists raw
+		 * counts rather than narrating them. */
+		public String describeCompletedTasks() {
+			List<String> tasks = new java.util.ArrayList<>();
+			if (this.successfulStareCount > 0) {
+				tasks.add(this.successfulStareCount + " successful stare(s)");
+			}
+			if (this.reachedDeadStare) {
+				tasks.add("reached a dead-on stare");
+			}
+			if (this.torchBreakCount > 0) {
+				tasks.add(this.torchBreakCount + " torch(es) broken");
+			}
+			if (this.lungeAttemptCount > 0) {
+				tasks.add(this.lungeAttemptCount + " lunge attempt(s)");
+			}
+			if (this.soundCueCount > 0) {
+				tasks.add(this.soundCueCount + " sound cue(s)");
+			}
+			if (this.successfulBreatheCount > 0) {
+				tasks.add(this.successfulBreatheCount + " breathe cue(s)");
+			}
+			if (this.grabbedSuccessfully) {
+				tasks.add("grabbed the player");
+			}
+			// See tasksNearSoulLight/tasksNotNearSoulLight's own field comment - this wave's own
+			// contribution only, not the whole run's cumulative tally (WendigoManager's own
+			// run-completion debug line covers that, once resolveRunOutcome actually decides the
+			// advance/regress outcome).
+			if (this.tasksNearSoulLight > 0 || this.tasksNotNearSoulLight > 0) {
+				tasks.add(this.tasksNotNearSoulLight + " task(s) not near soul light, "
+					+ this.tasksNearSoulLight + " near");
+			}
+			if (this.dealtDamage) {
+				tasks.add("dealt damage");
+			}
+			if (this.withdrewInstantly) {
+				tasks.add("withdrew instantly");
+			}
+			if (this.interruptedDuringAction != null) {
+				tasks.add("interrupted during " + this.interruptedDuringAction);
+			}
+			return tasks.isEmpty() ? "no tasks completed" : String.join(", ", tasks);
+		}
 	}
 
 	/**
@@ -717,6 +778,10 @@ public class PlanRunner {
 	private void completeWave(boolean withdrewInstantly) {
 		resolveRiderOnEnd();
 		this.forcingRide = false;
+		// The forced flee from a landed spectral hit (see forceFleeToOrbit) is genuinely over once
+		// the wave it triggered actually completes, whichever way that happens - a real despawn-point
+		// arrival or an exhausted fallback chain both end up here.
+		this.fleeingFromSpectralHit = false;
 		this.topLevelSteps = null;
 		this.waveComplete = true;
 		this.withdrewInstantly = withdrewInstantly;
@@ -748,14 +813,32 @@ public class PlanRunner {
 	 * rideJustEnded is what starts checkUnconditionalGrab's re-grab grace period, needed here just as
 	 * much as for a spammed-shift escape (release, drop, and grab_distance can trivially both be true
 	 * on the exact same tick). No-ops entirely if nobody's currently a forced rider.
+	 * <p>
+	 * forcingRide flips to false BEFORE the despawn-damage hurtServer call below, not after - a real,
+	 * live-reported bug (stage-5 boss bar sometimes staying up after a death-and-respawn): if THIS
+	 * exact hit is what kills the player, ServerLivingEntityEvents.ALLOW_DEATH's handler
+	 * (WendigoManager.handleTargetDeath -> endEngagementIfTarget) fires synchronously from inside
+	 * this same hurtServer call, and endEngagementIfTarget's own isForcingRide() guard - there
+	 * specifically to avoid short-circuiting a still-genuinely-active carry - would otherwise still
+	 * read true at that exact instant, silently skipping the whole "hand off to another player /
+	 * reset state.stage" reset. That left state.stage (and state.lockedTarget, until AFTER_RESPAWN's
+	 * own swap) stale at whatever they were, which is exactly why updateStage5BossBar (keyed purely
+	 * off state.stage) kept showing the bar again once the player respawned alive. Flipped AFTER
+	 * hasHadFairRideChance() is evaluated, not before - that method's own "!this.forcingRide" branch
+	 * means something different (a completely separate "no ride in progress at all" case for other
+	 * callers), so evaluating it first preserves its real rideTicks-based check unchanged; nothing
+	 * else in this method reads forcingRide again afterward, so flipping it here is otherwise safe.
 	 */
 	public void resolveRiderOnEnd() {
 		if (!this.forcingRide || this.ridingPlayer == null || !this.ridingPlayer.isAlive()) {
 			return;
 		}
-		if (hasHadFairRideChance() && this.self.level() instanceof ServerLevel serverLevel) {
-			this.ridingPlayer.hurtServer(serverLevel, this.self.damageSources().mobAttack(this.self), FORCED_RIDE_DESPAWN_DAMAGE);
-			debugSay("despawning with a forced rider still aboard - dealing " + FORCED_RIDE_DESPAWN_DAMAGE + " damage");
+		boolean fairChanceHad = hasHadFairRideChance();
+		this.forcingRide = false;
+		if (fairChanceHad && this.self.level() instanceof ServerLevel serverLevel) {
+			float damage = despawnDamageForCurrentStage();
+			this.ridingPlayer.hurtServer(serverLevel, this.self.damageSources().mobAttack(this.self), damage);
+			debugSay("despawning with a forced rider still aboard - dealing " + damage + " damage");
 			this.dealtDamage = true;
 		} else {
 			debugSay("despawning with a forced rider still aboard, but too soon after catching them for a "
@@ -763,8 +846,15 @@ public class PlanRunner {
 		}
 		this.ridingPlayer.removeEffect(MobEffects.BLINDNESS);
 		this.ridingPlayer.stopRiding();
-		this.forcingRide = false;
 		this.rideJustEnded = true;
+	}
+
+	/** The despawn-hit raw damage for the current stage - STAGE_DESPAWN_RAW_DAMAGE's own stage-tier
+	 * value, unclamped: the user's own explicit "let the wendigo finish the player off at other
+	 * [stages] too" reversal of an earlier "can't actually die outside stage 5" restriction - a real
+	 * kill is allowed at every stage now, not just the final one. */
+	private float despawnDamageForCurrentStage() {
+		return STAGE_DESPAWN_RAW_DAMAGE[stageForSeverityPercent(this.severityPercent)];
 	}
 
 	public void tick() {
@@ -800,9 +890,10 @@ public class PlanRunner {
 		// stare session the instant it's noticed at all (corner_of_eye, the widest band - matches
 		// STAGE_UNDER_20's own "spotted, even peripherally" framing for what counts as a success),
 		// latched so a long-held stare doesn't rack up dozens of counts across the ticks it stays true.
-		if (this.modelIntendedStaring && !this.currentStareCounted && PlanPredicates.isLookedAtByAnyone(this.self, "corner_of_eye")) {
+		if (this.modelIntendedStaring && !this.currentStareCounted && PlanPredicates.isLookedAtByTarget(this.self, "corner_of_eye")) {
 			this.successfulStareCount++;
 			this.currentStareCounted = true;
+			recordSoulLightTally(Targeting.nearestPlayer(this.self));
 		}
 		if (checkGlobalRules() || checkStage1ApproachRule()) {
 			return; // interrupted this tick - whatever was running got preempted, resolve next tick
@@ -1098,25 +1189,45 @@ public class PlanRunner {
 	 * the automatic terminal despawn phase and the mid-plan movement.retreat_with_fallback step, so
 	 * "try again, live, from here" behaves identically either way.
 	 */
-	/** Guards against a malformed/unexpected despawn_band value (or any band the schema wasn't meant
-	 * to offer here, e.g. "close") falling through to a live-band search with a nonsensical or
-	 * unreasonably close range - only the four the schema actually exposes are trusted. */
-	private static boolean isValidDespawnBand(String band) {
-		return "medium".equals(band) || "far".equals(band) || "farther".equals(band) || "farthest".equals(band);
-	}
-
+	/** Fleeing no longer has a model-chosen distance at all - the user's own explicit "just provide a
+	 * home-base... no point having him go further or closer than [the orbit range] since he'll
+	 * certainly return to it anyway" request: a despawn/retreat attempt now always aims for the
+	 * wendigo's own ordinary orbit band for its current stage (SemanticBands.orbitMinDistance/
+	 * orbitMaxDistance), real-pathfind-verified via the exact same findReachableOrbitPath helper
+	 * tickOrbit's own idle wander/waypoint search already uses - not a separately-chosen band, and no
+	 * longer just a geometric guess (findLiveBandPosition's own flood-fill reachability-from-self,
+	 * which is a weaker guarantee than a real verified path - see findReachableOrbitPath's own doc
+	 * comment). Falls back to the old unverified findDarkestAwayFrom scan, then despawning in place,
+	 * only once that budget is exhausted - same "some darkness beats none" last resort as before. */
 	private void beginNextDespawnAttempt() {
 		this.despawnAttemptCount++;
 		BlockPos selfPos = this.self.blockPosition();
 		Player nearestPlayer = Targeting.nearestPlayer(this.self);
-		BlockPos target = nearestPlayer != null
-			? DarkSpotScanner.findLiveBandPosition(this.self.level(), selfPos, nearestPlayer.blockPosition(),
-				PositionBands.distanceMin(this.despawnBand), PositionBands.distanceMax(this.despawnBand), Direction.UP)
-			: null;
-		if (target == null) {
-			BlockPos avoid = nearestPlayer != null ? nearestPlayer.blockPosition() : null;
-			target = DarkSpotScanner.findDarkestAwayFrom(this.self.level(), selfPos, SemanticBands.searchRadiusBlocks("near"), avoid);
+		BlockPos target = null;
+		if (nearestPlayer != null) {
+			CaveScale caveScale = CaveScaleScanner.classify(this.self.level(), selfPos);
+			Path path = findReachableOrbitPath(SemanticBands.orbitMinDistance(caveScale),
+				SemanticBands.orbitMaxDistance(caveScale), nearestPlayer.blockPosition(), caveScale);
+			if (path != null) {
+				target = path.getTarget();
+				this.currentDespawnTarget = target;
+				this.actionDeadlineTick = this.self.tickCount + SemanticBands.ACTION_TIMEOUT_TICKS;
+				// moveTo(Path, double) returns boolean (confirmed via decompile) - real bug found live:
+				// every one of this pass's new moveTo(Path, ...) call sites was discarding this, so a
+				// path that failed to actually start following (still non-null, but rejected/empty)
+				// silently left setNavigationFailed() at whatever it was before, instead of correctly
+				// marking the failure - the same class of bug the ORIGINAL moveTo(x,y,z,speed) call
+				// sites already guarded against by capturing their own boolean return.
+				boolean started = this.self.getNavigation().moveTo(path, this.despawnSpeedMultiplier);
+				this.self.setNavigationFailed(!started);
+				debugSay("despawn attempt " + this.despawnAttemptCount + ": target=" + target.toShortString() + " self=" + selfPos.toShortString()
+					+ " (orbit band, verified) moveTo started=" + started + " onGround=" + this.self.onGround() + " inLiquid=" + this.self.isInLiquid()
+					+ " minY=" + this.self.level().getMinY());
+				return;
+			}
 		}
+		BlockPos avoid = nearestPlayer != null ? nearestPlayer.blockPosition() : null;
+		target = DarkSpotScanner.findDarkestAwayFrom(this.self.level(), selfPos, SemanticBands.searchRadiusBlocks("near"), avoid);
 		if (target == null) {
 			// Last resort found nothing acceptable nearby either - despawning in place (matches
 			// the documented backstop), but this was previously silent, indistinguishable from a
@@ -1129,7 +1240,7 @@ public class PlanRunner {
 		boolean started = this.self.getNavigation().moveTo(target.getX() + 0.5, target.getY(), target.getZ() + 0.5, this.despawnSpeedMultiplier);
 		this.self.setNavigationFailed(!started);
 		debugSay("despawn attempt " + this.despawnAttemptCount + ": target=" + target.toShortString() + " self=" + selfPos.toShortString()
-			+ " moveTo started=" + started + " onGround=" + this.self.onGround() + " inLiquid=" + this.self.isInLiquid()
+			+ " (unverified fallback) moveTo started=" + started + " onGround=" + this.self.onGround() + " inLiquid=" + this.self.isInLiquid()
 			+ " minY=" + this.self.level().getMinY());
 	}
 
@@ -1148,7 +1259,21 @@ public class PlanRunner {
 		}
 		while (true) {
 			if (!this.actionQueue.isEmpty()) {
-				return this.actionQueue.poll();
+				JsonObject queued = this.actionQueue.poll();
+				// The one nesting exception (control_while_body_step in action_schema.json): a
+				// control.while body element can itself be a control.if. Resolved lazily, right here,
+				// rather than at while-body queue time - matches control.if's own "evaluate once, at the
+				// point this step is reached" semantics even though it arrived via a body queued all at
+				// once. The chosen branch replaces it in place - spliced onto the FRONT of actionQueue, not
+				// the back, so it runs before whatever else from this same body pass is still waiting.
+				if (queued.get("type").getAsString().equals("control.if")) {
+					List<JsonObject> branchSteps = resolveControlIfBranch(queued);
+					for (int i = branchSteps.size() - 1; i >= 0; i--) {
+						this.actionQueue.addFirst(branchSteps.get(i));
+					}
+					continue;
+				}
+				return queued;
 			}
 			if (this.activeWhile != null) {
 				JsonObject condition = this.activeWhile.getAsJsonObject("condition");
@@ -1164,8 +1289,16 @@ public class PlanRunner {
 				// easily be 40+ blocks out), and this check fired on the very first evaluation - before
 				// the loop's own approach_spot/approach_dim_spot body ever got a single chance to actually
 				// close that distance - ending the whole encounter in 2 ticks with no movement at all.
+				// Sibling hardcoded escape hatch to isPlayerTooFarAwayToKeepStaring right above - same "let
+				// a held stare-hold loop end on its own, as if genuinely spotted" idea, opposite direction:
+				// the user's own explicit "a hardcoded stare rule that moves on with the plan if ANY player
+				// in the group starts approaching him at medium approach scale" request. Not gated on
+				// whileIterationsRun>0 the way the too-far check is - firing on the very first evaluation is
+				// correct here (someone already closing in fast right as the hold begins should end it
+				// immediately, not after burning at least one wasted iteration first).
 				boolean conditionTrue = PlanPredicates.evaluate(condition, this.self, currentPredicateContext())
-					&& !(this.modelIntendedStaring && this.whileIterationsRun > 0 && isPlayerTooFarAwayToKeepStaring());
+					&& !(this.modelIntendedStaring && this.whileIterationsRun > 0 && isPlayerTooFarAwayToKeepStaring())
+					&& !(this.modelIntendedStaring && isAnyPlayerApproachingDuringStare());
 				logStep("predicate: " + condition + " -> " + conditionTrue);
 				// The body is only allowed to actually run again while both the authored iteration
 				// budget remains AND (for a body that includes an approach step) it hasn't already
@@ -1216,7 +1349,7 @@ public class PlanRunner {
 				boolean approachQueuedThisPass = false;
 				for (var element : this.activeWhile.getAsJsonArray("body")) {
 					JsonObject bodyStep = element.getAsJsonObject();
-					if (isApproachType(bodyStep.get("type").getAsString())) {
+					if (bodyElementHasApproach(bodyStep)) {
 						if (approachQueuedThisPass) {
 							this.actionQueue.add(holdStep());
 							continue;
@@ -1233,21 +1366,8 @@ public class PlanRunner {
 			JsonObject step = this.topLevelSteps.get(this.topIndex++).getAsJsonObject();
 			String type = step.get("type").getAsString();
 			if (type.equals("control.if")) {
-				logStep("step: control.if");
-				this.reEvaluateStepLog.add("control.if (immediate)");
-				boolean condition = PlanPredicates.evaluate(step.getAsJsonObject("condition"), this.self, currentPredicateContext());
-				logStep("predicate: " + step.getAsJsonObject("condition") + " -> " + condition);
-				// "else" is required by the schema now (OpenAI's strict structured-output mode
-				// disallows optional properties) but nullable - the model sends an explicit JSON null
-				// rather than omitting the key when there's nothing for the false branch to do.
-				// JsonObject.getAsJsonArray casts straight to JsonArray, which throws on a JsonNull
-				// value rather than treating it like an absent key, so that has to be checked first.
-				JsonElement branchElement = condition ? step.get("then") : step.get("else");
-				JsonArray branch = branchElement != null && !branchElement.isJsonNull() ? branchElement.getAsJsonArray() : null;
-				if (branch != null) {
-					for (var element : branch) {
-						this.actionQueue.add(element.getAsJsonObject());
-					}
+				for (JsonObject branchStep : resolveControlIfBranch(step)) {
+					this.actionQueue.add(branchStep);
 				}
 				continue;
 			}
@@ -1279,7 +1399,7 @@ public class PlanRunner {
 					// nothing before the player's even close. Substitutes the same "hold until actually
 					// noticed" default the schema's own control.while example already recommends,
 					// rather than just breaking the loop - the graduated-look-band timeout (see
-					// PlanPredicates.isLookedAtByAnyoneGraduated) still gives this a real time bound
+					// PlanPredicates.isLookedAtByTargetGraduated) still gives this a real time bound
 					// even without an exact dead-on look.
 					debugSay("issue: control.while condition uses predicate.player_distance while staring - "
 						+ "a stare-hold must be gated purely on being noticed - substituting a look-based hold instead");
@@ -1319,6 +1439,32 @@ public class PlanRunner {
 			}
 			return step;
 		}
+	}
+
+	/** Evaluates a control.if step's condition (right now, at the moment it's actually reached -
+	 * never earlier) and returns the chosen branch's steps in order, or an empty list if there's
+	 * nothing to run on that side. Shared by both places a control.if can now turn up: directly in
+	 * topLevelSteps, and (the one nesting exception) queued inside a control.while body - see
+	 * nextActionStep's own actionQueue-poll branch. */
+	private List<JsonObject> resolveControlIfBranch(JsonObject step) {
+		logStep("step: control.if");
+		this.reEvaluateStepLog.add("control.if (immediate)");
+		boolean condition = PlanPredicates.evaluate(step.getAsJsonObject("condition"), this.self, currentPredicateContext());
+		logStep("predicate: " + step.getAsJsonObject("condition") + " -> " + condition);
+		// "else" is required by the schema now (OpenAI's strict structured-output mode disallows
+		// optional properties) but nullable - the model sends an explicit JSON null rather than
+		// omitting the key when there's nothing for the false branch to do. JsonObject.getAsJsonArray
+		// casts straight to JsonArray, which throws on a JsonNull value rather than treating it like
+		// an absent key, so that has to be checked first.
+		JsonElement branchElement = condition ? step.get("then") : step.get("else");
+		JsonArray branch = branchElement != null && !branchElement.isJsonNull() ? branchElement.getAsJsonArray() : null;
+		List<JsonObject> steps = new ArrayList<>();
+		if (branch != null) {
+			for (var element : branch) {
+				steps.add(element.getAsJsonObject());
+			}
+		}
+		return steps;
 	}
 
 	/** One-time setup for an action_step. Returns false if it already finished within this tick. */
@@ -1390,57 +1536,39 @@ public class PlanRunner {
 				this.self.setNavigationFailed(!started);
 				debugMoveTo(type, started);
 			}
-			case "movement.approach_band" -> {
-				String band = step.get("band").getAsString();
+			case "movement.approach_spot" -> {
+				String destinationType = step.get("destination").getAsString();
 				Player target = Targeting.nearestPlayer(this.self);
 				if (target == null) {
 					return false;
 				}
-				// Resolved live, right now, against wherever the player actually is this instant - the
-				// whole point of the band system replacing the old pre-scanned labeled spots (see
-				// DarkSpotScanner.findLiveBandPosition's own doc comment). Already flood-verified
-				// reachable from self's current position by construction, so unlike the old
-				// labeled-spot system there's no separate "unresolvable label" case to substitute for -
-				// a null result here just means nothing in-band was found THIS time, same as any other
-				// movement primitive coming up empty. "no_players_looking" is the one special value
-				// (mirrors spawn_at's own) - same "farther"-band search, filtered for a position the
-				// player isn't currently facing, letting the model explicitly walk from wherever it
-				// currently is (typically an orbit position) to somewhere unwatched as an ordinary
-				// mid-plan step - previously only spawn_at could do this, and only for a fresh spawn;
-				// engageExistingWendigo never resolves spawn_at at all for a continuing entity, so this
-				// was the only way to get that same "reposition to unwatched" behavior mid-engagement.
-				// "spot_above" - the ceiling directly above the player, same straight-up probe
-				// spawn_at's own "spot_above" resolution uses (findCeilingVantagePoint) - lets the model
-				// explicitly reposition mid-plan to set up a movement.drop, not just choose it fresh at
-				// spawn time.
-				BlockPos dest = "no_players_looking".equals(band)
-					? DarkSpotScanner.findUnwatchedPosition(this.self.level(), this.self.blockPosition(), target,
-						PositionBands.distanceMin("farther"), PositionBands.distanceMax("farther"), Direction.UP)
-					: "spot_above".equals(band)
-						? DarkSpotScanner.findCeilingVantagePoint(this.self.level(), target.blockPosition())
-						: DarkSpotScanner.findLiveBandPosition(this.self.level(), this.self.blockPosition(), target.blockPosition(),
-							PositionBands.distanceMin(band), PositionBands.distanceMax(band), Direction.UP);
-				if (dest == null) {
-					debugSay("issue: nothing live-resolvable at band '" + band + "' right now - skipping movement.approach_band");
+				CaveScale caveScale = CaveScaleScanner.classify(this.self.level(), target.blockPosition());
+				// Real reachability verification, not just a geometric guess - the user's own explicit
+				// "if he can't reach the player in a spot he spawns/teleports to, try again" request,
+				// same shape findReachableOrbitPath already established for orbit positioning. Unlike
+				// combat.teleport (instant, no path needed), this is a walk, so every candidate gets a
+				// real pathfind check regardless of cave scale here (not just TIGHT) - see
+				// resolveDestinationPath's own doc comment.
+				Path path = resolveDestinationPath(destinationType, target, caveScale);
+				if (path == null) {
+					debugSay("issue: nothing reachable at destination '" + destinationType + "' right now - skipping movement.approach_spot");
 					return false;
 				}
 				double speed = SemanticBands.speedMultiplier(step.get("speed").getAsString());
-				boolean started = this.self.getNavigation().moveTo(dest.getX() + 0.5, dest.getY(), dest.getZ() + 0.5, speed);
-				this.self.setNavigationFailed(!started);
-				debugMoveTo(type, started);
+				// Reuses the already-computed, already-verified path directly - confirmed via decompile
+				// that moveTo(Path, double) does NOT internally repath (unlike moveTo(x,y,z,speed), whose
+				// own body is just createPath(x,y,z,1) then moveTo(path,speed)), so this is a genuine
+				// elimination of a redundant pathfind, not just a convenience overload. moveTo(Path,
+				// double) itself still returns boolean though (confirmed via decompile) - this was
+				// previously hardcoded to setNavigationFailed(false) regardless of outcome, which is
+				// exactly the bug that let a rejected/degenerate move sit forever instead of being
+				// recognized and retried.
+				boolean approachStarted = this.self.getNavigation().moveTo(path, speed);
+				this.self.setNavigationFailed(!approachStarted);
+				debugMoveTo(type, approachStarted);
 			}
 			case "movement.retreat_to_dark" -> {
 				BlockPos dest = retreatDestination(step);
-				if (dest == null) {
-					return false;
-				}
-				double speed = SemanticBands.speedMultiplier(step.get("speed").getAsString());
-				boolean started = this.self.getNavigation().moveTo(dest.getX() + 0.5, dest.getY(), dest.getZ() + 0.5, speed);
-				this.self.setNavigationFailed(!started);
-				debugMoveTo(type, started);
-			}
-			case "movement.reposition" -> {
-				BlockPos dest = PlanGeometry.repositionTarget(step, this.self);
 				if (dest == null) {
 					return false;
 				}
@@ -1484,185 +1612,73 @@ public class PlanRunner {
 				// not whether it actually lands the catch, only reached once tier-gating and the
 				// safe-darkness precondition above already passed.
 				this.lungeAttemptCount++;
+				recordSoulLightTally(target);
 			}
-			case "combat.teleport_to_band" -> {
-				// Always available as an action type (see TierGates.minPercentFor's own comment) -
-				// the real gating is (a) SchemaBuilder.filterTeleportBand only ever offering the
-				// stage-appropriate band value(s) in the schema in the first place, and (b) this
-				// runtime-only precondition, which schema filtering can't express at all since it
-				// depends on the wendigo's own LIVE position, not just severity: the current stage's
-				// own cumulative set of allowed source bands (TierGates.teleportSourceBands), the
-				// user's own "basically inverse" design relative to the destination progression - a
-				// set-membership check, not an exact match, now that both sides are cumulative. An
-				// instant relocation, not a walked approach - resolves the same tick it starts (falls
-				// through to isActionDone's default -> true, same as every other single-shot engine
-				// action), no navigation/moveTo involved.
+			case "combat.teleport" -> {
+				// Always available as an action type (see TierGates.minPercentFor's own comment) - the
+				// real gating is entirely which destination type(s) SchemaBuilder.filterTeleportType
+				// even offers for the current stage. No more source-band precondition - now that
+				// distance is cave-scale-driven rather than severity-gated, there's nothing left for
+				// a "can it teleport away from here" check to gate against. An instant relocation, not
+				// a walked approach - resolves the same tick it starts (falls through to isActionDone's
+				// default -> true, same as every other single-shot engine action), no navigation/moveTo
+				// involved, so (unlike movement.approach_spot) resolveDestinationSpot is used directly
+				// rather than needing a verified Path.
+				String destinationType = step.get("destination").getAsString();
 				Player target = Targeting.nearestPlayer(this.self);
 				if (target == null) {
 					return false;
 				}
-				int stage = TierGates.stageFor(this.self.getSeverityPercent());
-				List<String> allowedSourceBands = TierGates.teleportSourceBands(stage);
-				String actualSourceBand = PositionBands.classify(this.self.distanceTo(target));
-				if (!allowedSourceBands.contains(actualSourceBand)) {
-					debugSay("issue: teleport_to_band needs source band in " + allowedSourceBands + " at stage " + stage
-						+ ", currently '" + actualSourceBand + "' - skipping");
-					return false;
+				CaveScale caveScale = CaveScaleScanner.classify(this.self.level(), target.blockPosition());
+				BlockPos spot = resolveDestinationSpot(destinationType, target, caveScale);
+				// Every teleport destination must be exactly 0 light - the user's own explicit request
+				// - EXCEPT torch, deliberately exempted: the whole point of that destination is landing
+				// right at a live light source, which can never itself read as unlit. The underlying
+				// resolvers resolveDestinationSpot calls are shared with movement.approach_spot (which
+				// only needs MAX_DARK_LIGHT, not exactly 0) - so this is a post-filter scoped to just
+				// this teleport case, not a change to those shared searches themselves.
+				if (spot != null && !"torch".equals(destinationType)
+						&& this.self.level().getMaxLocalRawBrightness(spot) > 0) {
+					spot = null;
 				}
-				String band = step.get("band").getAsString();
-				// The precondition above already confirmed the wendigo is allowed to teleport at all
-				// this stage - from here, a failure to live-resolve the model's OWN chosen band
-				// degrades gracefully instead of just no-op'ing: walk forward through
-				// TierGates.TELEPORT_BAND_PRIORITY (best to worst, the user's own explicit ordering)
-				// starting from wherever the chosen band sits, trying each progressively-worse option
-				// until one resolves. Never walks backward toward a "better" option the model wasn't
-				// even offered at this stage - only ever the same or worse than what was actually
-				// requested.
-				int startIndex = TierGates.TELEPORT_BAND_PRIORITY.indexOf(band);
-				BlockPos spot = null;
-				String resolvedBand = null;
-				for (int i = startIndex; i < TierGates.TELEPORT_BAND_PRIORITY.size(); i++) {
-					String candidateBand = TierGates.TELEPORT_BAND_PRIORITY.get(i);
-					BlockPos candidateSpot = resolveTeleportToBandSpot(candidateBand, target);
-					// Every teleport destination must be exactly 0 light - the user's own explicit
-					// request - EXCEPT torch, deliberately exempted: the whole point of that band is
-					// landing right at a live light source, which can never itself read as 0 light, so
-					// requiring it here would make band=torch permanently unresolvable. The underlying
-					// resolvers this calls (findCeilingSpotAbovePlayer/findNearestUnwatchedDarkSpot/
-					// findLiveBandPosition3D) are shared with non-teleport callers (movement.
-					// approach_band's spot_above/no_players_looking, orbit's own wander/waypoint search)
-					// that still only need MAX_DARK_LIGHT, not 0 - so this is a post-filter scoped to
-					// just this teleport loop rather than a change to those shared searches themselves.
-					if (candidateSpot != null && !"torch".equals(candidateBand)
-							&& this.self.level().getMaxLocalRawBrightness(candidateSpot) > 0) {
-						candidateSpot = null;
-					}
-					if (candidateSpot != null) {
-						spot = candidateSpot;
-						resolvedBand = candidateBand;
-						break;
-					}
+				// Real live-reported bug: "sometimes when he teleports he teleports into the ground,
+				// causing suffocation." Root cause: the radial destination types (behind/unwatched/
+				// in_view/eyeline/ahead) resolve through findRadialDestinationPath, which wraps an
+				// already isAttachable/isPassable-verified candidate in createPath(candidate, 1) and
+				// hands back Path.getTarget() - canReach()/isAcceptableOrbitPath only guarantee the
+				// path's own last node landed WITHIN that 1-block tolerance of the original candidate,
+				// not exactly at it (confirmed via SemanticBands.isAcceptableOrbitPath's own body -
+				// canReach() alone, no exact-position check). movement.approach_spot never had this
+				// problem (a real walked arrival is collision-mediated regardless of any such drift),
+				// but combat.teleport's instant snapTo has no physics step to catch a final position
+				// that drifted onto solid ground. One last direct re-check of the EXACT coordinates
+				// about to be snapped into, right here, independent of whichever resolver produced
+				// them - closes the gap regardless of where in the chain the drift happened.
+				if (spot != null && !DarkSpotScanner.isPassable(this.self.level(), spot)) {
+					spot = null;
 				}
 				if (spot == null) {
-					debugSay("issue: nothing live-resolvable to teleport to at band '" + band
-						+ "' or any worse fallback - skipping teleport_to_band");
+					debugSay("issue: nothing live-resolvable to teleport to at destination '" + destinationType + "' - skipping combat.teleport");
 					return false;
 				}
 				this.self.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.self.getYRot(), 0f);
 				this.self.syncPoseToSpawnPosition();
-				// Real bug, live-reported: "above_player" is the one band here that lands on a CEILING
-				// (see resolveTeleportToBandSpot's own doc comment), but this nudge used to always pass
-				// Direction.UP regardless of resolvedBand - and Direction.UP is nudgeTowardAttachedSurface's
-				// own floor convention (a deliberate no-op there, see its doc comment), so a ceiling
-				// landing here never actually got the corrective push that forces AWCAPI to recognize a
-				// real ceiling collision. Without it, the entity just fell back off the ceiling under
-				// ordinary gravity almost immediately, so nothing was ever really up there long enough for
-				// a later movement.drop to meaningfully detach FROM. Direction.DOWN is
-				// nudgeTowardAttachedSurface's own ceiling convention - every other band here is still an
-				// ordinary floor landing, unaffected.
-				this.self.nudgeTowardAttachedSurface("above_player".equals(resolvedBand) ? Direction.DOWN : Direction.UP);
-				if ("above_player".equals(resolvedBand)) {
+				// "above" is the one destination type here that lands on a CEILING - Direction.DOWN is
+				// nudgeTowardAttachedSurface's own ceiling convention (Direction.UP, its floor
+				// convention, is a deliberate no-op against a ceiling landing - see that method's own
+				// doc comment for the real bug this guards against: without the correct nudge, AWCAPI
+				// never recognizes the ceiling collision and the entity just falls back off under
+				// ordinary gravity almost immediately). Every other destination type here is still an
+				// ordinary floor/wall landing, unaffected.
+				this.self.nudgeTowardAttachedSurface("above".equals(destinationType) ? Direction.DOWN : Direction.UP);
+				if ("above".equals(destinationType)) {
 					// See WendigoEntity.startCeilingSettle's own doc comment - the nudge above alone
 					// wasn't reliably enough for a movement.drop right after this to actually detach.
 					// isDropResolved() is what actually waits on this before calling forceDetach().
 					this.self.startCeilingSettle();
 				}
-				String fallbackNote = resolvedBand.equals(band) ? "" : " (fell back from '" + band + "')";
-				debugSay("teleport_to_band: relocated to " + spot.toShortString() + " (band=" + resolvedBand + ")"
-					+ fallbackNote + " near " + target.getGameProfile().name());
-			}
-			case "combat.teleport_in_view" -> {
-				// Always available as an action type, no runtime source-band precondition (unlike
-				// combat.teleport_to_band - see TierGates.teleportInViewBands' own doc comment for
-				// why). SchemaBuilder.filterTeleportInViewBand offers whichever cumulative set of
-				// bands the current stage has unlocked (see teleportInViewBands), but a failure to
-				// resolve the model's own chosen band live still degrades gracefully - the user's own
-				// explicit "if a spot can't be found at that distance in view then just try outward
-				// from there": walk forward through TierGates.TELEPORT_IN_VIEW_LADDER toward the
-				// farthest end, starting from the model's chosen band, until one resolves.
-				Player target = Targeting.nearestPlayer(this.self);
-				if (target == null) {
-					return false;
-				}
-				String band = step.get("band").getAsString();
-				int startIndex = TierGates.TELEPORT_IN_VIEW_LADDER.indexOf(band);
-				BlockPos spot = null;
-				String resolvedBand = null;
-				for (int i = startIndex; i < TierGates.TELEPORT_IN_VIEW_LADDER.size(); i++) {
-					String candidateBand = TierGates.TELEPORT_IN_VIEW_LADDER.get(i);
-					spot = DarkSpotScanner.findLiveBandPositionInView(this.self.level(), target,
-						PositionBands.distanceMin(candidateBand), PositionBands.distanceMax(candidateBand));
-					if (spot != null) {
-						resolvedBand = candidateBand;
-						break;
-					}
-				}
-				if (spot == null) {
-					debugSay("issue: nothing live-resolvable in-view to teleport to at band '" + band
-						+ "' or any band outward from it - skipping teleport_in_view");
-					return false;
-				}
-				this.self.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.self.getYRot(), 0f);
-				this.self.syncPoseToSpawnPosition();
-				this.self.nudgeTowardAttachedSurface(Direction.UP);
-				String fallbackNote = resolvedBand.equals(band) ? "" : " (fell back from '" + band + "')";
-				debugSay("teleport_in_view: relocated to " + spot.toShortString() + " (band=" + resolvedBand + ")"
-					+ fallbackNote + " near " + target.getGameProfile().name());
-			}
-			case "combat.teleport_to_eyeline" -> {
-				// Same shape as combat.teleport_in_view right above (always available as an action
-				// type, no runtime source-band precondition, same "search outward toward farthest on a
-				// resolve failure" fallback), the only difference being DarkSpotScanner's own tighter
-				// EYELINE_ALIGNMENT_DEGREES threshold - a dark spot genuinely along the player's current
-				// gaze, not merely somewhere broadly in their field of view.
-				Player target = Targeting.nearestPlayer(this.self);
-				if (target == null) {
-					return false;
-				}
-				String band = step.get("band").getAsString();
-				int startIndex = TierGates.TELEPORT_EYELINE_LADDER.indexOf(band);
-				BlockPos spot = null;
-				String resolvedBand = null;
-				for (int i = startIndex; i < TierGates.TELEPORT_EYELINE_LADDER.size(); i++) {
-					String candidateBand = TierGates.TELEPORT_EYELINE_LADDER.get(i);
-					spot = DarkSpotScanner.findLiveBandPositionEyeline(this.self.level(), target,
-						PositionBands.distanceMin(candidateBand), PositionBands.distanceMax(candidateBand));
-					if (spot != null) {
-						resolvedBand = candidateBand;
-						break;
-					}
-				}
-				if (spot == null) {
-					debugSay("issue: nothing live-resolvable inline with eyeline to teleport to at band '" + band
-						+ "' or any band outward from it - skipping teleport_to_eyeline");
-					return false;
-				}
-				this.self.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.self.getYRot(), 0f);
-				this.self.syncPoseToSpawnPosition();
-				this.self.nudgeTowardAttachedSurface(Direction.UP);
-				String fallbackNote = resolvedBand.equals(band) ? "" : " (fell back from '" + band + "')";
-				debugSay("teleport_to_eyeline: relocated to " + spot.toShortString() + " (band=" + resolvedBand + ")"
-					+ fallbackNote + " near " + target.getGameProfile().name());
-			}
-			case "combat.teleport_ahead" -> {
-				// See resolvePredictedPathSpot's own doc comment for the extrapolation itself - this
-				// just handles placement (or the teleport_in_view fallback) once a target spot (or
-				// null) comes back.
-				Player target = Targeting.nearestPlayer(this.self);
-				if (target == null) {
-					return false;
-				}
-				BlockPos spot = resolvePredictedPathSpot(target);
-				if (spot != null) {
-					this.self.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.self.getYRot(), 0f);
-					this.self.syncPoseToSpawnPosition();
-					this.self.nudgeTowardAttachedSurface(Direction.UP);
-					debugSay("teleport_ahead: relocated to " + spot.toShortString()
-						+ " along " + target.getGameProfile().name() + "'s predicted path");
-				} else if (!teleportInViewFallback(target)) {
-					debugSay("issue: couldn't predict a path spot (not moving, or nothing dim nearby it) and "
-						+ "the teleport_in_view fallback also found nothing - skipping teleport_ahead");
-				}
+				debugSay("teleport: relocated to " + spot.toShortString() + " (destination=" + destinationType
+					+ ") near " + target.getGameProfile().name());
 			}
 			case "movement.drop" -> {
 				// The user's own explicit "literally just removes their attachment" request - see
@@ -1678,6 +1694,14 @@ public class PlanRunner {
 				// false) lives there instead.
 			}
 			case "combat.break_torch" -> {
+				// The user's own explicit hardcoded exception, not a schema/TierGates concern - too
+				// hurt to bother with torches anymore once he's dropped to 3/4 health or less,
+				// regardless of what the model's own plan wants. Checked here, not at plan-build time,
+				// since health can drop mid-wave after the plan already committed to this step.
+				if (this.self.getHealth() <= this.self.getMaxHealth() * BREAK_TORCH_MAX_HEALTH_FRACTION) {
+					debugSay("issue: too hurt (<=75% health) to bother breaking torches - skipping break_torch");
+					return false;
+				}
 				// Always the nearest torch to the WENDIGO's own current position - no band-constrained
 				// option anymore (removed per a real reported failure mode: picking "nearest torch
 				// within some band of the PLAYER" could pick one on the far side of the player from
@@ -1706,9 +1730,6 @@ public class PlanRunner {
 				}
 				this.self.setLightTolerantPathing(true);
 				this.chaseUnreachableTicks = 0;
-				// Fresh timer so isChaseResolved's own first repath doesn't fire again immediately
-				// right after this initial moveTo - see chaseRepathTicks' own field comment.
-				this.chaseRepathTicks = rollChaseRepathDelay();
 				// A real chase can run much longer than the default per-action timeout without that
 				// meaning anything's wrong - only the sustained-unreachable check below should end it.
 				this.actionDeadlineTick = this.self.tickCount + CHASE_MAX_TICKS;
@@ -1730,9 +1751,6 @@ public class PlanRunner {
 				}
 				this.self.setLightTolerantPathing(true);
 				this.chaseUnreachableTicks = 0;
-				// See combat.chase's own comment - fresh timer so isChaseUntilLightResolved's first
-				// repath doesn't fire again immediately right after this initial moveTo.
-				this.chaseRepathTicks = rollChaseRepathDelay();
 				this.actionDeadlineTick = this.self.tickCount + CHASE_MAX_TICKS;
 				boolean started = this.self.getNavigation().moveTo(target, LUNGE_CHASE_SPEED_MULTIPLIER);
 				this.self.setNavigationFailed(!started);
@@ -1750,6 +1768,17 @@ public class PlanRunner {
 			}
 			case "posture.stare" -> {
 				boolean enabled = step.get("enabled").getAsBoolean();
+				// The user's own explicit hardcoded exception: no staring at stage 5 once he's down to
+				// half health or less - "signifying he's done playing around," the theatrical
+				// stare-and-wait doesn't fit a desperate final-stage encounter anymore. Only blocks
+				// STARTING a fresh stare - enabled=false (ending one already in progress) always goes
+				// through regardless, same reasoning as combat.break_torch's own health cutoff not
+				// forcibly aborting an already-in-progress approach.
+				if (enabled && stageForSeverityPercent(this.severityPercent) == 5
+						&& this.self.getHealth() <= this.self.getMaxHealth() * STAGE5_STARE_MAX_HEALTH_FRACTION) {
+					debugSay("issue: stage 5 and <=50% health - too far gone to bother staring, skipping posture.stare");
+					return false;
+				}
 				if (enabled && !this.modelIntendedStaring) {
 					// Allow a new success to be counted, see successfulStareCount's own field comment.
 					this.currentStareCounted = false;
@@ -1808,33 +1837,30 @@ public class PlanRunner {
 		return true;
 	}
 
-	// combat.teleport_ahead's own extrapolation - same "is the player actually moving" threshold
-	// PlanPredicates.targetMoving/WaveContext.describePlayerMovement already use (horizontal delta
-	// magnitude, not the vanilla isSprinting() flag alone), duplicated here rather than widened to
-	// package-visible since both of those live in different reasons for staying private (see
-	// WaveContext's own doc comment on this exact duplication tradeoff).
+	// combat.teleport/movement.approach_spot's own "ahead" extrapolation - same "is the player
+	// actually moving" threshold PlanPredicates.targetMoving/WaveContext.describePlayerMovement
+	// already use (horizontal delta magnitude, not the vanilla isSprinting() flag alone), duplicated
+	// here rather than widened to package-visible since both of those live in different reasons for
+	// staying private (see WaveContext's own doc comment on this exact duplication tradeoff).
 	private static final double TELEPORT_AHEAD_MOVING_SPEED_THRESHOLD_SQR = 0.0009; // (~0.03 blocks/tick)^2
 	// How far ahead of the player's current position (along their live horizontal movement direction)
 	// the predicted landing point sits, and how wide a radius around that predicted point
-	// DarkSpotScanner.findDimSpotNear then searches - first pass, tune by feel like every other
-	// distance constant in this file.
+	// DarkSpotScanner.findDimSpotNear then searches - unlike every other destination type, this is
+	// deliberately NOT cave-scale/SemanticBands.actionSearchMinDistance-driven, since it's not a
+	// distance-from-player concept at all - first pass, tune by feel like every other distance
+	// constant in this file.
 	private static final double TELEPORT_AHEAD_LOOKAHEAD_DISTANCE = 20.0;
 	private static final double TELEPORT_AHEAD_SEARCH_RADIUS = 12.0;
 
-	/** combat.teleport_ahead's own path-prediction step - the user's own explicit "guess the player's
-	 * path... a straight-line path in their direction" request (the simpler of the two approaches
-	 * discussed, versus a torch-tracing algorithm left as a possible future upgrade to this same
-	 * method's own logic, not attempted here). Null (no prediction at all, not even an attempt) if the
-	 * player is currently standing still - there's no direction to extrapolate from a zero velocity,
-	 * and guessing one would be pure noise. Otherwise projects TELEPORT_AHEAD_LOOKAHEAD_DISTANCE blocks
-	 * out along their live horizontal movement heading and searches DarkSpotScanner.findDimSpotNear
-	 * around that point - deliberately DIM (light 1-2), not the usual pitch-black requirement, the
-	 * user's own explicit reasoning: a player is more likely to actually be walking near their own
-	 * placed light than through genuine darkness, so biasing toward a dim spot near the prediction
-	 * makes it more likely to land somewhere along their real route. Also null if nothing turns up
-	 * anywhere in that search - startAction's own combat.teleport_ahead case is responsible for the
-	 * teleport_in_view fallback in either null case, not this method. */
-	private BlockPos resolvePredictedPathSpot(Player target) {
+	/** The ahead destination type's own path-prediction step - the user's own explicit "guess the
+	 * player's path... a straight-line path in their direction" request. Null if the player is
+	 * currently standing still - there's no direction to extrapolate from a zero velocity, and
+	 * guessing one would be pure noise. Otherwise projects TELEPORT_AHEAD_LOOKAHEAD_DISTANCE blocks
+	 * out along their live horizontal movement heading - resolveDestinationSpot's own "ahead" case
+	 * then searches DarkSpotScanner.findDimSpotNear around this point (any-surface, same as every
+	 * other non-face-specific destination type), falling back to "in_view" if this comes back null
+	 * (not moving) or the dim search around it turns up nothing. */
+	private BlockPos predictedPathOrigin(Player target) {
 		Vec3 delta = target.getDeltaMovement();
 		double horizontalSpeedSqr = delta.x * delta.x + delta.z * delta.z;
 		if (horizontalSpeedSqr <= TELEPORT_AHEAD_MOVING_SPEED_THRESHOLD_SQR) {
@@ -1843,75 +1869,160 @@ public class PlanRunner {
 		double horizontalSpeed = Math.sqrt(horizontalSpeedSqr);
 		double dirX = delta.x / horizontalSpeed;
 		double dirZ = delta.z / horizontalSpeed;
-		BlockPos predicted = BlockPos.containing(
+		return BlockPos.containing(
 			target.getX() + dirX * TELEPORT_AHEAD_LOOKAHEAD_DISTANCE,
 			target.getY(),
 			target.getZ() + dirZ * TELEPORT_AHEAD_LOOKAHEAD_DISTANCE);
-		return DarkSpotScanner.findDimSpotNear(this.self.level(), predicted, TELEPORT_AHEAD_SEARCH_RADIUS);
 	}
 
-	// Starting point for combat.teleport_ahead's own teleportInViewFallback, walked outward the same
-	// way the real combat.teleport_in_view case walks from whatever band the model itself chose -
-	// "medium" as a reasonable, moderate default since there's no model-authored band to start from
-	// here (this fallback fires automatically, not from the model choosing teleport_in_view directly).
-	private static final String TELEPORT_AHEAD_FALLBACK_BAND = "medium";
-
-	/** combat.teleport_ahead's own fallback once resolvePredictedPathSpot comes back null (not moving,
-	 * or nothing dim nearby the prediction) - an ordinary teleport_in_view placement, same ladder-walk
-	 * shape the real combat.teleport_in_view case uses (DarkSpotScanner.findLiveBandPositionInView,
-	 * TierGates.TELEPORT_IN_VIEW_LADDER), just starting from TELEPORT_AHEAD_FALLBACK_BAND instead of a
-	 * model-chosen one. A small, deliberate duplication of that case's own resolution logic rather than
-	 * refactoring it to share this - lower risk to already-tested, working code than extracting a
-	 * shared helper both paths would depend on. Returns true (and actually places self) if any band on
-	 * the ladder resolves, false if the whole ladder comes up empty too. */
-	private boolean teleportInViewFallback(Player target) {
-		int startIndex = TierGates.TELEPORT_IN_VIEW_LADDER.indexOf(TELEPORT_AHEAD_FALLBACK_BAND);
-		BlockPos spot = null;
-		String resolvedBand = null;
-		for (int i = startIndex; i < TierGates.TELEPORT_IN_VIEW_LADDER.size(); i++) {
-			String candidateBand = TierGates.TELEPORT_IN_VIEW_LADDER.get(i);
-			spot = DarkSpotScanner.findLiveBandPositionInView(this.self.level(), target,
-				PositionBands.distanceMin(candidateBand), PositionBands.distanceMax(candidateBand));
-			if (spot != null) {
-				resolvedBand = candidateBand;
-				break;
+	/** Shared destination resolver for both combat.teleport and movement.approach_spot - see
+	 * SchemaBuilder's own combat_teleport/movement_approach_spot $defs for the full semantics of each
+	 * destination type. "above" (ceiling only) and "torch" (nearest live light source, already
+	 * surface-agnostic) are face-specific, resolved directly with no retry/cave-scale search at all -
+	 * unaffected by cave scale. Every other type - behind/unwatched/in_view/eyeline/ahead - can
+	 * legitimately land on floor, wall, OR ceiling ("behind the player" could just as easily be on
+	 * the ceiling behind them), so each retry samples a freshly-randomized surface normal (same
+	 * technique randomOrbitSurfaceNormal already establishes for orbit positioning) rather than being
+	 * tied to one surface. Every candidate is now real-pathfind-verified (SemanticBands.
+	 * isAcceptableOrbitPath) regardless of cave scale - previously this only happened for CaveScale
+	 * .TIGHT, which let a NORMAL/MASSIVE-cave teleport land geometry-valid but genuinely unreachable
+	 * (the user's own live report: an eyeline teleport resolving "super far out in an unreachable
+	 * cave"). See findRadialDestinationPath's own doc comment for how the search now also prefers
+	 * closer candidates before ever widening out to SemanticBands.actionSearchMaxDistance. Returns
+	 * null if nothing valid turns up within budget. */
+	private BlockPos resolveDestinationSpot(String destinationType, Player target, CaveScale caveScale) {
+		if ("above".equals(destinationType)) {
+			return DarkSpotScanner.findCeilingSpotAbovePlayer(this.self.level(), target.blockPosition());
+		}
+		if ("torch".equals(destinationType)) {
+			List<BlockPos> torches = LightSourceScanner.findLightSources(this.self.level(),
+				target.blockPosition(), TORCH_BREAK_SEARCH_RADIUS, 1);
+			return torches.isEmpty() ? null : torches.get(0);
+		}
+		if ("ahead".equals(destinationType)) {
+			BlockPos predictedOrigin = predictedPathOrigin(target);
+			if (predictedOrigin == null) {
+				return resolveDestinationSpot("in_view", target, caveScale); // not moving - nothing to predict
 			}
+			Path path = resolveAheadCandidatePath(predictedOrigin, caveScale);
+			return path != null ? path.getTarget() : resolveDestinationSpot("in_view", target, caveScale);
 		}
-		if (spot == null) {
-			return false;
-		}
-		this.self.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, this.self.getYRot(), 0f);
-		this.self.syncPoseToSpawnPosition();
-		this.self.nudgeTowardAttachedSurface(Direction.UP);
-		debugSay("teleport_ahead: fell back to teleport_in_view, relocated to " + spot.toShortString()
-			+ " (band=" + resolvedBand + ") near " + target.getGameProfile().name());
-		return true;
+		Path path = findRadialDestinationPath(destinationType, target, caveScale);
+		return path != null ? path.getTarget() : null;
 	}
 
-	/** combat.teleport_to_band's own per-band resolver, factored out of startAction's own switch case
-	 * so the TELEPORT_BAND_PRIORITY fallback cascade there can call it once per candidate band without
-	 * repeating the same dispatch each time. above_player is the ceiling drop-in point
-	 * (DarkSpotScanner.findCeilingSpotAbovePlayer); behind_player and close both resolve identically
-	 * (DarkSpotScanner.findNearestUnwatchedDarkSpot) - the same blind-spot search, just offered at
-	 * different stages/distances; torch is a plain relocation to the nearest torch to the player (same
-	 * nearest-torch lookup nearestTorch()/combat.break_torch's own targeting already uses) - no side
-	 * effect on the torch itself, unlike the old spawn_on_torch this replaces (see its own schema
-	 * description - it doesn't destroy it or force a follow-up, that's left entirely to the model);
-	 * every other band is an ordinary live-resolved floor position (DarkSpotScanner.
-	 * findLiveBandPosition3D, normal=UP - same floor-only convention this action's bands have always
-	 * used). */
-	private BlockPos resolveTeleportToBandSpot(String band, Player target) {
-		return switch (band) {
-			case "above_player" -> DarkSpotScanner.findCeilingSpotAbovePlayer(this.self.level(), target.blockPosition());
-			case "behind_player", "close" -> DarkSpotScanner.findNearestUnwatchedDarkSpot(this.self.level(), target);
-			case "torch" -> {
-				List<BlockPos> torches = LightSourceScanner.findLightSources(this.self.level(),
-					target.blockPosition(), TORCH_BREAK_SEARCH_RADIUS, 1);
-				yield torches.isEmpty() ? null : torches.get(0);
+	// Successively wider distance rings tried before giving up at SemanticBands.actionSearchMaxDistance
+	// - the user's own explicit ask: try other candidates at roughly the same distance before searching
+	// farther out, since a farther candidate is statistically less likely to actually be reachable from
+	// wherever the player currently is. Each ring gets its own full orbitReachRetryAttempts budget
+	// before the search widens to the next one.
+	private static final int ACTION_SEARCH_RING_COUNT = 3;
+
+	/** Shared radial-destination resolver for the behind/unwatched/in_view/eyeline destination types
+	 * (combat.teleport and movement.approach_spot alike): searches in ACTION_SEARCH_RING_COUNT
+	 * successively wider rings from SemanticBands.actionSearchMinDistance out to
+	 * SemanticBands.actionSearchMaxDistance, exhausting a full WendigoTuningConfig
+	 * .orbitReachRetryAttempts budget of freshly-randomized-normal candidates at the CURRENT ring
+	 * (real-pathfind-verified via SemanticBands.isAcceptableOrbitPath) before ever widening to the
+	 * next one - so a genuinely close-but-disconnected candidate doesn't cause the search to jump
+	 * straight out toward the far edge of the whole range, it keeps trying other spots at roughly the
+	 * same distance first. Returns the already-computed, already-verified Path (not just a destination
+	 * BlockPos) so movement.approach_spot can hand it straight to PathNavigation.moveTo(Path, double);
+	 * combat.teleport instead reads Path.getTarget() off the result, since it only needs the
+	 * destination itself, not the path there. */
+	private Path findRadialDestinationPath(String destinationType, Player target, CaveScale caveScale) {
+		double minDistance = SemanticBands.actionSearchMinDistance(caveScale);
+		double hardMaxDistance = SemanticBands.actionSearchMaxDistance();
+		double ringStep = (hardMaxDistance - minDistance) / ACTION_SEARCH_RING_COUNT;
+		for (int ring = 1; ring <= ACTION_SEARCH_RING_COUNT; ring++) {
+			double ringMaxDistance = ring == ACTION_SEARCH_RING_COUNT ? hardMaxDistance : minDistance + ringStep * ring;
+			for (int attempt = 0; attempt < WendigoMod.tuningConfig.orbitReachRetryAttempts; attempt++) {
+				Direction normal = randomOrbitSurfaceNormal();
+				BlockPos candidate = switch (destinationType) {
+					case "behind", "unwatched" -> DarkSpotScanner.findUnwatchedPosition3D(this.self.level(), target, minDistance, ringMaxDistance);
+					case "in_view" -> DarkSpotScanner.findLiveBandPositionInView(this.self.level(), target, minDistance, ringMaxDistance, normal);
+					case "eyeline" -> DarkSpotScanner.findLiveBandPositionEyeline(this.self.level(), target, minDistance, ringMaxDistance, normal);
+					default -> null;
+				};
+				if (candidate == null) {
+					continue;
+				}
+				Path path = this.self.getNavigation().createPath(candidate, 1);
+				if (SemanticBands.isAcceptableOrbitPath(path, caveScale)) {
+					return path;
+				}
 			}
-			default -> DarkSpotScanner.findLiveBandPosition3D(this.self.level(), target.blockPosition(),
-				PositionBands.distanceMin(band), PositionBands.distanceMax(band), Direction.UP);
-		};
+		}
+		return null;
+	}
+
+	/** The ahead destination type's own candidate search (fixed TELEPORT_AHEAD_SEARCH_RADIUS around
+	 * the predicted point, not a min/max band around the player, so it doesn't go through
+	 * findRadialDestinationPath's own ring-expansion) - now always real-pathfind-verified regardless
+	 * of cave scale, same fix as findRadialDestinationPath's own for the same live-reported reason. */
+	private Path resolveAheadCandidatePath(BlockPos predictedOrigin, CaveScale caveScale) {
+		for (int attempt = 0; attempt < WendigoMod.tuningConfig.orbitReachRetryAttempts; attempt++) {
+			Direction normal = randomOrbitSurfaceNormal();
+			BlockPos candidate = DarkSpotScanner.findDimSpotNear(this.self.level(), predictedOrigin, TELEPORT_AHEAD_SEARCH_RADIUS, normal);
+			if (candidate == null) {
+				continue;
+			}
+			Path path = this.self.getNavigation().createPath(candidate, 1);
+			if (SemanticBands.isAcceptableOrbitPath(path, caveScale)) {
+				return path;
+			}
+		}
+		return null;
+	}
+
+	/** movement.approach_spot's own destination resolver - same candidate generation as
+	 * resolveDestinationSpot above (both now real-pathfind-verified regardless of cave scale - see
+	 * findRadialDestinationPath's own doc comment for why that changed). Returns the
+	 * already-computed, already-verified Path directly (not just a destination BlockPos) so the
+	 * caller can hand it straight to PathNavigation.moveTo(Path, double) instead of re-pathing from
+	 * scratch. */
+	private Path resolveDestinationPath(String destinationType, Player target, CaveScale caveScale) {
+		// "above" deliberately does NOT reuse resolveDestinationSpot's own "above" case here - that one
+		// (findCeilingSpotAbovePlayer) enforces a 10-block minimum height, correct for a dramatic
+		// teleport ambush but wrong for a walked approach: the OLD, proven-working
+		// movement.approach_band(spot_above) always used findCeilingVantagePoint instead (confirmed via
+		// git history), a plain straight-up probe with no minimum height at all. Real regression found
+		// live via GameTest: a walked approach into a modest, < 10-block-tall room (an entirely ordinary
+		// cave ceiling height, not a degenerate case) silently found nothing and never moved, while the
+		// same room's combat.teleport(above) sibling test uses a taller room specifically because it
+		// needs findCeilingSpotAbovePlayer's own [10,30] window to have anything to find at all.
+		if ("above".equals(destinationType)) {
+			BlockPos spot = DarkSpotScanner.findCeilingVantagePoint(this.self.level(), target.blockPosition());
+			if (spot == null) {
+				return null;
+			}
+			// Real gap found while widening reachability verification elsewhere in this method: this
+			// branch (and torch's, right below) used to hand back a raw createPath result with no
+			// isAcceptableOrbitPath check at all, contradicting this method's own doc comment promise
+			// that movement.approach_spot ALWAYS verifies reachability regardless of destination type.
+			Path path = this.self.getNavigation().createPath(spot, 1);
+			return SemanticBands.isAcceptableOrbitPath(path, caveScale) ? path : null;
+		}
+		if ("torch".equals(destinationType)) {
+			BlockPos spot = resolveDestinationSpot(destinationType, target, caveScale);
+			if (spot == null) {
+				return null;
+			}
+			Path path = this.self.getNavigation().createPath(spot, 1);
+			return SemanticBands.isAcceptableOrbitPath(path, caveScale) ? path : null;
+		}
+		if ("ahead".equals(destinationType)) {
+			BlockPos predictedOrigin = predictedPathOrigin(target);
+			if (predictedOrigin == null) {
+				return resolveDestinationPath("in_view", target, caveScale); // not moving - nothing to predict
+			}
+			Path path = resolveAheadCandidatePath(predictedOrigin, caveScale);
+			// "ahead" falls back to "in_view" once its own budget is exhausted (nothing dim/reachable
+			// found near the predicted point), same as resolveDestinationSpot's own teleport-side
+			// fallback.
+			return path != null ? path : resolveDestinationPath("in_view", target, caveScale);
+		}
+		return findRadialDestinationPath(destinationType, target, caveScale);
 	}
 
 	/** Whether the in-progress action has reached its completion condition, or timed out. */
@@ -1948,7 +2059,7 @@ public class PlanRunner {
 		} else {
 			resolved = switch (type) {
 				case "movement.approach" -> arrivedNearPlayer() || navigationFinished() || checkStuck();
-				case "movement.approach_band", "movement.retreat_to_dark", "movement.reposition" ->
+				case "movement.approach_spot", "movement.retreat_to_dark" ->
 					navigationFinished() || checkStuck();
 				case "combat.lunge_attack" -> isLungeResolved();
 				case "combat.break_torch" -> isBreakTorchResolved();
@@ -1986,8 +2097,7 @@ public class PlanRunner {
 
 	private static boolean isPlainMovementType(String type) {
 		return switch (type) {
-			case "movement.approach", "movement.approach_band",
-				"movement.retreat_to_dark", "movement.reposition" -> true;
+			case "movement.approach", "movement.approach_spot", "movement.retreat_to_dark" -> true;
 			default -> false;
 		};
 	}
@@ -1995,7 +2105,7 @@ public class PlanRunner {
 	/** Whether a control.while's body contains an approach-type step at all - see whileApproachesRun. */
 	private static boolean whileBodyHasApproach(JsonObject whileStep) {
 		for (var element : whileStep.getAsJsonArray("body")) {
-			if (isApproachType(element.getAsJsonObject().get("type").getAsString())) {
+			if (bodyElementHasApproach(element.getAsJsonObject())) {
 				return true;
 			}
 		}
@@ -2003,7 +2113,37 @@ public class PlanRunner {
 	}
 
 	private static boolean isApproachType(String type) {
-		return type.equals("movement.approach") || type.equals("movement.approach_band");
+		return type.equals("movement.approach") || type.equals("movement.approach_spot");
+	}
+
+	/** Whether this control.while body element is itself an approach-type step, or (the one nesting
+	 * exception - see control_while_body_step in action_schema.json) a control.if with an approach
+	 * type step on either branch. Only one level deep to check - a nested control.if's own then/else
+	 * are always flat action_step lists, never another control.if/control.while. Used to extend the
+	 * "at most one approach step queued per body pass" cap (see whileApproachesRun's own comment)
+	 * to steps hidden behind a branch, conservatively - which branch actually runs isn't known until
+	 * the control.if is reached at queue-poll time, so a body element that COULD run an approach on
+	 * either side counts as one for capping purposes even if the branch actually taken wouldn't. */
+	private static boolean bodyElementHasApproach(JsonObject element) {
+		String type = element.get("type").getAsString();
+		if (isApproachType(type)) {
+			return true;
+		}
+		if (!type.equals("control.if")) {
+			return false;
+		}
+		for (String branchKey : new String[] {"then", "else"}) {
+			JsonElement branchElement = element.get(branchKey);
+			if (branchElement == null || branchElement.isJsonNull()) {
+				continue;
+			}
+			for (var step : branchElement.getAsJsonArray()) {
+				if (isApproachType(step.getAsJsonObject().get("type").getAsString())) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -2087,10 +2227,6 @@ public class PlanRunner {
 	private boolean isLungeResolved() {
 		if (withinMeleeRange()) {
 			Player player = Targeting.nearestPlayer(this.self);
-			if (player != null && isPlayerDefendingWithSpear(player)) {
-				repelWithSpear(player);
-				return true;
-			}
 			if (player != null) {
 				beginForcedRide(player);
 			}
@@ -2137,8 +2273,8 @@ public class PlanRunner {
 	/** movement.drop's own resolution - see startAction's own updated comment on why the real
 	 * forceDetach() call lives here instead of firing unconditionally at action-start. Holds
 	 * (returns false, same as timing.wait) for as long as WendigoEntity.isCeilingSettling() is true -
-	 * only relevant right after a combat.teleport_to_band(band="above_player") landing (see
-	 * WendigoEntity.startCeilingSettle's own doc comment); every other case (a walked spot_above climb,
+	 * only relevant right after a combat.teleport(destination="above") landing (see
+	 * WendigoEntity.startCeilingSettle's own doc comment); every other case (a walked climb to destination=above,
 	 * or movement.drop called with nothing to detach from at all) already has isCeilingSettling()
 	 * reading false, so this resolves on the very same tick it starts, identical to the old
 	 * unconditional behavior. */
@@ -2158,19 +2294,17 @@ public class PlanRunner {
 	 * sustaining a repeated-strike loop the way this used to before the ride mechanic replaced
 	 * damage-on-contact) or gives up once they've been unreachable for CHASE_GIVE_UP_TICKS straight.
 	 *
-	 * <p>Repaths on a plain fixed timer (chaseRepathTicks, rolled via rollChaseRepathDelay) now,
-	 * NOT reactively off isStuck()/navigationFinished() the way this used to - the user's own
-	 * explicit request, after live-diagnosing the actual mechanism: navigationFinished() reads true
-	 * the instant ANY path segment completes, including a perfectly good one, and re-issuing moveTo()
-	 * immediately at that exact moment (rather than on a delay) is what was corrupting this entity's
-	 * own attachment state on ceiling paths specifically - confirmed live via CHASE_REPATH logging
-	 * showing repath spam landing exactly on arrival, matching the observed "a single path node gets
-	 * placed on him and he starts glitching" symptom exactly. internal.orbit's own wander (a
-	 * different, much slower fixed timer - see tickOrbit) and a real vanilla mob's own melee-chase
-	 * (SpiderAttackGoal, a plain MeleeAttackGoal subclass, repaths every 4-10 ticks flat, never
-	 * reactively) both already work this way and neither exhibits this bug at all. isStuck()/
-	 * navigationFinished() are still read below, but only for chaseUnreachableTicks' own give-up
-	 * bookkeeping now - completely decoupled from when a repath actually fires.
+	 * <p>Reactive repathing again - the user's own explicit revert back to "only repath once the
+	 * current path has actually finished, or stuck detection has fired," undoing an earlier same-
+	 * session-line fixed-timer interim (chaseRepathTicks/rollChaseRepathDelay, since deleted) that
+	 * was itself adopted to fix a real live bug: re-issuing moveTo() immediately the instant
+	 * navigationFinished() went true (even for a perfectly good, just-completed path) was corrupting
+	 * this entity's own ceiling attachment state - confirmed live via CHASE_REPATH logging showing
+	 * repath spam landing exactly on arrival, matching an observed "a single path node gets placed on
+	 * him and he starts glitching" symptom. If that same corruption resurfaces after this revert,
+	 * this is the first place to look. isStuck()/navigationFinished() now drive BOTH
+	 * chaseUnreachableTicks' own give-up bookkeeping AND the repath trigger itself again, computed
+	 * once and reused for both rather than queried twice.
 	 */
 	private boolean isChaseResolved() {
 		Player player = Targeting.nearestPlayer(this.self);
@@ -2178,16 +2312,13 @@ public class PlanRunner {
 			return true; // nothing left to chase
 		}
 		if (withinMeleeRange()) {
-			if (isPlayerDefendingWithSpear(player)) {
-				repelWithSpear(player);
-				return true;
-			}
 			beginForcedRide(player);
 			debugSay("chase: caught the player at self=" + this.self.blockPosition().toShortString());
 			return true;
 		}
 		maybeDestroyNearbyTorches();
-		if (this.self.getNavigation().isStuck() || (navigationFinished() && !withinMeleeRange())) {
+		boolean needsRepath = this.self.getNavigation().isStuck() || (navigationFinished() && !withinMeleeRange());
+		if (needsRepath) {
 			this.chaseUnreachableTicks++;
 			dropIfNewlyStuckOnCeiling();
 		} else {
@@ -2198,10 +2329,7 @@ public class PlanRunner {
 			this.self.setNavigationFailed(true);
 			return true;
 		}
-		// Plain fixed-timer repath - resolveChaseDestination/rejectDegeneratePathIfNeeded TEMPORARILY
-		// REMOVED, the user's own explicit request, to isolate results without them.
-		if (--this.chaseRepathTicks <= 0) {
-			this.chaseRepathTicks = rollChaseRepathDelay();
+		if (needsRepath) {
 			logChaseRepath("combat.chase");
 			this.self.getNavigation().moveTo(player, LUNGE_CHASE_SPEED_MULTIPLIER);
 			logPathNodes("combat.chase repath");
@@ -2226,16 +2354,6 @@ public class PlanRunner {
 		}
 	}
 
-	// See chaseRepathTicks' own field comment for the history - was a flat 4 + random(7) (vanilla's
-	// own MeleeAttackGoal cadence), now centered around ~20 ticks per the user's own later request -
-	// see WendigoTuningConfig.chaseRepathMinTicks/MaxTicks, editable at config/wendigo-tuning.json.
-	private int rollChaseRepathDelay() {
-		WendigoTuningConfig tuning = WendigoMod.tuningConfig;
-		int min = tuning.chaseRepathMinTicks;
-		int max = tuning.chaseRepathMaxTicks;
-		return min + this.self.getRandom().nextInt(Math.max(1, max - min + 1));
-	}
-
 	/**
 	 * internal.chase_until_light's resolution - the darkness-overstay ambush's whole point is "get
 	 * out of the dark or get grabbed": checked first, every tick, regardless of distance - the
@@ -2255,18 +2373,15 @@ public class PlanRunner {
 			return true;
 		}
 		if (withinMeleeRange()) {
-			if (isPlayerDefendingWithSpear(player)) {
-				repelWithSpear(player);
-				return true;
-			}
 			beginForcedRide(player);
 			debugSay("internal.chase_until_light: caught the player at self=" + this.self.blockPosition().toShortString());
 			return true;
 		}
-		// See isChaseResolved's own doc comment for the full reasoning - repaths on the same plain
-		// fixed timer now, not reactively, and isStuck()/navigationFinished() are only read here for
-		// chaseUnreachableTicks' own give-up bookkeeping.
-		if (this.self.getNavigation().isStuck() || (navigationFinished() && !withinMeleeRange())) {
+		// See isChaseResolved's own doc comment for the full reasoning - reactive again, repathing
+		// (and driving chaseUnreachableTicks' own give-up bookkeeping) only once the current path has
+		// actually finished or stuck detection has fired, computed once and reused for both.
+		boolean needsRepath = this.self.getNavigation().isStuck() || (navigationFinished() && !withinMeleeRange());
+		if (needsRepath) {
 			this.chaseUnreachableTicks++;
 			dropIfNewlyStuckOnCeiling();
 		} else {
@@ -2277,9 +2392,7 @@ public class PlanRunner {
 			this.self.setNavigationFailed(true);
 			return true;
 		}
-		// See isChaseResolved's own comment on this exact same simplification.
-		if (--this.chaseRepathTicks <= 0) {
-			this.chaseRepathTicks = rollChaseRepathDelay();
+		if (needsRepath) {
 			logChaseRepath("internal.chase_until_light");
 			this.self.getNavigation().moveTo(player, LUNGE_CHASE_SPEED_MULTIPLIER);
 			logPathNodes("internal.chase_until_light repath");
@@ -2294,7 +2407,10 @@ public class PlanRunner {
 	 * kind of wreckage. Throttled so this isn't a full light-source scan every single tick.
 	 * findSnuffableLightSources/snuffByWendigo, not findLightSources/destroyByWendigo - lanterns and
 	 * everything else outside the snuffable scope are left alone, same narrowing performTorchBreak's
-	 * own targeted case uses. */
+	 * own targeted case uses. Stays off for good, same as performTorchBreak's own deliberate snuff -
+	 * the user's own explicit "lights should not come back on after the plan is done" request removed
+	 * the post-wave relight queue this used to feed entirely (see LightSourceScanner.snuffByWendigo's
+	 * own doc comment), so there's nothing left to hand collateral torches off to here either. */
 	private void maybeDestroyNearbyTorches() {
 		if (this.self.tickCount % CHASE_TORCH_SCAN_INTERVAL_TICKS != 0) {
 			return;
@@ -2304,14 +2420,13 @@ public class PlanRunner {
 		}
 		for (BlockPos torch : LightSourceScanner.findSnuffableLightSources(serverLevel, this.self.blockPosition(), CHASE_TORCH_RADIUS, CHASE_TORCH_MAX_PER_SCAN)) {
 			LightSourceScanner.snuffByWendigo(serverLevel, torch, this.self);
-			this.snuffedTorches.add(torch.immutable());
 		}
 	}
 
 	private static boolean isMovementType(String type) {
 		return switch (type) {
-			case "movement.approach", "movement.approach_band",
-				"movement.retreat_to_dark", "movement.reposition", "movement.retreat_with_fallback",
+			case "movement.approach", "movement.approach_spot",
+				"movement.retreat_to_dark", "movement.retreat_with_fallback",
 				"internal.despawn_move", "combat.lunge_attack", "combat.break_torch", "combat.chase",
 				"internal.chase_until_light" -> true;
 			default -> false;
@@ -2530,7 +2645,8 @@ public class PlanRunner {
 		// Centered on every player, offset toward self - see WendigoSounds' own class doc comment. No
 		// player currently resolvable (rare - Targeting.nearestPlayer's own "nothing found" case)
 		// means nobody to play this for at all, so skip rather than calling play() for no reason.
-		if (Targeting.nearestPlayer(this.self) == null) {
+		Player target = Targeting.nearestPlayer(this.self);
+		if (target == null) {
 			return;
 		}
 		WendigoSounds.Type type = switch (cue) {
@@ -2541,6 +2657,7 @@ public class PlanRunner {
 		};
 		WendigoSounds.play(serverLevel, this.self, type);
 		this.soundCueCount++; // hidden goal-progress signal - see the field's own comment
+		recordSoulLightTally(target);
 		debugSay("sound cue played: " + cue);
 	}
 
@@ -2554,9 +2671,11 @@ public class PlanRunner {
 	 * successfulBreatheCount's own field comment) when ANY nearby player is within
 	 * BREATHE_SUCCESS_RADIUS at the moment it plays - the user's own explicit "the wendigo is
 	 * recommended to get as close as possible... before running that noise" framing, checked against
-	 * every nearby player (Targeting.nearbyPlayers), not just whichever one is locked/nearest, same
-	 * multiplayer-aware shape isLookedAtByAnyone already uses for a similar "did ANY player experience
-	 * this" question. */
+	 * every nearby player (Targeting.nearbyPlayers), not just whichever one is locked/nearest -
+	 * deliberately still multiplayer-global ("did ANY player experience this"), unlike stare
+	 * DETECTION (PlanPredicates.isLookedAtByTarget, now target-only - see its own doc comment); this
+	 * is closer in kind to approach detection (hasApproachedByAnyone), an atmosphere/opportunity
+	 * signal rather than a "was I personally spotted" one. */
 	private void playBreathe() {
 		if (!(this.self.level() instanceof ServerLevel serverLevel)) {
 			return;
@@ -2571,6 +2690,7 @@ public class PlanRunner {
 		}
 		if (successful) {
 			this.successfulBreatheCount++;
+			recordSoulLightTally(Targeting.nearestPlayer(this.self));
 		}
 		debugSay("breathe played - successful=" + successful);
 	}
@@ -2651,6 +2771,84 @@ public class PlanRunner {
 		return ORBIT_SURFACE_NORMALS[this.self.getRandom().nextInt(ORBIT_SURFACE_NORMALS.length)];
 	}
 
+	/** Bounded-retry candidate-and-verify loop shared by tickOrbit's in-band wander and out-of-band
+	 * waypoint branches - the user's own explicit "if he can't reach the player in a spot he
+	 * spawns/teleports to, try again" request, applied to the one orbit-position search that
+	 * previously had NO reachability check or retry of any kind (findLiveBandPosition3D's own doc
+	 * comment admits it's "deliberately NOT flood-verified reachable"). Samples a fresh
+	 * findLiveBandPosition3D candidate (fresh randomOrbitSurfaceNormal() each attempt, same as
+	 * before) and computes a REAL path to it from the entity's own current, actual position - no
+	 * snap/teleport, since the entity is walking there, not blinking there (unlike WendigoManager's
+	 * teleport-relocate callers). Returns the already-computed Path itself, not just a destination
+	 * BlockPos, so the caller can hand it straight to PathNavigation.moveTo(Path, double) instead of
+	 * re-pathing from scratch via the (x,y,z,speed) overload (that overload's own body is just
+	 * createPath(x,y,z,1) then moveTo(path,speed) - reusing our own already-computed path skips the
+	 * redundant createPath entirely). Bounded by WendigoTuningConfig.orbitReachRetryAttempts, the same
+	 * shared budget every orbit-position search in this codebase now uses. Returns null if every
+	 * attempt fails verification - callers fall back to their own existing unverified behavior, same
+	 * "some darkness beats none" last resort as before, just no longer the first thing tried. */
+	private Path findReachableOrbitPath(double minDistance, double maxDistance, BlockPos targetPos, CaveScale caveScale) {
+		for (int attempt = 0; attempt < WendigoMod.tuningConfig.orbitReachRetryAttempts; attempt++) {
+			BlockPos candidate = DarkSpotScanner.findLiveBandPosition3D(this.self.level(), targetPos,
+				minDistance, maxDistance, randomOrbitSurfaceNormal());
+			if (candidate == null) {
+				continue;
+			}
+			// distance=1, NOT 0 - confirmed via decompile that createPath(BlockPos, int) resolves
+			// through materially different internal search parameters than createPath(Entity, int)
+			// (WendigoManager.pathToTarget's own entity-target convention, distance=0 there) - a raw
+			// BlockPos target needs distance=1 to reliably resolve canReach()=true for legitimately
+			// close candidates, confirmed live via a GameTest that started failing on a trivial
+			// same-room candidate with distance=0. This also happens to be the exact distance value
+			// the old moveTo(x,y,z,speed) already used internally (it resolves through this same
+			// BlockPos overload) - so reusing this Path via moveTo(Path, double) is a genuine zero
+			// behavior change in arrival tolerance, not the "minor tightening" distance=0 would have
+			// been.
+			Path path = this.self.getNavigation().createPath(candidate, 1);
+			if (SemanticBands.isAcceptableOrbitPath(path, caveScale)) {
+				return path;
+			}
+		}
+		return null;
+	}
+
+	// How far past the entity's own current position the "run directly away" waypoint gets placed
+	// each recheck - just needs to be far enough that a fresh moveTo call actually commits to real
+	// distance each time rather than fizzling out almost immediately once reached, not tied to any
+	// particular cave-scale band the way ordinary orbit distance is (this doesn't care about bands).
+	private static final double FLEE_WHILE_GLOWING_STEP_DISTANCE = 12.0;
+
+	/** Straight-line "get away from whoever's closest" movement while genuinely glowing - see
+	 * tickOrbit's own doc comment for why this fires. Re-evaluates on the same ORBIT_RECHECK_INTERVAL_
+	 * TICKS cadence ordinary orbit rechecks use (reusing orbitRecheckTicks itself - the two states are
+	 * mutually exclusive within a single tick, tickOrbit only ever calls one or the other, so sharing
+	 * the counter is safe and avoids a redundant field). Deliberately doesn't verify darkness/
+	 * reachability/pathfind-acceptability the way ordinary orbit waypoints do - the point is raw
+	 * distance from the target as fast as possible, not a considered destination; PathNavigation
+	 * .moveTo's own normal unreachable-target handling (silently finds nothing, tries again next
+	 * recheck) is all the robustness this needs. LUNGE_CHASE_SPEED_MULTIPLIER (SemanticBands' fastest
+	 * tier, "fast") - the user's own explicit "at the max speed." */
+	private void tickFleeWhileGlowing(Player target) {
+		this.orbitRecheckTicks++;
+		if (this.orbitRecheckTicks < ORBIT_RECHECK_INTERVAL_TICKS) {
+			return;
+		}
+		this.orbitRecheckTicks = 0;
+		Vec3 selfPos = this.self.position();
+		Vec3 away = selfPos.subtract(target.position());
+		if (away.lengthSqr() < 1.0E-4) {
+			// Degenerate case (standing right on top of the target) - direction is meaningless, pick
+			// an arbitrary horizontal one rather than leaving them stuck with nowhere to flee toward.
+			double angle = this.self.getRandom().nextDouble() * 2.0 * Math.PI;
+			away = new Vec3(Math.cos(angle), 0.0, Math.sin(angle));
+		}
+		Vec3 destination = selfPos.add(away.normalize().scale(FLEE_WHILE_GLOWING_STEP_DISTANCE));
+		this.self.setLightTolerantPathing(false);
+		boolean started = this.self.getNavigation().moveTo(destination.x, destination.y, destination.z,
+			LUNGE_CHASE_SPEED_MULTIPLIER);
+		debugMoveTo("flee-while-glowing", started);
+	}
+
 	/** The internal.orbit primitive's own per-tick logic - see startOrbit for entry and
 	 * isOrbiting/isOrbitTargetLost/isOrbitTrapped for what WendigoManager polls. Re-evaluates roughly
 	 * every ORBIT_RECHECK_INTERVAL_TICKS (not every tick - this doesn't need to be as responsive as
@@ -2672,6 +2870,21 @@ public class PlanRunner {
 		Player target = Targeting.nearestPlayer(this.self);
 		if (target == null) {
 			this.orbitTargetLost = true;
+			return;
+		}
+		// The user's own explicit follow-up: while genuinely glowing (a real landed spectral hit -
+		// isCurrentlyGlowing() only ever reflects setGlowingTag, never the debug-only rig glow, which
+		// lives entirely in WendigoVisual and never touches this flag - so this is already naturally
+		// excluded, no separate check needed) he should keep running directly away from whoever's
+		// closest instead of settling into (or re-entering) the normal orbit band at all - "he does
+		// not care about orbit distance after just getting shot," so a player who trapped him inside
+		// orbit range can't just keep shooting him in place. Checked here, at the very top of every
+		// orbit tick, rather than only at the moment orbiting starts - WendigoManager's own post-wave
+		// routing (startOrbit/startReturnToOrbit) doesn't know or care about glow state, so this is
+		// what actually intercepts it regardless of which path led back into "orbiting=true." Falls
+		// through to the real orbit logic below the instant glow ends on its own (updateGlow).
+		if (this.self.isCurrentlyGlowing()) {
+			tickFleeWhileGlowing(target);
 			return;
 		}
 		if (this.self.getNavigation().isInProgress()) {
@@ -2710,12 +2923,17 @@ public class PlanRunner {
 				// comment: the flood only ever searches for the SAME normal at every step, so a
 				// ceiling/wall pick from a floor-standing entity routinely failed to even find a seed
 				// column, systematically under-representing anything but the floor despite
-				// randomOrbitSurfaceNormal() already intending an equal shot at all 6 directions.
-				BlockPos wanderTarget = DarkSpotScanner.findLiveBandPosition3D(this.self.level(), targetPos,
-					minDistance, maxDistance, randomOrbitSurfaceNormal());
-				if (wanderTarget != null) {
-					this.self.getNavigation().moveTo(wanderTarget.getX() + 0.5, wanderTarget.getY(), wanderTarget.getZ() + 0.5,
-						ORBIT_IN_BAND_SPEED_MULTIPLIER);
+				// randomOrbitSurfaceNormal() already intending an equal shot at all 6 directions. Now
+				// real-pathfind-verified (see findReachableOrbitPath) rather than accepted on geometry
+				// alone.
+				Path wanderPath = findReachableOrbitPath(minDistance, maxDistance, targetPos, caveScale);
+				if (wanderPath != null) {
+					// moveTo(Path, double) returns boolean (confirmed via decompile) - orbit doesn't lean on
+					// setNavigationFailed at all (isInProgress()/updateOrbitStuckTracking above already covers
+					// "did this actually go anywhere," including a moveTo that never started), so capturing
+					// this is purely for debug visibility, not a behavior fix like the approach_spot one was.
+					boolean wanderStarted = this.self.getNavigation().moveTo(wanderPath, ORBIT_IN_BAND_SPEED_MULTIPLIER);
+					debugMoveTo("orbit.wander", wanderStarted);
 					return;
 				}
 			}
@@ -2742,13 +2960,17 @@ public class PlanRunner {
 			return;
 		}
 		this.self.setLightTolerantPathing(false);
-		BlockPos waypoint = DarkSpotScanner.findLiveBandPosition3D(this.self.level(), targetPos,
-			minDistance, maxDistance, randomOrbitSurfaceNormal());
-		if (waypoint == null) {
-			// Nothing in-band within the sampled shell - fall back to simply heading somewhere dark
-			// and away from the target rather than standing still with no destination at all.
-			waypoint = DarkSpotScanner.findDarkestAwayFrom(this.self.level(), selfPos, maxDistance, targetPos);
+		Path waypointPath = findReachableOrbitPath(minDistance, maxDistance, targetPos, caveScale);
+		if (waypointPath != null) {
+			// Same debug-visibility-only capture as the in-band wander branch above - see its comment.
+			boolean waypointStarted = this.self.getNavigation().moveTo(waypointPath, orbitSpeedMultiplier(distance, minDistance, maxDistance));
+			debugMoveTo("orbit.waypoint", waypointStarted);
+			return;
 		}
+		// Nothing in-band/reachable within the retry budget - unverified last resort, same philosophy
+		// as WendigoManager's own fallbacks: head somewhere dark and away from the target rather than
+		// standing still with no destination at all.
+		BlockPos waypoint = DarkSpotScanner.findDarkestAwayFrom(this.self.level(), selfPos, maxDistance, targetPos);
 		if (waypoint != null) {
 			this.self.getNavigation().moveTo(waypoint.getX() + 0.5, waypoint.getY(), waypoint.getZ() + 0.5,
 				orbitSpeedMultiplier(distance, minDistance, maxDistance));
@@ -2831,6 +3053,18 @@ public class PlanRunner {
 		return player == null || this.self.distanceTo(player) > STARING_DISENGAGED_DISTANCE;
 	}
 
+	/** Hardcoded (not model-authored) stare-interrupt safety valve - the user's own explicit "a
+	 * hardcoded stare rule that moves on with the plan if ANY player in the group starts approaching
+	 * him at medium approach scale" request. "Any player" deliberately, unlike PlanPredicates.
+	 * isLookedAtByTarget's own target-only look-detection (see that method's own doc comment) - a
+	 * DIFFERENT group member closing in on the wendigo mid-stare is still a real approaching threat/
+	 * opportunity worth reacting to, even if they're not who the encounter is officially "for."
+	 * Reuses whileBaselineDistance (NaN with no active control.while, which hasApproachedByAnyone
+	 * already treats as "nothing covered yet" - false, a safe no-op outside a while loop). */
+	private boolean isAnyPlayerApproachingDuringStare() {
+		return PlanPredicates.hasApproachedByAnyone(this.self, "medium", this.whileBaselineDistance);
+	}
+
 	/** Linearly interpolates LUNGE_SAFE_LIGHT_RADIUS_MIN (at combat.lunge_attack's own TierGates
 	 * unlock threshold) up to LUNGE_SAFE_LIGHT_RADIUS_MAX (at 100% severity) - the wendigo is allowed
 	 * to commit to a lunge further from real darkness the more established this player's relationship
@@ -2849,8 +3083,48 @@ public class PlanRunner {
 	// makes it that much harder to shake off once caught. See WendigoTuningConfig.rideEscapeAttemptsMin/
 	// Max, editable at config/wendigo-tuning.json.
 	// Dealt once, only if the wave concludes (a real despawn, not a forced/backstop wave-end) while
-	// still forcing the ride - see completeWave.
-	private static final float FORCED_RIDE_DESPAWN_DAMAGE = 40.0F;
+	// still forcing the ride - see completeWave/resolveRiderOnEnd. The user's own real, live-tested
+	// values - "/damage @s <amount> minecraft:mob_attack" (the exact same damage source this hit
+	// itself uses, no weapon item, so no enchant-effectiveness wrinkle either) against a player
+	// wearing each tier bare, from full health - replacing an earlier hand-derived-from-CombatRules
+	// approximation (this codebase's own simplified re-implementation of the real formula landed
+	// close but not exact; these are the real tested numbers, not computed ones). Stage 1 isn't
+	// separately specified by the user - reuses stage 2's leather value, since there's no armor tier
+	// weaker than leather to reach for instead. Unclamped now (a real kill is allowed at every stage,
+	// not just stage 5 - the user's own explicit "let the wendigo finish the player off at other
+	// [stages] too" reversal of an earlier restriction - see despawnDamageForCurrentStage).
+	// Index 0 unused (stages are 1-5) - mirrors WendigoProgressionTracker.STAGE_PERCENTS' own
+	// same-shape 0-padded array for the same reason (stage numbers read naturally as array indices).
+	private static final float[] STAGE_DESPAWN_RAW_DAMAGE = {
+		0.0F,
+		22.0F, // stage 1 (see above) - leather
+		22.0F, // stage 2 - leather
+		22.0F, // stage 3 - copper
+		24.0F, // stage 4 - iron
+		36.0F, // stage 5 - diamond
+	};
+
+	/** Same stage bucketing STAGE1_MAX_PERCENT already establishes for stage 1 (severityPercent < 20),
+	 * extended symmetrically across the rest of WendigoProgressionTracker.STAGE_PERCENTS' own fixed
+	 * per-stage values (10/30/50/70/90) - every real wave's severityPercent is always exactly one of
+	 * those five (see rideFairChanceTicks's own comment on STAGE1_PERCENT/STAGE5_PERCENT), so bucket
+	 * boundaries at the midpoints (20/40/60/80) unambiguously recover the stage a wave belongs to. */
+	private static int stageForSeverityPercent(int severityPercent) {
+		if (severityPercent < 20) {
+			return 1;
+		}
+		if (severityPercent < 40) {
+			return 2;
+		}
+		if (severityPercent < 60) {
+			return 3;
+		}
+		if (severityPercent < 80) {
+			return 4;
+		}
+		return 5;
+	}
+
 	private static final String RIDE_ESCAPE_HINT = "Spam SHIFT to break free!";
 	// How long the ride has to have actually run (see rideTicks) before completeWave/resolveRiderOnEnd
 	// is allowed to deal the despawn damage - see their own comments for the real bug this originally
@@ -2884,6 +3158,9 @@ public class PlanRunner {
 	}
 
 	private boolean forcingRide;
+	// See isFleeingFromSpectralHit's own doc comment - set by forceFleeToOrbit, cleared by
+	// completeWave once the forced flee genuinely finishes.
+	private boolean fleeingFromSpectralHit;
 	private int rideEscapeAttempts;
 	private int rideEscapeThreshold;
 	// Set once per grab from rideFairChanceTicks(severityPercent) (see beginForcedRide) -
@@ -2905,17 +3182,6 @@ public class PlanRunner {
 	// or the release would be undone the very next tick, forever. Consumed (read and cleared) via
 	// consumeRideJustEnded rather than polled, so a tick where nobody checks it can't lose it.
 	private boolean rideJustEnded;
-	// Same shape as rideJustEnded/consumeRideJustEnded, for the same reason: checkUnconditionalGrab
-	// calls forceGrabNow every single tick a target is within grab_distance, with no plan-state
-	// protection of its own (it bypasses the whole plan system on purpose - see forceGrabNow's own
-	// doc comment). A successful grab already re-arms checkUnconditionalGrab's grace/cooldown via
-	// rideJustEnded once it ends, but a spear repel never starts a ride at all - nothing stopped the
-	// very next tick from re-evaluating isPlayerDefendingWithSpear (still true - the player hasn't
-	// necessarily moved, stopped charging, or looked away in a single tick) and repelling again,
-	// which is exactly the reported "spear sound spammed on some hits" bug: a player holding a
-	// charged spear aimed at the wendigo while standing inside grab_distance got repelled fresh every
-	// tick for as long as they kept holding it. Consumed the same way rideJustEnded is.
-	private boolean spearRepelJustHappened;
 	// Who's actually being carried - getFirstPassenger() goes empty the instant they dismount, so a
 	// separate reference is needed to know who to force back on.
 	private Player ridingPlayer;
@@ -2956,6 +3222,75 @@ public class PlanRunner {
 		return this.forcingRide;
 	}
 
+	/** True from the instant a landed spectral hit starts a forced flee (forceFleeToOrbit) until that
+	 * flee genuinely finishes (completeWave, whichever way it resolves - a real despawn-point
+	 * arrival or an exhausted fallback chain). The user's own explicit follow-up: fleeing from a hit
+	 * must not be interruptible by a hardcoded override (WendigoManager.overrideIntoChaseUntilLight/
+	 * overrideIntoLunge/checkUnconditionalGrab all check this before firing) - he needs to actually
+	 * finish fleeing before anything else can start running on him again. */
+	public boolean isFleeingFromSpectralHit() {
+		return this.fleeingFromSpectralHit;
+	}
+
+	/** A landed spectral arrow hit (see WendigoEntity.hurtServer) immediately abandons whatever this
+	 * wave was doing and flees back into darkness/orbit - the user's own explicit follow-up request,
+	 * the same shape the old, now-removed spear-defense repel used to trigger. Deliberately doesn't
+	 * inject a new hardcoded plan the way startOverride does - just empties the current one entirely
+	 * (an already-exhausted plan, same as a normal completion), so the very next tick's advance()
+	 * falls straight into the same hasDespawnWork()/farthest-band flee every other plan exhaustion
+	 * already uses, instead of a second, separate flee implementation.
+	 * <p>
+	 * Also clears currentAction, not just topLevelSteps/actionQueue - a real bug in the first version
+	 * of this method, confirmed live: tick()'s own "if (this.currentAction != null) { if
+	 * (!isActionDone()) return; ...}" gate runs BEFORE advance() ever gets a chance to notice the
+	 * emptied plan, so a hit landing mid-action (mid-chase, most commonly - exactly when a player
+	 * would realistically be shooting him) left the STALE currentAction in place, silently blocking
+	 * tick() from ever reaching advance() until that old action happened to resolve on its own,
+	 * however long that took - "doesn't flee at all" from the outside, even though the plan really
+	 * had been emptied. Clearing it here (mirroring exactly how preemptWithAction/the chase-give-up
+	 * abandon branch above both already interrupt an in-progress action immediately, not just let it
+	 * finish) makes the very next tick's advance() actually run.
+	 * <p>
+	 * Also resets despawnAttemptCount/despawnSucceeded, not just despawnEnabled - a second real bug
+	 * confirmed live alongside the currentAction one above: if the wendigo was hit while ORBITING
+	 * (arguably the single most common time to actually get shot - nothing stops a player from
+	 * shooting on sight before he's even properly engaged), these carry over STALE from whatever the
+	 * last completed wave left them at, since only startInternal (an ordinary start/startOverride)
+	 * ever resets them - startOrbit itself doesn't touch them at all. An already-exhausted stale
+	 * despawnAttemptCount made advance()'s very first call after the plan was emptied fall straight
+	 * into hasDespawnWork()==false and complete the wave immediately, with zero actual flee motion -
+	 * a real flee needs the SAME fresh full attempt budget an ordinary start()/startOverride() gets,
+	 * not whatever was left over from an unrelated earlier wave.
+	 * <p>
+	 * No-ops while actively carrying a rider (isForcingRide()) - a mid-carry ride resolves through
+	 * its own separate mechanism entirely (see beginForcedRide/resolveRiderOnEnd), not ordinary plan
+	 * execution, and clearing plan state out from under it would be interrupting the wrong thing. */
+	public void forceFleeToOrbit() {
+		if (this.forcingRide) {
+			return;
+		}
+		this.fleeingFromSpectralHit = true;
+		this.orbiting = false;
+		this.returningToOrbit = false;
+		this.carryingAway = false;
+		this.currentAction = null;
+		this.topLevelSteps = new JsonArray();
+		this.topIndex = 0;
+		this.actionQueue.clear();
+		this.activeWhile = null;
+		this.despawnEnabled = true;
+		this.despawnAttemptCount = 0;
+		this.despawnSucceeded = false;
+		this.currentDespawnTarget = null;
+		this.self.getNavigation().stop();
+		this.self.setNavigationFailed(false);
+		if (this.self.level() instanceof ServerLevel serverLevel) {
+			// Centered on every player, offset toward self - see WendigoSounds' own class doc comment.
+			// Same cue every other flee trigger in this codebase pairs with a retreat.
+			WendigoSounds.play(serverLevel, this.self, WendigoSounds.Type.FLEE);
+		}
+	}
+
 	/** Reads and clears rideJustEnded in one step - see its own field comment. WendigoManager calls
 	 * this once per tick from checkUnconditionalGrab to know whether a grace period (no re-grab
 	 * until the target has put actual distance between themselves and the wendigo) needs to start. */
@@ -2965,148 +3300,6 @@ public class PlanRunner {
 		return result;
 	}
 
-	/** Reads and clears spearRepelJustHappened in one step - see its own field comment.
-	 * WendigoManager calls this right after every forceGrabNow, the same way it already checks
-	 * consumeRideJustEnded after a real grab, to arm the same re-grab grace/cooldown after a repel. */
-	public boolean consumeSpearRepelJustHappened() {
-		boolean result = this.spearRepelJustHappened;
-		this.spearRepelJustHappened = false;
-		return result;
-	}
-
-	/** Reads and clears snuffedTorches in one step - see its own field comment. WendigoManager calls
-	 * this once, right when a wave ends (win, forced-end, or debug-forced alike - a debug/showcase
-	 * wave's own torch wreckage still deserves the same relight, unlike encounter-history recording,
-	 * which deliberately skips those), to hand off exactly the torches THIS wave snuffed into its own
-	 * post-wave relight queue. */
-	public List<BlockPos> consumeSnuffedTorches() {
-		List<BlockPos> result = List.copyOf(this.snuffedTorches);
-		this.snuffedTorches.clear();
-		return result;
-	}
-
-	// The user's own explicit request: a worse spear should also deal less damage on a successful
-	// repel, netherite the most - "wooden does 1, then figure out the rest." Same worst-to-best tier
-	// order as SPEAR_DEFENSE_ANGLE_DEGREES right below, evenly stepped by 1 per tier (1 through 7) -
-	// the simplest possible reading of "wooden does the least (1), netherite does the most": each
-	// tier's own damage IS its rank. Lands iron (the old flat value every tier used to deal
-	// regardless of material) at exactly 5, the same number this used to be for everyone - a
-	// convenient, meaningful anchor point, not a coincidence being relied on for correctness.
-	private static final Map<Item, Float> SPEAR_REPEL_DAMAGE;
-	static {
-		Map<Item, Float> damage = new LinkedHashMap<>();
-		damage.put(Items.WOODEN_SPEAR, 1.0F);
-		damage.put(Items.STONE_SPEAR, 2.0F);
-		damage.put(Items.COPPER_SPEAR, 3.0F);
-		damage.put(Items.GOLDEN_SPEAR, 4.0F);
-		damage.put(Items.IRON_SPEAR, 5.0F);
-		damage.put(Items.DIAMOND_SPEAR, 6.0F);
-		damage.put(Items.NETHERITE_SPEAR, 7.0F);
-		SPEAR_REPEL_DAMAGE = Map.copyOf(damage);
-	}
-	// Fallback for any #minecraft:spears member not in the explicit tier table above - the OLD flat
-	// value every tier used to deal, same "land in the middle, not a surprise extreme" reasoning
-	// SPEAR_DEFENSE_ANGLE_DEGREES_DEFAULT's own comment gives for defaulting to its own permissive
-	// end instead - this one just doesn't have as obvious a "safe" direction to default toward, so it
-	// defaults to the previous known-fine value instead.
-	private static final float SPEAR_REPEL_DAMAGE_DEFAULT = 5.0F;
-
-	/** See SPEAR_REPEL_DAMAGE's own comment. */
-	private static float spearRepelDamage(ItemStack spearStack) {
-		return SPEAR_REPEL_DAMAGE.getOrDefault(spearStack.getItem(), SPEAR_REPEL_DAMAGE_DEFAULT);
-	}
-
-	// The user's own explicit request: a worse spear should demand a much tighter, more accurate aim
-	// to land the defense, a netherite spear about as forgiving as the plain "in_view" band already
-	// was (30 degrees - see SemanticBands.lookAngleDegrees). Ordered worst-to-best by the same rough
-	// material-value progression the rest of vanilla's tiered gear follows, evenly stepped between a
-	// deliberately tight 6-degree floor for wood (genuinely "dead-on," tighter than even the
-	// dead_stare band's own 14 degrees, matching the user's own "super accurate" framing) and the
-	// unchanged 30-degree netherite ceiling - a LinkedHashMap so tier order is meaningful/inspectable,
-	// not just an implementation detail. First-pass values, tune by feel like every other constant in
-	// this file.
-	private static final Map<Item, Float> SPEAR_DEFENSE_ANGLE_DEGREES;
-	static {
-		Map<Item, Float> angles = new LinkedHashMap<>();
-		angles.put(Items.WOODEN_SPEAR, 6.0F);
-		angles.put(Items.STONE_SPEAR, 10.0F);
-		angles.put(Items.COPPER_SPEAR, 14.0F);
-		angles.put(Items.GOLDEN_SPEAR, 18.0F);
-		angles.put(Items.IRON_SPEAR, 22.0F);
-		angles.put(Items.DIAMOND_SPEAR, 26.0F);
-		angles.put(Items.NETHERITE_SPEAR, 30.0F);
-		SPEAR_DEFENSE_ANGLE_DEGREES = Map.copyOf(angles);
-	}
-	// Fallback for any #minecraft:spears member not in the explicit tier table above (a datapack/mod
-	// addition this engine doesn't know the material tier of) - the current netherite-equivalent
-	// value, the most permissive rather than the most punishing, so an unrecognized spear defaults to
-	// at least as forgiving as what every spear used to get, not an unwinnable surprise-tight window.
-	private static final float SPEAR_DEFENSE_ANGLE_DEGREES_DEFAULT = 30.0F;
-
-	/** See SPEAR_DEFENSE_ANGLE_DEGREES's own comment. */
-	private static float spearDefenseAngleDegrees(ItemStack spearStack) {
-		return SPEAR_DEFENSE_ANGLE_DEGREES.getOrDefault(spearStack.getItem(), SPEAR_DEFENSE_ANGLE_DEGREES_DEFAULT);
-	}
-
-	/** True if this player is actively readying a defensive spear thrust toward the wendigo right
-	 * now - wielding any tier of vanilla spear (#minecraft:spears - wooden through netherite, all
-	 * built off the same generic Item.Properties.spear(...)/PIERCING_WEAPON data-component config,
-	 * confirmed via bytecode rather than assumed: there's no dedicated SpearItem subclass) and
-	 * currently "using" it (Item.use()'s own charge-hold state - verified it calls the same
-	 * Player.startUsingItem(hand) every other charge/block/draw item uses, so isUsingItem()/
-	 * getUseItem() is the right generic check here too, not something spear-specific), while facing
-	 * the wendigo within that specific spear's own accuracy margin (see spearDefenseAngleDegrees) -
-	 * no longer a single shared "in_view" band for every tier, the user's own explicit "worse spear
-	 * needs tighter aim" request. */
-	private boolean isPlayerDefendingWithSpear(Player player) {
-		if (!player.isUsingItem()) {
-			return false;
-		}
-		ItemStack spearStack = player.getUseItem();
-		return spearStack.is(ItemTags.SPEARS)
-			&& PlanPredicates.isLookingAtSelfWithinAngle(player, this.self, spearDefenseAngleDegrees(spearStack));
-	}
-
-	/** A correctly-timed spear defense: instead of landing the grab, the wendigo takes a hit and
-	 * flees. Deliberately self-contained rather than relying on isChaseType/navigationFailed's
-	 * existing "chase gave up" abandon-the-plan handling (that only covers combat.chase/
-	 * internal.chase_until_light, not combat.lunge_attack, and forceGrabNow's own call site can fire
-	 * straight out of orbit with no active plan at all to abandon) - swaps in a fresh, already-
-	 * exhausted plan regardless of what was running before, so the very next tick's advance() falls
-	 * straight into the same hasDespawnWork()/farthest-band flee every other plan exhaustion already
-	 * uses. Deliberately does NOT touch currentAction - 3 of the 4 call sites run from inside
-	 * isActionDone(), and tick() still needs to read the ORIGINAL currentAction right after that
-	 * returns (see startCarryFlee's own comment for the exact same pitfall) - forceGrabNow's call
-	 * site (the one case not already inside that frame) clears it itself instead. */
-	private void repelWithSpear(Player player) {
-		this.spearRepelJustHappened = true;
-		if (player instanceof ServerPlayer serverPlayer) {
-			WendigoAdvancements.grant(serverPlayer, WendigoAdvancements.SPEAR_REPEL);
-		}
-		if (this.self.level() instanceof ServerLevel serverLevel) {
-			float damage = spearRepelDamage(player.getUseItem());
-			this.self.hurtServer(serverLevel, this.self.damageSources().playerAttack(player), damage);
-			// The generic hurt sound (WendigoEntity.playHurtSound) already fires automatically as part
-			// of hurtServer - this is the extra, spear-specific "you actually landed the defense" cue
-			// on top of it, played directly (not through WendigoSounds' own queue/throttle - this is a
-			// direct combat-feedback hit sound, not an atmosphere cue, so it shouldn't compete with or
-			// get delayed by whatever cues are already queued).
-			serverLevel.playSound(null, this.self.getX(), this.self.getY(), this.self.getZ(),
-				SoundEvents.SPEAR_HIT, SoundSource.HOSTILE, 1.0F, 1.0F);
-			// Centered on every player, offset toward self - see WendigoSounds' own class doc comment.
-			WendigoSounds.play(serverLevel, this.self, WendigoSounds.Type.FLEE);
-		}
-		debugSay("speared while charging in - fleeing instead of grabbing");
-		this.orbiting = false;
-		this.returningToOrbit = false;
-		this.carryingAway = false;
-		this.topLevelSteps = new JsonArray();
-		this.topIndex = 0;
-		this.actionQueue.clear();
-		this.activeWhile = null;
-		this.self.getNavigation().stop();
-		this.self.setNavigationFailed(false);
-	}
 
 	/**
 	 * combat.lunge_attack/combat.chase's "caught them" resolution, replacing straight damage-on-
@@ -3142,6 +3335,7 @@ public class PlanRunner {
 			WendigoAdvancements.grant(serverPlayer, WendigoAdvancements.GRABBED);
 		}
 		this.grabbedSuccessfully = true;
+		recordSoulLightTally(player);
 		this.forcingRide = true;
 		this.ridingPlayer = player;
 		this.rideEscapeAttempts = 0;
@@ -3173,15 +3367,6 @@ public class PlanRunner {
 	 * sets grabbedSuccessfully (see its own doc comment), so there's nothing extra to set here. */
 	public void forceGrabNow(ServerPlayer target) {
 		if (this.forcingRide) {
-			return;
-		}
-		if (isPlayerDefendingWithSpear(target)) {
-			repelWithSpear(target);
-			// Called directly by WendigoManager, not from inside isActionDone() mid-tick like the
-			// other 3 repelWithSpear/beginForcedRide call sites - safe (and necessary, see
-			// repelWithSpear's own comment) to clear currentAction here so the very next tick falls
-			// straight into the flee instead of waiting for whatever action happened to be running.
-			this.currentAction = null;
 			return;
 		}
 		if (!beginForcedRide(target)) {
@@ -3332,14 +3517,30 @@ public class PlanRunner {
 	}
 
 	/** See inViewStreakTicks/cornerOfEyeStreakTicks' own field comment and PlanPredicates.
-	 * isLookedAtByAnyoneGraduated (the actual consumer) - polled every tick regardless of what's
+	 * isLookedAtByTargetGraduated (the actual consumer) - polled every tick regardless of what's
 	 * currently running, same reasoning as updateForcedRide, so a streak already in progress before a
 	 * stare-hold loop starts still counts once it does. */
 	private void updateLookStreaks() {
-		this.inViewStreakTicks = PlanPredicates.isLookedAtByAnyone(this.self, "in_view")
+		this.inViewStreakTicks = PlanPredicates.isLookedAtByTarget(this.self, "in_view")
 			? this.inViewStreakTicks + 1 : 0;
-		this.cornerOfEyeStreakTicks = PlanPredicates.isLookedAtByAnyone(this.self, "corner_of_eye")
+		this.cornerOfEyeStreakTicks = PlanPredicates.isLookedAtByTarget(this.self, "corner_of_eye")
 			? this.cornerOfEyeStreakTicks + 1 : 0;
+	}
+
+	/** See tasksNearSoulLight/tasksNotNearSoulLight's own field comment - called once at each of the 6
+	 * existing hidden-goal-progress increment sites (successfulStareCount/torchBreakCount/
+	 * lungeAttemptCount/soundCueCount/successfulBreatheCount/grabbedSuccessfully), right alongside that
+	 * counter's own increment. Null-safe - a caller that already null-checked its own target can pass
+	 * it straight through, one that hasn't can just call Targeting.nearestPlayer(this.self) inline. */
+	private void recordSoulLightTally(Player target) {
+		if (target == null) {
+			return;
+		}
+		if (SoulLightScanner.isNearSoulLight(this.self.level(), target.blockPosition())) {
+			this.tasksNearSoulLight++;
+		} else {
+			this.tasksNotNearSoulLight++;
+		}
 	}
 
 	/** Bundles this instant's predicate-evaluation state for PlanPredicates.evaluate - see
@@ -3374,18 +3575,17 @@ public class PlanRunner {
 	/** Snuffs exactly the one torch combat.break_torch pathfound to - no connectivity/cluster
 	 * destruction (removed: a plan wanting several torches gone just issues combat.break_torch more
 	 * than once, each call re-targeting whatever's now nearest - see nearestTorch). See
-	 * LightSourceScanner.snuffByWendigo - leaves a relightable, still-physically-present unlit torch/
-	 * candle behind instead of removing the block outright. Deliberately NOT added to snuffedTorches -
-	 * the user's own explicit "we should not keep track of torches snuffed during a torch break, those
-	 * should all just stay off" correction: a deliberate combat.break_torch is meant to be a lasting
-	 * consequence, unlike combat.chase's own passive collateral (see maybeDestroyNearbyTorches, the
-	 * only remaining source snuffedTorches tracks), which still gets relit after the wave since nothing
-	 * about a chase's own incidental wreckage was ever meant to be permanent. */
+	 * LightSourceScanner.snuffByWendigo - leaves a relightable (by a PLAYER, flint-and-steel, at their
+	 * own initiative), still-physically-present unlit torch/candle behind instead of removing the
+	 * block outright. Stays off for good otherwise - the user's own explicit "lights should not come
+	 * back on after the plan is done" request - same as combat.chase's own passive collateral (see
+	 * maybeDestroyNearbyTorches), neither one is ever engine-relit anymore. */
 	private void performTorchBreak() {
 		if (this.currentTorchTarget == null || !(this.self.level() instanceof ServerLevel serverLevel)) {
 			return;
 		}
 		this.torchBreakCount++; // hidden goal-progress signal - see the field's own comment
+		recordSoulLightTally(Targeting.nearestPlayer(this.self));
 		LightSourceScanner.snuffByWendigo(serverLevel, this.currentTorchTarget, this.self);
 	}
 

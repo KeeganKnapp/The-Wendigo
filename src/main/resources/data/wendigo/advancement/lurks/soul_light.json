@@ -7,7 +7,7 @@
   },
   "display": {
     "description": {
-      "text": "Find shelter in the glow of a soul light, deep below. Larger soul light sources yield better protection"
+      "text": "Soul lights pacify an active wendigo over time, but they won't prevent an attack from an active wendigo. Stay near a soul light source at all times to prevent the wendigo from growing hungrier in the deepslate caves. Soul fire particles indicate protection"
     },
     "hidden": false,
     "icon": {

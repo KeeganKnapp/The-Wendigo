@@ -2,8 +2,10 @@ package com.wendigo.wave;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.ToIntFunction;
@@ -60,13 +62,24 @@ public final class WendigoProgressionTracker {
 	// controls how quickly the area starts reading as "the wendigo's own territory" once someone's
 	// genuinely settled in down here.
 	private static final int MOB_CLEARING_WARMUP_TICKS = 200; // 10s
-	private static final int MOB_CLEARING_MIN_STAGE = 2; // mirrors the old 20%-severity threshold
+	// The user's own explicit "let mobs spawn on stage 2 as well" request - raised from 2 to 3, so
+	// ordinary hostile mobs can still spawn/survive at stage 2 (the wendigo doesn't start clearing
+	// its own "territory" of them until stage 3).
+	private static final int MOB_CLEARING_MIN_STAGE = 3;
 
 	// How many cumulative ticks below y=0 (while no run is active) a player needs before becoming
 	// eligible for a fresh wendigo spawn - see the class doc comment. Reset to 0 the instant a run
 	// starts or resumes, frozen (not incrementing) for the run's entire duration, only resuming once
 	// the run truly completes.
 	private static final int ELIGIBILITY_TICKS_REQUIRED = 2000;
+	// The user's own explicit "larger grace period for those who beat the wendigo" request - a real
+	// kill (endStage5Hunt) starts the eligibility timer this far BELOW zero instead of at zero (see
+	// the accrual loop below - eligibilityTicks.merge only ever adds, so a negative starting point
+	// just means SAMPLE_INTERVAL_TICKS-sized accrual has to climb back up through zero first before
+	// it starts counting toward ELIGIBILITY_TICKS_REQUIRED the normal way) - a genuinely earned kill
+	// buys real extra breathing room beyond the ordinary post-run reset every other stage completion
+	// gets. First-pass value (3x the ordinary grace period, total), tune by feel.
+	private static final int KILL_BONUS_ELIGIBILITY_TICKS = ELIGIBILITY_TICKS_REQUIRED * 2;
 
 	// Index by stage (1-5); index 0 unused, kept only so stage numbers can index directly without an
 	// off-by-one everywhere. Stage 5's goal is intentionally unreachable - see isGoalMet. Stage 1's
@@ -80,11 +93,14 @@ public final class WendigoProgressionTracker {
 	// stage's own STAGE_GOALS entry is still a single number checked against ActiveRun.progress alone -
 	// see isGoalMet), so this doesn't generalize into an array the way STAGE_GOALS does.
 	private static final int STAGE1_SOUND_GOAL = 4;
-	// A THIRD axis, this one applying to every stage 1-4 uniformly (not just stage 1) - the user's own
-	// explicit "1 successful breathe on stage 1, 1 on stage 2... and so on" request. Stage 5 is
-	// deliberately exempt ("it doesn't really matter" there, the user's own words) - matching its own
-	// separate kill-triggered stop condition (endStage5Hunt) that bypasses isGoalMet's own ordinary
-	// progress check entirely anyway, so this would never actually be reachable there regardless.
+	// A THIRD axis, this one originally applying to every stage 1-4 uniformly - the user's own explicit
+	// "1 successful breathe on stage 1, 1 on stage 2... and so on" request. Stage 5 is deliberately
+	// exempt ("it doesn't really matter" there, the user's own words) - matching its own separate
+	// kill-triggered stop condition (endStage5Hunt) that bypasses isGoalMet's own ordinary progress
+	// check entirely anyway, so this would never actually be reachable there regardless. Stage 1 is now
+	// ALSO exempt (see isGoalMet) - the user's own later reversal, paired with sound.breathe itself no
+	// longer being offered at stage 1 at all (see TierGates.minPercentFor) - so this goal now really
+	// only applies to stages 2-4, despite the field/comment names still saying "1-4".
 	private static final int BREATHE_GOAL = 1;
 
 	private static final class ActiveRun {
@@ -93,9 +109,18 @@ public final class WendigoProgressionTracker {
 		// Stage 1's own "noises" axis (see STAGE1_SOUND_GOAL) - every sound.ambient_cue that actually
 		// played this run, across however many waves it took. Stays 0 and unused for every other stage.
 		int soundProgress;
-		// Every stage 1-4's own "successful breathe" axis (see BREATHE_GOAL) - stays 0 and unused for
-		// stage 5.
+		// Stages 2-4's own "successful breathe" axis (see BREATHE_GOAL) - stays 0 and unused for stage
+		// 1 and stage 5.
 		int breatheProgress;
+		// The soul-light progression redesign - the user's own explicit "track if the target was
+		// within a safe distance to a soul light... when a task was satisfied" request. Accumulated
+		// across every wave this run takes (see addSoulLightTally, fed from PlanRunner's own per-wave
+		// EncounterOutcome.tasksNearSoulLight/tasksNotNearSoulLight), read once at run-completion time
+		// by resolveRunOutcome to decide whether the run's goal being met advances or REGRESSES the
+		// stage. Stays 0 and unused for stage 5 - see endStage5Hunt's own doc comment for why that
+		// stage has no task tally at all.
+		int tasksNearSoulLight;
+		int tasksNotNearSoulLight;
 
 		ActiveRun(int stage) {
 			this.stage = stage;
@@ -107,6 +132,14 @@ public final class WendigoProgressionTracker {
 	private final Map<UUID, ActiveRun> activeRuns = new HashMap<>();
 	private final Map<UUID, Boolean> wasUnderY0 = new HashMap<>();
 	private final Map<UUID, Integer> warmupUntilTick = new HashMap<>();
+	// The user's own explicit death-handling request: a player who just died shouldn't be immediately
+	// re-selected as a hand-off target (they're still physically "under y=0" and, if they have an
+	// active run, still "resumable" too - neither fact changes just because they died), so
+	// WendigoManager's own ALLOW_DEATH handler marks them here right as the current engagement on
+	// them ends, and selectTarget skips anyone in this set entirely. Cleared on
+	// ServerPlayerEvents.AFTER_RESPAWN (see markRespawned) - once they're back and genuinely eligible
+	// again (immediately, if resumable), ordinary selection rules apply again.
+	private final Set<UUID> recentlyDied = new HashSet<>();
 	private int ticksSinceSample;
 
 	// Null until the real server actually starts (see onServerStarted) - never set for the throwaway
@@ -346,8 +379,8 @@ public final class WendigoProgressionTracker {
 		}
 	}
 
-	/** Every stage 1-4's own third axis (see BREATHE_GOAL) - a no-op for stage 5's ActiveRun (nothing
-	 * ever reads breatheProgress outside isGoalMet's own stage!=5 check), same "harmless to call
+	/** Stages 2-4's own third axis (see BREATHE_GOAL) - a no-op for stage 1 and stage 5's ActiveRun
+	 * (nothing ever reads breatheProgress outside isGoalMet's own stage checks), same "harmless to call
 	 * unconditionally" reasoning addSecondaryProgress above already has. */
 	public void addBreatheProgress(ServerPlayer player, int amount) {
 		ActiveRun run = this.activeRuns.get(player.getUUID());
@@ -356,16 +389,26 @@ public final class WendigoProgressionTracker {
 		}
 	}
 
+	/** Same shape as addProgress/addSecondaryProgress/addBreatheProgress above - see
+	 * ActiveRun.tasksNearSoulLight/tasksNotNearSoulLight's own field comment. */
+	public void addSoulLightTally(ServerPlayer player, int near, int notNear) {
+		ActiveRun run = this.activeRuns.get(player.getUUID());
+		if (run != null) {
+			run.tasksNearSoulLight += near;
+			run.tasksNotNearSoulLight += notNear;
+		}
+	}
+
 	/** Stage 5 never reads true here (STAGE_GOALS[5] is Integer.MAX_VALUE) - it has its own separate
 	 * stop condition entirely (see endStage5Hunt): the player has to actually kill it, not accumulate
 	 * a counted goal, so a "progress" number has nothing to compare against here at all (breatheMet is
 	 * still explicitly exempted for stage 5 too, for clarity, even though primaryMet alone already
 	 * blocks it from ever reading true). Stage 1 is the one DOUBLY-compound case - the user's own
-	 * explicit "4 stares AND 4 noises" request layered under a THIRD "1 successful breathe" axis that
-	 * now applies to every stage 1-4 (not just stage 1) - requiring progress (stares/torch-breaks/
-	 * lunges/grab, whichever that stage's own primary metric is), soundProgress (stage 1 only), and
-	 * breatheProgress (stages 1-4) to each independently clear their own goal, not a combined total of
-	 * any kind. */
+	 * explicit "4 stares AND 4 noises" request layered under a THIRD "1 successful breathe" axis, later
+	 * narrowed to stages 2-4 only once sound.breathe itself stopped being offered at stage 1 at all
+	 * (see TierGates.minPercentFor) - requiring progress (stares/torch-breaks/lunges/grab, whichever
+	 * that stage's own primary metric is), soundProgress (stage 1 only), and breatheProgress (stages
+	 * 2-4) to each independently clear their own goal, not a combined total of any kind. */
 	public boolean isGoalMet(ServerPlayer player) {
 		ActiveRun run = this.activeRuns.get(player.getUUID());
 		if (run == null) {
@@ -373,20 +416,62 @@ public final class WendigoProgressionTracker {
 		}
 		boolean primaryMet = run.progress >= STAGE_GOALS[run.stage];
 		boolean soundMet = run.stage != 1 || run.soundProgress >= STAGE1_SOUND_GOAL;
-		boolean breatheMet = run.stage == 5 || run.breatheProgress >= BREATHE_GOAL;
+		// Stage 1 is now ALSO exempt (the user's own later reversal, alongside sound.breathe no longer
+		// being offered at stage 1 at all - see TierGates.minPercentFor) - a run can't clear a goal it's
+		// not even allowed to attempt.
+		boolean breatheMet = run.stage == 5 || run.stage == 1 || run.breatheProgress >= BREATHE_GOAL;
 		return primaryMet && soundMet && breatheMet;
 	}
 
-	/** Marks the active run as genuinely, permanently over - completedRuns advances (deciding the
-	 * NEXT run's stage), the run itself clears, and the eligibility timer starts fresh from right now
-	 * (per "only starts counting up after their run with the wendigo is over"). Stages 1-4 only - see
-	 * endStage5Hunt for stage 5's own version of this (kill-triggered, no completedRuns advance). */
-	public void completeRun(ServerPlayer player) {
-		UUID id = player.getUUID();
-		this.completedRuns.merge(id, 1, Integer::sum);
-		this.activeRuns.remove(id);
-		this.eligibilityTicks.put(id, 0);
-		persistCompletedRuns(id, this.completedRuns.get(id));
+	/**
+	 * Marks the active run as genuinely, permanently over - the user's own explicit "soul light is a
+	 * mask" redesign: this used to unconditionally advance completedRuns by 1; now the run's own
+	 * cumulative soul-light tally (ActiveRun.tasksNearSoulLight/tasksNotNearSoulLight, accumulated
+	 * across every wave the run took - see addSoulLightTally) decides the DIRECTION. Tasks completed
+	 * not-near-soul-light "winning" (tasksNotNearSoulLight >= tasksNearSoulLight - ties favor
+	 * advancing, the user's own explicit ">=") advances the stage exactly like before; the reverse now
+	 * REGRESSES it, a real new possibility this introduces - "stay within the soul lights to keep the
+	 * wendigo at stage 1... the soul lights are like a mask leaving the wendigo curious but not
+	 * letting him settle in for the hunt," the user's own words.
+	 * <p>
+	 * Applies to the WHOLE proximity group around player, not just the technical wave target -
+	 * "one plan, one set of tasks per group, whether 5 in a group or 1" (see groupNear) - every
+	 * member's own completedRuns moves by the same +1/-1, floored at 0 (matches setRunsForTesting's
+	 * own clamp - this floor is also exactly how staying near soul light forever keeps a stage-1
+	 * player pinned at stage 1, never going negative). Every group member's eligibility timer resets
+	 * together too, not just the technical target's - otherwise a non-target member's timer keeps
+	 * running and could immediately trigger a second, separate fresh run the instant this one
+	 * resolves.
+	 * <p>
+	 * Stages 1-4 only - see endStage5Hunt for stage 5's own version of this (kill-triggered,
+	 * unconditional demotion, no soul-light tally at all). Returns whether the tally favored
+	 * advancing (true) or regressing (false), for WendigoManager's own debug logging.
+	 * <p>
+	 * Floored at STAGE_2_COMPLETED_RUNS, not 0, for a member whose own completedRuns has ALREADY
+	 * reached that once - the user's own explicit "enforce a minimum stage of 2 after the first time
+	 * a player exits stage 1... for the rest of the game" request. No separate persistent "has ever
+	 * reached stage 2" flag needed: since this same floor applies every time this method ever
+	 * regresses anyone, completedRuns can never drop below 2 again once it's gotten there, so
+	 * whether the CURRENT (pre-regression) value already clears that bar is itself already always an
+	 * accurate answer to "has this member ever exited stage 1," by induction. A member who hasn't
+	 * reached it yet still floors at plain 0 as before - stage 1 itself can still regress/fail to
+	 * ever reach stage 2 at all.
+	 */
+	public boolean resolveRunOutcome(ServerLevel level, ServerPlayer player) {
+		ActiveRun run = this.activeRuns.get(player.getUUID());
+		boolean favorable = run == null || run.tasksNotNearSoulLight >= run.tasksNearSoulLight;
+		int delta = favorable ? 1 : -1;
+		for (ServerPlayer member : groupNear(level, player)) {
+			UUID id = member.getUUID();
+			int current = completedRunsOf(member);
+			int floor = current >= STAGE_2_COMPLETED_RUNS ? STAGE_2_COMPLETED_RUNS : 0;
+			int updated = Math.max(floor, current + delta);
+			this.completedRuns.put(id, updated);
+			persistCompletedRuns(id, updated);
+			this.eligibilityTicks.put(id, 0);
+		}
+		this.activeRuns.remove(player.getUUID());
+		return favorable;
 	}
 
 	// Stage 5's persisted health - restored on every spawn, saved on every cosmetic pause (see
@@ -403,15 +488,48 @@ public final class WendigoProgressionTracker {
 		this.stage5Health.put(player.getUUID(), health);
 	}
 
-	/** Stage 5's own stop condition (see isGoalMet's own comment) - the player has to actually kill
-	 * it. Restarts the eligibility timer exactly like completeRun does for every other stage
-	 * (deliberately does NOT touch completedRuns - there's no stage 6 to advance to, a fresh stage-5
-	 * hunt just starts again once eligible), and resets the persisted health back to full so the next
-	 * encounter starts fresh rather than resuming at 0/negative. */
-	public void endStage5Hunt(ServerPlayer player) {
+	// resolveRunOutcome's own permanent regression floor once reached, and also the completedRuns
+	// value a demoted stage-5 kill drops down to (see endStage5Hunt - the user's own explicit
+	// "defeating the wendigo should demote to stage 2, not 3" correction) - matches stageFor(2) == 2
+	// exactly, so this really does mean "stage 2," not some arbitrary number. The two uses landing on
+	// the exact same value isn't a coincidence being relied on for correctness - a kill demoting
+	// anyone is now just this same permanent floor, not a separate, higher one.
+	private static final int STAGE_2_COMPLETED_RUNS = 2;
+
+	/**
+	 * Stage 5's own stop condition (see isGoalMet's own comment) - the player has to actually kill
+	 * it. Unlike resolveRunOutcome, there's no soul-light tally to consult at all here - "for the
+	 * last stage there are no tasks other than killing the wendigo," the user's own words, so this is
+	 * unconditional: a genuine kill now DEMOTES the stage back to 2 (not "no change", the old
+	 * behavior) - killing it doesn't advance further (there's no stage 6), but it also doesn't just
+	 * loop back into fresh stage-5 hunts forever; it gives the group a real breather before climbing
+	 * back up. Lands on STAGE_2_COMPLETED_RUNS specifically, not some deeper demotion, since stage 2
+	 * is already the permanent floor everyone who's ever gotten this far is entitled to anyway (see
+	 * resolveRunOutcome's own doc comment).
+	 * <p>
+	 * Applies to the WHOLE proximity group around player, same "one plan, one set of tasks per group"
+	 * reasoning as resolveRunOutcome - see groupNear. Capped DOWN only (Math.min, never
+	 * Math.max/a flat set) - a group member who was somehow below stage 2 already is never bumped UP
+	 * by someone else's kill, consistent with the min-based (not max/average) group-stage-selection
+	 * philosophy this project already settled on (protect the least-established member, never inflate
+	 * their progress based on someone else's activity).
+	 * <p>
+	 * Restarts every group member's eligibility timer with a real bonus grace period on top (see
+	 * KILL_BONUS_ELIGIBILITY_TICKS - the user's own explicit "larger grace period for those who beat
+	 * the wendigo" request, applied to the whole group same as everything else here), and resets the
+	 * persisted health back to full so the next encounter starts fresh rather than resuming at
+	 * 0/negative.
+	 */
+	public void endStage5Hunt(ServerLevel level, ServerPlayer player) {
+		for (ServerPlayer member : groupNear(level, player)) {
+			UUID id = member.getUUID();
+			int demoted = Math.min(completedRunsOf(member), STAGE_2_COMPLETED_RUNS);
+			this.completedRuns.put(id, demoted);
+			persistCompletedRuns(id, demoted);
+			this.eligibilityTicks.put(id, -KILL_BONUS_ELIGIBILITY_TICKS);
+		}
 		UUID id = player.getUUID();
 		this.activeRuns.remove(id);
-		this.eligibilityTicks.put(id, 0);
 		this.stage5Health.remove(id);
 	}
 
@@ -430,6 +548,29 @@ public final class WendigoProgressionTracker {
 	public record TargetSelection(ServerPlayer target, int stage, boolean isResume) {
 	}
 
+	/** See recentlyDied's own field comment - called from WendigoManager's ServerPlayerEvents.
+	 * ALLOW_DEATH handler, right as the current engagement on this player ends, so selectTarget can't
+	 * immediately hand right back to the same player who just died. */
+	public void markDied(ServerPlayer player) {
+		this.recentlyDied.add(player.getUUID());
+	}
+
+	/** See recentlyDied's own field comment - called from WendigoManager's ServerPlayerEvents.
+	 * AFTER_RESPAWN handler. Takes the UUID directly (not a ServerPlayer) since respawn always hands
+	 * back a NEW ServerPlayer instance - the UUID is the only thing guaranteed to still match. */
+	public void markRespawned(UUID playerId) {
+		this.recentlyDied.remove(playerId);
+	}
+
+	/** Public specifically so WendigoManager's own async LLM-completion staleness guards
+	 * (beginWave/beginEngagement) can check whether the SPECIFIC player a request was issued for has
+	 * since died, without comparing object identity against state.lockedTarget directly - that
+	 * comparison would incorrectly flag a legitimate debug target-redirect (/wendigo wave onto a
+	 * DIFFERENT player than whoever's currently locked) as stale too, which this avoids entirely. */
+	public boolean isRecentlyDied(ServerPlayer player) {
+		return this.recentlyDied.contains(player.getUUID());
+	}
+
 	/**
 	 * Multiplayer-aware automatic wave target, in priority order:
 	 * 1. Anyone with an active (unfinished) run, currently below y=0 - always wins over fresh
@@ -439,17 +580,29 @@ public final class WendigoProgressionTracker {
 	 * 2. Otherwise, players who've reached ELIGIBILITY_TICKS_REQUIRED with no active run - grouped by
 	 *    proximity exactly like the old severity-based selection (two players in the same group if
 	 *    within MOB_CLEAR_OUTER_RADIUS of each other, transitively). Group with the most players wins;
-	 *    ties broken by whichever group's highest completedRuns member is furthest along. The actual
-	 *    target is picked at random from within that group, but the stage used for the whole engagement
-	 *    comes from that max-completedRuns member, matching "the player with the most spawns on them
-	 *    will be the one to base what stage the group is in on".
+	 *    ties broken by whichever group's highest completedRuns member is furthest along (a separate
+	 *    concern from step 3 below - which CLUSTER of players is worth spawning near at all, not what
+	 *    intensity to show up at).
+	 * 3. The actual target is picked at random from within the winning group, but the STAGE used for
+	 *    the whole engagement comes from that group's LEAST-established (lowest completedRuns) member
+	 *    - the user's own explicit correction: the old "runs" progression model (discrete per-player
+	 *    stages, no shared continuously-climbing severity score) has no sensible way to "average" a
+	 *    group's intensity anymore, and using the group's MOST-established member (the literal
+	 *    previous behavior here, before this fix) meant a barely-eligible newcomer standing near a
+	 *    stage-5 veteran got shown a full stage-5 haunting they hadn't remotely earned - using the
+	 *    lowest instead protects whoever's least established, which is the whole point of a
+	 *    per-player progression system in the first place.
+	 * Excludes anyone in recentlyDied entirely from BOTH lists - a player who just died is still
+	 * physically under y=0 (death doesn't move them) and, if they had an active run, still nominally
+	 * "resumable" too, so without this exclusion a hand-off search immediately after their own death
+	 * would just find them again instead of moving on to someone else or genuinely coming up empty.
 	 * Null if nobody qualifies either way right now.
 	 */
 	public TargetSelection selectTarget(ServerLevel level) {
 		List<ServerPlayer> resumable = new ArrayList<>();
 		List<ServerPlayer> fresh = new ArrayList<>();
 		for (ServerPlayer player : level.players()) {
-			if (!isUnderY0(player)) {
+			if (!isUnderY0(player) || this.recentlyDied.contains(player.getUUID())) {
 				continue;
 			}
 			if (this.activeRuns.containsKey(player.getUUID())) {
@@ -468,8 +621,39 @@ public final class WendigoProgressionTracker {
 		}
 		List<ServerPlayer> group = selectGroup(groupByProximity(fresh), this::completedRunsOf);
 		ServerPlayer target = group.get(ThreadLocalRandom.current().nextInt(group.size()));
-		int maxCompletedRuns = group.stream().mapToInt(this::completedRunsOf).max().orElse(0);
-		return new TargetSelection(target, stageFor(maxCompletedRuns), false);
+		int minCompletedRuns = group.stream().mapToInt(this::completedRunsOf).min().orElse(0);
+		return new TargetSelection(target, stageFor(minCompletedRuns), false);
+	}
+
+	/**
+	 * Everyone currently transitively within MOB_CLEAR_OUTER_RADIUS of player (including player
+	 * themselves), regardless of eligibility state - unlike selectTarget's own resumable/fresh
+	 * filtering (which only groups CANDIDATES for starting/resuming a run), this is used at RUN
+	 * COMPLETION time (resolveRunOutcome/endStage5Hunt) to decide who else's completedRuns should
+	 * move alongside the technical target's own - "one plan, one set of tasks per group, whether 5 in
+	 * a group or 1," the user's own words. Only considers players currently under y=0 (isUnderY0) in
+	 * the SAME level as player - someone who wandered off above ground or into a different dimension
+	 * mid-run isn't meaningfully "still in the group" by the time it resolves. Falls back to just
+	 * [player] if nobody else qualifies (including if player themselves doesn't turn up in any
+	 * connected component for some reason - defensive, shouldn't happen given the caller's own
+	 * preconditions, but never leaves the technical target out of their own group's resolution).
+	 */
+	private List<ServerPlayer> groupNear(ServerLevel level, ServerPlayer player) {
+		List<ServerPlayer> candidates = new ArrayList<>();
+		for (ServerPlayer candidate : level.players()) {
+			if (isUnderY0(candidate)) {
+				candidates.add(candidate);
+			}
+		}
+		if (!candidates.contains(player)) {
+			candidates.add(player);
+		}
+		for (List<ServerPlayer> group : groupByProximity(candidates)) {
+			if (group.contains(player)) {
+				return group;
+			}
+		}
+		return List.of(player);
 	}
 
 	/** Connected components under "within MOB_CLEAR_OUTER_RADIUS of each other" - simple union-find,

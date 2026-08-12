@@ -21,9 +21,20 @@ public class LlmConfig {
 	// "anthropic" or "openai" - selects which of the two below (model/openaiModel) and which env
 	// var (ANTHROPIC_API_KEY/OPENAI_API_KEY) LlmClient actually uses; the other provider's client
 	// is never constructed, so its key doesn't need to be set at all.
-	public String provider = "anthropic";
+	// Defaults match the project's own actual current choice (see this class's own history/memory:
+	// tried switching to Anthropic, hit a schema-complexity "compiled grammar too large" limit that
+	// persisted even after trimming the schema, reverted back to OpenAI) - these two fields only
+	// matter the first time a given run directory boots (see load() below, which writes them out to
+	// a real JSON file at that point and reads the file thereafter), but a fresh run directory
+	// (a new dev clone, CI, ./gradlew runGameTest's own separate build/run/gameTest working
+	// directory) should bootstrap into the SAME real choice everyone else is already running with,
+	// not silently fall back to the abandoned Anthropic path or the pricier/more rate-limited full
+	// gpt-4o. Found live: a convergence-testing GameTest run against a freshly-generated
+	// build/run/gameTest config hit OpenAI's gpt-4o rate limit within its first few requests, while
+	// the hand-edited run/config/wendigo-llm.json (gpt-4o-mini) had no such trouble.
+	public String provider = "openai";
 	public String model = "claude-haiku-4-5-20251001"; // used when provider = "anthropic"
-	public String openaiModel = "gpt-4o"; // used when provider = "openai"
+	public String openaiModel = "gpt-4o-mini"; // used when provider = "openai"
 	public long maxTokens = 512;
 	public int requestTimeoutSeconds = 30;
 

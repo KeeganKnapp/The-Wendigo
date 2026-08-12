@@ -1,5 +1,5 @@
 {
-  "parent": "wendigo:lurks/spear_repel",
+  "parent": "wendigo:lurks/spectral_hit",
   "criteria": {
     "impossible": {
       "trigger": "minecraft:impossible"
@@ -7,7 +7,7 @@
   },
   "display": {
     "description": {
-      "text": "End the hunt for good, at the peak of its hunger."
+      "text": "End the hunt for good, at the peak of its hunger. Continue to mine near soul lights to pacify the wendigo"
     },
     "frame": "challenge",
     "hidden": false,
@@ -15,7 +15,7 @@
       "id": "minecraft:netherite_sword"
     },
     "title": {
-      "text": "The Hunter, Hunted"
+      "text": "It'll be back"
     }
   },
   "requirements": [

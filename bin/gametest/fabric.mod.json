@@ -1,0 +1,16 @@
+{
+	"schemaVersion": 1,
+	"id": "wendigo-gametest",
+	"version": "1.0.0",
+	"name": "Wendigo GameTests",
+	"description": "Headless @GameTest scenarios for the wendigo mod - never shipped, only used by ./gradlew runGameTest.",
+	"environment": "server",
+	"entrypoints": {
+		"fabric-gametest": [
+			"com.wendigo.gametest.WendigoGameTests"
+		]
+	},
+	"depends": {
+		"wendigo": "*"
+	}
+}

@@ -1,0 +1,10 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "#": "minecraft:glow_berries",
+    "X": "minecraft:arrow"
+  },
+  "pattern": [" # ", "#X#", " # "],
+  "result": {"count": 2, "id": "minecraft:spectral_arrow"}
+}

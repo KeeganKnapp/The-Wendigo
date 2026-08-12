@@ -76,7 +76,7 @@ public final class WendigoCommands {
 	private static final String DEFAULT_TEST_PLAN_CONTENT = """
 	{
 	"plan": [
-	{ "type": "movement.approach_band", "band": "close", "speed": "slow" },
+	{ "type": "movement.approach_spot", "destination": "unwatched", "speed": "slow" },
 	{ "type": "posture.stare", "enabled": true },
 	{
 	"type": "control.while",

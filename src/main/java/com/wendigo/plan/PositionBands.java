@@ -1,15 +1,14 @@
 package com.wendigo.plan;
 
 /**
- * The 6 live-resolved distance-from-player bands that replaced the old pre-scanned spot_a..spot_f
- * system - every position a plan needs (spawn_at, movement.approach_band, combat.break_torch's
- * optional band, despawn/retreat's own farthest-band target) is resolved fresh against these ranges
- * at the moment it's actually needed, never cached. Public (unlike the rest of SemanticBands, which
- * is package-private) specifically so com.wendigo.wave.WendigoManager can share the exact same
- * numbers PlanRunner resolves movement.approach_band/despawn against - same precedent as
- * ProximityBands' own public split. Not scientifically tuned - first pass, adjust by feel like
- * everything else in SemanticBands. Severity/cave-scale gating for these lives in
- * SchemaBuilder.isBandAllowed, not here - this is purely the distance-range vocabulary.
+ * The 6 live distance-from-player bands used for reporting/classifying a position (see classify) -
+ * movement.approach_spot/combat.teleport's own destination search no longer uses these at all (see
+ * SemanticBands.actionSearchMinDistance - cave scale drives that now, not a fixed band ladder), but
+ * the vocabulary itself stays alive for prompt-facing description (WaveContext's own current-distance
+ * report) and predicate.player_distance's own band checks. Public (unlike the rest of SemanticBands,
+ * which is package-private) specifically so com.wendigo.wave.WendigoManager can share the exact same
+ * numbers - same precedent as ProximityBands' own public split. Not scientifically tuned - first
+ * pass, adjust by feel like everything else in SemanticBands.
  */
 public final class PositionBands {
 	private PositionBands() {
@@ -43,9 +42,8 @@ public final class PositionBands {
 	 * threshold rather than distanceMax - the two aren't quite contiguous (close's own 9.0 max and
 	 * medium's own 10.0 min leave a 1-block gap, same for every other adjacent pair), so anchoring on
 	 * distanceMin instead is what actually tiles the whole number line with no gap or overlap.
-	 * Backs combat.teleport_to_band's own source-band precondition (TierGates.teleportSourceBands)
-	 * and its matching WaveContext prompt context - both need to classify the wendigo's own current
-	 * live distance the exact same way. */
+	 * Backs WaveContext's own prompt report of the wendigo's current live distance/band when it's
+	 * already active. */
 	public static String classify(double distance) {
 		if (distance < distanceMin("medium")) {
 			return "close";

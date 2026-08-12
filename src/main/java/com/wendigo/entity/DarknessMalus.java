@@ -38,9 +38,8 @@ final class DarknessMalus {
 	// route through it is still possible if it's truly the only option.
 	private static final float AVOID_BASE_MALUS = 120.0F;
 	private static final float AVOID_MALUS_PER_LEVEL = 25.0F;
-	// Cobwebs get an even heavier flat penalty than the worst light case - getting physically stuck
-	// is a worse outcome than being briefly lit, so this should almost always lose to any detour.
-	private static final float COBWEB_MALUS = 150.0F;
+	// Cobwebs get no penalty, easy to walk through, so should be fine to path through
+	private static final float COBWEB_MALUS = 0.0F;
 	// Heavier still than COBWEB_MALUS - see apply's own comment for why this is a malus at all now
 	// (was a hard exclusion) - getting completely stranded with zero viable neighbors after an
 	// accidental fall onto dripstone is an even worse outcome than a cobweb tangle, so this should

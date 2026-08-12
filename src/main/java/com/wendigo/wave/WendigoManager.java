@@ -1,8 +1,6 @@
 package com.wendigo.wave;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -12,12 +10,16 @@ import java.util.concurrent.ThreadLocalRandom;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerBossEvent;
@@ -28,8 +30,6 @@ import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.BossEvent;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.level.biome.Biomes;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.pathfinder.Path;
 
 import com.wendigo.WendigoMod;
@@ -41,21 +41,22 @@ import com.wendigo.plan.PlanPredicates;
 import com.wendigo.plan.PositionBands;
 import com.wendigo.plan.ProximityBands;
 import com.wendigo.plan.SchemaBuilder;
+import com.wendigo.plan.SemanticBands;
 import com.wendigo.sound.WendigoSounds;
 import com.wendigo.spatial.CaveScaleScanner;
 import com.wendigo.spatial.CaveScaleScanner.CaveScale;
 import com.wendigo.spatial.DarkSpotScanner;
 import com.wendigo.spatial.LightSourceScanner;
+import com.wendigo.spatial.SoulLightScanner;
 
 /**
  * Owns the wendigo's spawn/despawn lifecycle: at most one per level, spawned onto whichever
  * eligible player/group is due for a fresh run (or has an unfinished one to resume - see
  * WendigoProgressionTracker.selectTarget), running a single LLM-authored plan from spawn to
  * despawn with no mid-wave re-planning. See PlanRunner for how the plan body itself executes once
- * the entity exists. Every position a plan resolves against (movement.approach_band, teleporting,
- * despawn/retreat) is resolved LIVE at the moment it's actually needed (see
- * DarkSpotScanner.findLiveBandPosition) - this class never pre-scans and hands off a set of
- * frozen positions the way it once did.
+ * the entity exists. Every position a plan resolves against (movement.approach_spot, teleporting,
+ * despawn/retreat) is resolved LIVE at the moment it's actually needed - this class never
+ * pre-scans and hands off a set of frozen positions the way it once did.
  */
 public final class WendigoManager {
 	// Sent on every request, regardless of severity - the primitives/predicates/mechanics don't
@@ -68,44 +69,46 @@ public final class WendigoManager {
 		"You control a wendigo, a shadow-dwelling stalker creature in Minecraft. It's a persistent "
 		+ "presence, not something that spawns fresh every time - usually it's already nearby, "
 		+ "quietly keeping its distance, before you're ever asked for a plan. You are given a "
-		+ "target player, their dweller severity, and a live distance-band ladder describing how "
-		+ "far things currently are from them. Positioning works entirely through that ladder, not "
-		+ "fixed coordinates - but where 'plan' STARTS is not your choice: it just begins from "
+		+ "target player, their dweller severity, and a live account of the surrounding cave and "
+		+ "how many torches sit nearby. Positioning works entirely through semantic destination "
+		+ "types (see below), never fixed coordinates - but where 'plan' STARTS is not your choice: "
+		+ "it just begins from "
 		+ "wherever the wendigo already is right now. If it's already active, that's exactly wherever "
 		+ "orbit left it; for a genuinely fresh appearance, the engine places it somewhere unwatched "
 		+ "on its own, before you're ever asked for a plan - there's nothing to pick here, and no "
 		+ "field for it. If you want to reposition before doing anything else, that's what "
-		+ "movement.approach_band is for (see below) - use it as your own plan's first step, or skip "
+		+ "movement.approach_spot is for (see below) - use it as your own plan's first step, or skip "
 		+ "it entirely and let the plan's first real action happen right where the wendigo already "
-		+ "stands. Where it withdraws to afterward IS your choice - "
-		+ "despawn_band picks a live band the engine resolves a position in once it's actually time "
-		+ "to flee (whenever 'plan' finishes, or whenever a movement.retreat_with_fallback step "
-		+ "runs), re-resolving fresh if the first attempt fails. Choose it deliberately, not always "
-		+ "the maximum: a brief, subtle beat might only warrant backing off to medium before "
-		+ "resuming a quiet watch, while committing to a chase or a grab plausibly earns real "
-		+ "distance (farther/farthest) before showing itself again. medium/far/farther/farthest are "
-		+ "all always available for this regardless of severity - retreating modestly is never the "
-		+ "bold half of a decision - but medium is as close as it goes; a real withdrawal never lands "
-		+ "any nearer than that. "
-		+ "The 6 positioning bands, nearest to furthest: close_as_possible, close, medium, far, "
-		+ "farther, farthest - see the prompt's own numbers for exact block ranges, and don't "
-		+ "confuse these with predicate.player_distance's own, differently-scaled ladder "
-		+ "(grab_distance/lunge_distance/close_quarters/medium/far, used only for combat/predicate "
-		+ "checks, never for positioning) - same-sounding names like 'medium'/'far' mean different "
-		+ "ranges in each ladder. close_as_possible only exists in a tight, mineshaft-like space "
-		+ "(see the prompt's caving-scenario note) - there's nowhere far to go anyway in a cramped "
-		+ "space; close/medium/far/farther otherwise unlock progressively closer to the player as "
-		+ "severity climbs - which bands are even offered already reflects how bold the wendigo is "
-		+ "allowed to be right now. farthest is always available. "
-		+ "Everywhere a band is used - movement.approach_band, despawn_band, teleporting - it's resolved LIVE, "
-		+ "against wherever the player actually is at that exact moment, never a position frozen "
-		+ "from earlier in the request: there's no mid-engagement re-planning, so the whole plan is "
-		+ "decided once, up front, but each step that moves somewhere waits until it actually runs "
+		+ "stands. Where it withdraws to afterward is NOT your choice, unlike positioning - a flee "
+		+ "(whenever 'plan' finishes, or whenever a movement.retreat_with_fallback step runs) always "
+		+ "heads back toward the wendigo's own ordinary orbit range for its current stage, "
+		+ "reachability-verified, re-resolving fresh if the first attempt fails. It'll certainly "
+		+ "return to that same range on its own regardless, so there's no field for this - a flee is "
+		+ "always a genuine trip home, never a distance you pick. "
+		+ "Positioning throughout the rest of the plan works through two actions instead of a "
+		+ "distance-band ladder: movement.approach_spot walks there, combat.teleport instantly "
+		+ "relocates there, both resolved against a TYPE of spot rather than a distance - behind (the "
+		+ "player's own blind spot - could be on the floor, a wall, or the ceiling behind them, "
+		+ "whichever is actually there), eyeline (dark, but genuinely inline with wherever they're "
+		+ "looking right now), above (a ceiling vantage point), in_view (dark, but somewhere they CAN "
+		+ "currently see - a deliberate reveal), torch (the nearest live torch - teleport only, "
+		+ "approach_spot has no use for it since combat.break_torch already targets the nearest one "
+		+ "from wherever the wendigo ends up), ahead (a guess at where they're actually heading, "
+		+ "landing somewhere dim rather than fully dark - both actions support this one too), and "
+		+ "unwatched (approach_spot only - the plain 'go somewhere they're not looking' option, no "
+		+ "other constraint, the standard first step for repositioning before the rest of a plan "
+		+ "runs). How far away the resolved spot actually sits is never something you choose - it's "
+		+ "entirely driven by the size of the surrounding cave (see the prompt's own report of it "
+		+ "below), not by severity at all. Which of these types is even offered right now depends on "
+		+ "stage - see the per-stage note below for what's unlocked so far. Everywhere a destination "
+		+ "type is used it's resolved LIVE, against wherever the player actually is at that exact "
+		+ "moment, never a position frozen from earlier in the request: there's no mid-engagement "
+		+ "re-planning (aside from control.re_evaluate - see its own description), so the whole plan "
+		+ "is decided once, up front, but each step that moves somewhere waits until it actually runs "
 		+ "before deciding exactly where that is. "
-		+ "Use movement.approach_band to explicitly reposition mid-plan (e.g. creep from far to "
-		+ "close once undetected, once that's unlocked); omit any movement step entirely if the "
-		+ "wendigo's current live distance already fits what comes next - there is no obligation to "
-		+ "always move first. "
+		+ "Use movement.approach_spot to explicitly reposition mid-plan; omit any movement step "
+		+ "entirely if the wendigo's current live position already fits what comes next - there is no "
+		+ "obligation to always move first. "
 		+ "combat.break_torch destroys a torch: always the single nearest known light source from "
 		+ "wherever the wendigo ITSELF currently is, no band or player-relative choice - the prompt's "
 		+ "own live torches_at_<band>_distance counts are informational context (is there likely "
@@ -159,19 +162,20 @@ public final class WendigoManager {
 		+ "and unnoticed right up until the reveal, instead of giving the face away the whole time it's "
 		+ "waiting for the player to even get close. Prefer this pattern whenever the point is closing "
 		+ "distance for a combat commit; save the stare-hold pattern for when the point is specifically "
-		+ "waiting to be noticed. Works especially well from a wall/ceiling perch (60%+, once spot_above/"
-		+ "movement.drop unlock - see that stage's own note): predicate.player_distance reads horizontal "
+		+ "waiting to be noticed. Works especially well from a wall/ceiling perch (60%+, once "
+		+ "destination=above/movement.drop unlock - see that stage's own note): predicate.player_distance reads horizontal "
 		+ "distance straight down the wendigo's own column while it's attached above someone, not the "
 		+ "raw diagonal, so the exact same control.while(lunge_distance){movement.hold} wait resolves the "
 		+ "instant the player walks underneath - then movement.drop right before the stare/lunge/chase "
 		+ "instead of walking there. A patient ceiling ambush, not just a ground-level one. "
 		+ "sound.ambient_cue(stare) is heavily encouraged right when a held stare begins. "
 		+ "sound.breathe is a single, deliberate breathing sound played right at the wendigo's own real "
-		+ "position (not the unplaced cinematic cues sound.ambient_cue uses) - available at every stage, "
-		+ "including the very first one. Get as close as possible before using it; the closer it is when "
+		+ "position (not the unplaced cinematic cues sound.ambient_cue uses) - NOT available at the very "
+		+ "first, faintest stage, unlocks once the relationship with this player is established enough to "
+		+ "be bold. Get as close as possible before using it; the closer it is when "
 		+ "this plays, the more it reads as genuinely, physically right there beside them. It pairs "
-		+ "especially well right after a close instant reposition (combat.teleport_to_band(band=close/"
-		+ "behind_player), or (once unlocked) band=above_player) or an ordinary close approach, and again "
+		+ "especially well right after a close instant reposition (combat.teleport(destination=behind), "
+		+ "or (once unlocked) destination=above) or an ordinary close approach, and again "
 		+ "right before escalating into whatever comes next for the current stage - "
 		+ "movement.retreat_with_fallback/control.despawn early on, combat.lunge_attack/combat.chase/"
 		+ "another teleport once those unlock. Lean on it often, not just occasionally. "
@@ -222,59 +226,51 @@ public final class WendigoManager {
 		+ "previous real encounter with this player, if any (how it ended, whether it was ever directly "
 		+ "spotted, its plan shape) - react to that outcome instead of ignoring it, and vary the "
 		+ "approach rather than repeating the same sequence again. "
-		+ "combat.teleport_to_band (see its own schema description for the full mechanic) is available "
-		+ "at every stage, not something that unlocks later - and the set of destination bands it can "
+		+ "combat.teleport (see its own schema description for the full mechanic) is available at "
+		+ "every stage, not something that unlocks later - and the set of destination TYPES it can "
 		+ "offer GROWS with stage rather than being replaced: everything unlocked at an earlier stage "
 		+ "stays available at every later one too, alongside whatever's new - each stage's own text "
-		+ "below names the full current menu. Even once a band's offered, it only works while the "
-		+ "wendigo's own current live distance/band (reported above, when it's already active) already "
-		+ "sits in one of the source bands that stage's own text names (also cumulative - the set of "
-		+ "positions it can teleport FROM widens right alongside where it can teleport TO). Reach for "
-		+ "it specifically when the player is currently sprinting and the prompt's own current-band "
-		+ "report already satisfies that requirement - ideally as the very FIRST step of the plan, "
-		+ "teleporting straight into position rather than pathing there normally, since a sprinting "
-		+ "player already committed to moving fast is exactly the moment a sudden, silent reposition "
-		+ "reads as unsettling rather than redundant. If the chosen band itself can't actually be found "
-		+ "live (no valid dark spot there right now, or no torch nearby for band=torch), the engine "
-		+ "automatically substitutes the next-worse option instead of just doing nothing - you never "
-		+ "need to plan around that yourself, just pick whichever band actually fits the moment. "
-		+ "combat.teleport_in_view is this ability's mirror image - same instant, no-travel-time "
-		+ "relocation, but to a spot the player CAN currently see rather than one they're blind to, "
-		+ "meant for a deliberate reveal rather than an ambush. It has no source-band precondition (usable "
-		+ "regardless of the wendigo's own current position), and its own offered band(s) grow with "
-		+ "stage the same cumulative way (farthest at the earliest stage, each later stage adding one "
-		+ "more) - EXCEPT stage 1, which is a deliberate one-time exception offering every band at "
-		+ "once, not just farthest, precisely because that stage otherwise has almost nothing else to "
-		+ "vary (see its own text below). Pair it with an immediate posture.stare right after landing "
+		+ "below names the full current menu. No source-position precondition anymore, unlike the old "
+		+ "band system - it's pullable off from wherever the wendigo currently is, regardless of "
+		+ "type. Reach for it specifically when the player is currently sprinting - a sudden, silent "
+		+ "reposition reads as unsettling rather than redundant right as they've committed to moving "
+		+ "fast - ideally as the very FIRST step of the plan, teleporting straight into position "
+		+ "rather than pathing there normally. destination=behind/eyeline/above/in_view all require "
+		+ "landing somewhere completely unlit; destination=torch is the one exception (a light source "
+		+ "by definition), and destination=ahead deliberately lands somewhere dim instead. If the "
+		+ "chosen type can't actually be found live right now, this is a clean no-op and the plan just "
+		+ "continues (ahead is the one exception - it always resolves to SOME placement, falling back "
+		+ "to an ordinary in_view reveal if the player isn't moving or nothing dim turns up near the "
+		+ "prediction) - you never need to plan around that yourself. "
+		+ "destination=in_view is a deliberate reveal - a spot the player CAN currently see rather "
+		+ "than one they're blind to. Pair it with an immediate posture.stare right after landing "
 		+ "early on; later on, let that stare turn straight into combat.chase/combat.lunge_attack "
-		+ "instead of holding it. The engine also enforces a minimum here: a posture.stare(enabled=true) "
-		+ "session that starts immediately after a combat.teleport_in_view keeps holding for at least 3 "
-		+ "real seconds no matter what the rest of the plan/control.while says - the reveal needs actual "
-		+ "screen time to land, not an instant blink-and-gone. Nothing to plan around deliberately, just "
-		+ "don't be surprised if a short hold reads as longer than authored right after this specific "
-		+ "pairing. "
-		+ "combat.teleport_to_eyeline is a third, more unsettling sibling of these two - like "
-		+ "teleport_in_view it resolves the same instant it runs with no source-band precondition, but "
-		+ "the destination is BOTH dark AND genuinely inline with wherever the player is looking right "
-		+ "now, not just broadly in their field of view - something already sitting exactly where their "
-		+ "gaze already rests, barely visible, rather than an obvious in-view reveal. Same band "
-		+ "progression as teleport_in_view (grows with stage, stage 1 gets every band at once), same "
-		+ "pairing advice (an immediate posture.stare early on; later, straight into combat.chase/"
-		+ "combat.lunge_attack). Available at every stage, same as the other two. "
-		+ "combat.teleport_ahead is a different kind of teleport entirely - not a band around the "
+		+ "instead of holding it. The engine also enforces a minimum here: a posture.stare(enabled="
+		+ "true) session that starts immediately after a combat.teleport(destination=in_view) keeps "
+		+ "holding for at least 3 real seconds no matter what the rest of the plan/control.while says "
+		+ "- the reveal needs actual screen time to land, not an instant blink-and-gone. Nothing to "
+		+ "plan around deliberately, just don't be surprised if a short hold reads as longer than "
+		+ "authored right after this specific pairing. "
+		+ "destination=eyeline is a more unsettling sibling of in_view - dark AND genuinely inline "
+		+ "with wherever the player is looking right now, not just broadly in their field of view - "
+		+ "something already sitting exactly where their gaze already rests, barely visible, rather "
+		+ "than an obvious in-view reveal. Same pairing advice as in_view (an immediate posture.stare "
+		+ "early on; later, straight into combat.chase/combat.lunge_attack). "
+		+ "destination=ahead is a different kind of teleport entirely - not a spot around the "
 		+ "player's current position, but a guess at where they're actually going: if they're moving, "
 		+ "it predicts a point ahead along their live path and lands somewhere dim (faintly lit, not "
 		+ "pitch black - a player is more likely to actually walk near their own torches than through "
-		+ "genuine darkness, so this deliberately doesn't require full darkness like every other "
-		+ "teleport does) close to that predicted point, so it reads as already lying in wait along "
-		+ "their real route rather than reacting to where they currently stand. No band to choose - it "
-		+ "always resolves on its own. If the player isn't moving, or nothing dim turns up near the "
-		+ "prediction, it automatically falls back to an ordinary teleport_in_view instead, so there's "
-		+ "nothing to plan around if the prediction doesn't pan out. This one rewards patience more "
-		+ "than the others: land ahead of them, then either hold a stare and let a control.while on "
-		+ "predicate.player_approaching do the waiting (the distance closing on its own is the whole "
-		+ "point), or let the stare turn into combat.chase/combat.lunge_attack once they're actually "
-        + "close. Available at every stage.\n\n";
+		+ "genuine darkness) close to that predicted point, so it reads as already lying in wait along "
+		+ "their real route rather than reacting to where they currently stand. This one rewards "
+		+ "patience more than the others: land ahead of them, then either hold a stare and let a "
+		+ "control.while on predicate.player_approaching do the waiting (the distance closing on its "
+		+ "own is the whole point), or let the stare turn into combat.chase/combat.lunge_attack once "
+		+ "they're actually close. "
+		+ "movement.approach_spot works the same way but walks there instead of blinking - same "
+		+ "destination types minus torch, plus unwatched (the plain 'go somewhere they're not "
+		+ "looking' option, no other constraint), and reachability-verified before committing (a real "
+		+ "path, not just a geometric guess) since getting there matters for a walk in a way it never "
+		+ "does for an instant teleport.\n\n";
 
 	private static final String STAGE_UNDER_20 =
 		"CURRENT STAGE: under 20%, barely a presence. This is the very first, faintest phase of this "
@@ -286,44 +282,36 @@ public final class WendigoManager {
 		+ "into whatever reveal fits. The shape stays simple - a reveal, a hold until noticed or "
 		+ "approached, then a clean withdrawal - but nothing else about it is fixed, and this stage in "
 		+ "particular is worth actively varying wave to wave: hold duration, whether the reveal is the "
-		+ "ordinary stare-in-place, a combat.teleport_in_view glimpse-and-vanish, or the even more "
-		+ "unsettling combat.teleport_to_eyeline (every distance is available for both of those "
-		+ "specifically at this stage, not just the farthest one - reach across the whole range rather "
-		+ "than always picking the same distance), how long it "
-		+ "lingers before the STARE-HOLD ends. The prompt's own account of past encounters with this "
-		+ "player (see the generic note above) is exactly what should drive that variation - if the "
-		+ "last few waves all read the same, that's the signal to do something different this time, not "
-		+ "a reason to repeat what already worked mechanically. Ending: control.despawn (the instant, "
-		+ "in-place vanish) is the RECOMMENDED ending here, not a hard requirement - it fits this "
-		+ "stage's barely-a-presence feel best, so reach for it by default - but movement."
-		+ "retreat_with_fallback (a real, visible flight into the dark) is also offered as an "
-		+ "alternative if a genuine flee reads better for a particular wave, e.g. right after the "
-		+ "player closed in unexpectedly fast. Vary between the two rather than defaulting to the "
-		+ "same one every single time. sound.ambient_cue is now available at this stage too - lean on it, "
-		+ "especially sound.ambient_cue(stare) right when a held stare begins (see the generic "
-		+ "STARE-HOLD note above) - a faint noise is exactly the kind of small, unplaced unease this "
-		+ "stage is built around, more so than at any later stage where the wendigo has other, bolder "
-		+ "tools to lean on instead. sound.breathe is available here too (see the generic note above) - "
-		+ "since every distance band is offered for combat.teleport_in_view/combat.teleport_to_eyeline "
-		+ "specifically at this stage, reaching for band=close with one of those, then sound.breathe right "
-		+ "there before the withdrawal, is a good way to work a genuinely close, physically-there moment "
-		+ "into an otherwise distant, faint-presence stage. Still nothing else belongs in the plan: no torches, "
-		+ "no traps, no approaching the player, no chase, those primitives aren't even "
-		+ "offered here. combat.teleport_to_band(band=farthest) is the one exception worth knowing about "
-		+ "even so - only usable while the wendigo's own current distance is already in the close band "
-		+ "(see the generic note above), so it's really only relevant if the player closed in fast "
-		+ "enough to end up right next to it; a startled blink to maximum distance reads as more "
-		+ "in-character for this stage than a silent vanish would if that happens. Example shapes, pick "
-		+ "whichever fits the moment rather than defaulting to the first one every time: spawn unseen, "
-		+ "sound.ambient_cue(stare), stare until noticed or approached, control.despawn - OR "
-		+ "combat.teleport_in_view(band=medium), sound.ambient_cue(ambient), a brief posture.stare, "
-		+ "sound.ambient_cue(flee), movement.retreat_with_fallback.";
+		+ "ordinary stare-in-place, a combat.teleport(destination=in_view) glimpse-and-vanish, or the "
+		+ "even more unsettling destination=eyeline, how long it lingers before the STARE-HOLD ends. "
+		+ "The prompt's own account of past encounters with this player (see the generic note above) is "
+		+ "exactly what should drive that variation - if the last few waves all read the same, that's "
+		+ "the signal to do something different this time, not a reason to repeat what already worked "
+		+ "mechanically. Ending: control.despawn (the instant, in-place vanish) is the RECOMMENDED "
+		+ "ending here, not a hard requirement - it fits this stage's barely-a-presence feel best, so "
+		+ "reach for it by default - but movement.retreat_with_fallback (a real, visible flight into "
+		+ "the dark) is also offered as an alternative if a genuine flee reads better for a particular "
+		+ "wave, e.g. right after the player closed in unexpectedly fast. Vary between the two rather "
+		+ "than defaulting to the same one every single time. sound.ambient_cue is now available at "
+		+ "this stage too - lean on it, especially sound.ambient_cue(stare) right when a held stare "
+		+ "begins (see the generic STARE-HOLD note above) - a faint noise is exactly the kind of small, "
+		+ "unplaced unease this stage is built around, more so than at any later stage where the "
+		+ "wendigo has other, bolder tools to lean on instead. sound.breathe is NOT available yet at "
+		+ "this stage (unlocks next stage) - too concrete and physically-there a cue for how deniable "
+		+ "this very first phase is meant to stay. "
+		+ "Still nothing else belongs in the plan: no torches, no traps, no approaching the player, no "
+		+ "chase, no destination=above/behind for the teleport/approach actions - those aren't even "
+		+ "offered here. Example shapes, pick whichever fits the moment rather than defaulting to the "
+		+ "first one every time: spawn unseen, sound.ambient_cue(stare), stare until noticed or "
+		+ "approached, control.despawn - OR combat.teleport(destination=in_view), "
+		+ "sound.ambient_cue(ambient), a brief posture.stare, sound.ambient_cue(flee), "
+		+ "movement.retreat_with_fallback.";
 
 	private static final String STAGE_20_39 =
 		"CURRENT STAGE: 20-39%, curious. Enough has happened that outright caution is giving way to "
 		+ "curiosity - the wendigo is starting to test the edges of the player's space instead of just "
-		+ "appearing and vanishing, though only the farther/farthest bands are unlocked yet - genuine "
-		+ "closeness isn't earned until later stages, so this is about presence, not confrontation. "
+		+ "appearing and vanishing, though genuine closeness (combat.teleport(destination=behind)) "
+		+ "isn't earned until stage 5, so this is about presence, not confrontation. "
 		+ "combat.break_torch just unlocked this stage - no further threshold above this one, so use "
 		+ "it whenever the prompt's torch counts show something worth targeting, every wave that "
 		+ "offers the chance, not as an occasional flourish. sound.ambient_cue(ambient) can accompany the "
@@ -331,134 +319,139 @@ public final class WendigoManager {
 		+ "flight into darkness) is now available as an alternative ending to control.despawn (still "
 		+ "allowed below 20%, but redirected to a flee above it) - withdrawing into the dark reads "
 		+ "better than vanishing once it's been this bold, and sound.ambient_cue(flee) right "
-		+ "beforehand is heavily encouraged to announce the withdrawal. combat.teleport_to_band now "
-		+ "offers TWO destination values (farthest, still available, plus farther, newly unlocked this "
-		+ "stage - see the generic note above on why the menu grows rather than replaces), usable "
-		+ "from either of two source bands, close or medium. combat.teleport_in_view(band=farther) is "
-		+ "the reveal counterpart - blink into view at that range and stare, a good opener for this "
-		+ "stage's own curious-but-still-cautious feel: seen once, briefly, from real distance, then "
-		+ "business as usual. If the player ever closes in close enough on their own, sound.breathe right "
-		+ "then (see the generic note above) makes that moment land - get as close as possible first "
-		+ "rather than playing it from wherever it happens to already be. Example: approach to farther if "
-		+ "not already there, "
+		+ "beforehand is heavily encouraged to announce the withdrawal. movement.approach_spot's own "
+		+ "destination=behind unlocks this stage - a genuine walked approach to the player's blind "
+		+ "spot, well ahead of when the instant teleport version of the same idea becomes available "
+		+ "(stage 5) - a good opener for this stage's own curious-but-still-cautious feel: creep in "
+		+ "unseen, then decide what comes next once actually close, rather than either staying distant "
+		+ "or blinking straight into their blind spot. If the player ever closes in close enough on "
+		+ "their own, sound.breathe (which just unlocked this stage) right then makes that moment land - "
+		+ "get as close as possible first rather than playing it from wherever it happens to already "
+		+ "be. The example below is a starting point, not a script - vary the opener, whether it leans "
+		+ "on combat.break_torch or a plain reveal, how it withdraws, and let the prompt's own account "
+		+ "of past encounters with this player (see the generic note above) push toward doing something "
+		+ "different than however the last few waves went, not the same shape every time. Example: "
+		+ "movement.approach_spot(destination=behind), "
 		+ "combat.break_torch, sound.ambient_cue(flee), movement.retreat_with_fallback before despawning.";
 
 	private static final String STAGE_40_59 =
 		"CURRENT STAGE: 40-59%, prey-driven and starting to plan. The wendigo has stopped just "
 		+ "reacting to the player's presence and started treating them as something to be hunted "
-		+ "deliberately - this is the first stage where it sets real traps instead of just observing, "
-		+ "and where the far band unlocks (in addition to farther/farthest). "
+		+ "deliberately - this is the first stage where it sets real traps instead of just observing. "
 		+ "memory.store_dark_location is available for remembering a fallback retreat point before "
 		+ "committing to something riskier. A good trap shape (the AMBUSH WAIT pattern - see above): "
-		+ "movement.approach_band(far) to close in a bit, then control.while(predicate.player_distance "
-		+ "farther_than lunge_distance) - no posture.stare yet, stay dark and unnoticed - to wait for "
-		+ "them to close the rest of the gap on their own, THEN posture.stare(enabled=true) "
-		+ "(sound.ambient_cue(stare) heavily encouraged right here) immediately followed by "
-		+ "combat.lunge_attack once the wait ends, so the reveal and the strike land together instead "
-		+ "of staring the whole time it's still waiting - sound.breathe fits right in that same moment "
-		+ "too, right as they close the final stretch and before the lunge (see the generic note above). "
-		+ "combat.break_torch remains a strong opener "
-		+ "wherever the prompt's torch counts are high. combat.teleport_to_band adds far to its own "
-		+ "growing destination menu this stage (farthest and farther still available too), usable from "
-		+ "any of three source bands now - close, medium, or far. combat.teleport_in_view(band=far) is "
-		+ "the reveal counterpart - blink into view and stare, still just the reveal on its own at this "
-		+ "stage, not yet paired straight into a strike (that pairing starts once combat.lunge_attack/"
-		+ "combat.chase themselves unlock). Example: approach_band(far), "
+		+ "movement.approach_spot(destination=unwatched) to close in a bit, then control.while("
+		+ "predicate.player_distance farther_than lunge_distance) - no posture.stare yet, stay dark "
+		+ "and unnoticed - to wait for them to close the rest of the gap on their own, THEN "
+		+ "posture.stare(enabled=true) (sound.ambient_cue(stare) heavily encouraged right here) "
+		+ "immediately followed by combat.lunge_attack once the wait ends, so the reveal and the "
+		+ "strike land together instead of staring the whole time it's still waiting - sound.breathe "
+		+ "fits right in that same moment too, right as they close the final stretch and before the "
+		+ "lunge (see the generic note above). combat.break_torch remains a strong opener wherever the "
+		+ "prompt's torch counts are high. combat.teleport's own destination=torch unlocks this stage "
+		+ "- an instant relocation right to the nearest live torch, always follow it with something "
+		+ "(combat.break_torch, posture.stare, combat.lunge_attack once that's unlocked) rather than "
+		+ "leaving it as the whole beat on its own. The AMBUSH WAIT pattern above is the strongest "
+		+ "option when it fits, not the only one worth reaching for every wave - combat.break_torch "
+		+ "alone, a plain reveal-and-stare, or skipping the ambush entirely all read as legitimate "
+		+ "too, and the prompt's own account of past encounters with this player (see the generic note "
+		+ "above) should push toward variety wave to wave rather than reproducing the same shape every "
+		+ "time. Example: movement.approach_spot(destination=unwatched), "
 		+ "wait quietly via a lunge_distance while loop, then stare and lunge once they're close.";
 
 	private static final String STAGE_60_79 =
-		"CURRENT STAGE: 60-79%, openly aggressive. Subtlety is mostly gone - the wendigo commits now, "
-		+ "and the medium band unlocks this stage (in addition to far/farther/farthest) for closing "
-		+ "distance before committing. combat.lunge_attack (catching the player grabs them - see its "
-		+ "own description) is available, and sound.ambient_cue(chase) unlocks alongside it - pair the "
-		+ "two for the reveal (heavily encouraged right before the lunge) rather than always retreating "
-		+ "the moment the player closes in. combat.chase is not available yet - it's reserved for 80%+ "
-		+ "(see next stage), so a lunge is still the sole point of contact here. What does change within "
-		+ "this stage: how far from real darkness it's willing to commit to that lunge keeps widening as "
-		+ "severity climbs - tightest right at 60%, loosest approaching 80% - so leaning into a lunge from "
-		+ "a position that isn't perfectly safe to retreat from afterward reads as more in-character the "
-		+ "higher into this range you are, not something to always play cautiously. combat.lunge_attack "
-		+ "should almost always be preceded by a posture.stare, whether in the plan body or via a "
-		+ "global_rule - it's the payoff for being noticed while staring, not something to trigger with no "
-		+ "reveal moment first. A reliable way to guarantee the transition happens the instant it's "
-		+ "spotted, regardless of what step the plan was on: a global_rule with condition "
+		"CURRENT STAGE: 60-79%, openly aggressive. Subtlety is mostly gone - the wendigo commits now. "
+		+ "combat.lunge_attack (catching the player grabs them - see its own description) is available, "
+		+ "and sound.ambient_cue(chase) unlocks alongside it - pair the two for the reveal (heavily "
+		+ "encouraged right before the lunge) rather than always retreating the moment the player closes "
+		+ "in. combat.chase is not available yet - it's reserved for 80%+ (see next stage), so a lunge "
+		+ "is still the sole point of contact here. What does change within this stage: how far from "
+		+ "real darkness it's willing to commit to that lunge keeps widening as severity climbs - "
+		+ "tightest right at 60%, loosest approaching 80% - so leaning into a lunge from a position "
+		+ "that isn't perfectly safe to retreat from afterward reads as more in-character the higher "
+		+ "into this range you are, not something to always play cautiously. combat.lunge_attack should "
+		+ "almost always be preceded by a posture.stare, whether in the plan body or via a global_rule - "
+		+ "it's the payoff for being noticed while staring, not something to trigger with no reveal "
+		+ "moment first. A reliable way to guarantee the transition happens the instant it's spotted, "
+		+ "regardless of what step the plan was on: a global_rule with condition "
 		+ "predicate.player_looking_at_self at whichever band fits and action combat.lunge_attack. "
-		+ "Example: approach_band(medium), stalk while undetected, sound.ambient_cue(chase), combat.lunge_attack "
-		+ "once close, sound.ambient_cue(flee), movement.retreat_with_fallback afterward. "
-		+ "combat.teleport_to_band's destination menu grows by TWO this stage: band=medium, an ordinary "
-		+ "positioning teleport, and band=close, the same unwatched blind-spot flavor stage 5's own "
-		+ "behind_player uses, just from a slightly less point-blank range - both stack on top of "
-		+ "farthest/farther/far, still available too. The source side grows to match (close, medium, "
-		+ "far, or farther all now work). Both new destinations read as a real gap-closer now rather "
-		+ "than a purely defensive blink, worth opening the plan "
-		+ "with specifically when the player's sprinting, straight into posture.stare/sound.breathe/"
-		+ "combat.lunge_attack "
-		+ "from there instead of walking the distance normally; reach for close specifically when landing "
-		+ "unseen matters more than landing at an exact distance. combat.teleport_in_view(band=medium) "
-		+ "pairs the same way this stage's own posture.stare-then-lunge pattern already does - blink into "
-		+ "view, stare, then straight into combat.lunge_attack once spotted, either directly in the plan "
-		+ "body or via the same global_rule pattern described above. "
-		+ "movement.approach_band's 'spot_above' band and movement.drop also both unlock here - "
-		+ "three independent primitives, not one combined move, so they mix into whatever plan actually "
-		+ "fits: position at spot_above (directly on the ceiling above the player), movement.drop to let "
-		+ "go and fall, then combat.lunge_attack once close enough to finish the catch - an overhead "
-		+ "ambush the player won't see coming from a ground-level glance, worth reaching for specifically "
-		+ "when they haven't noticed a ceiling presence at all. movement.drop isn't reserved for that one "
-		+ "scripted setup, though - it's a safe no-op whenever the wendigo happens to already be on the "
-		+ "floor, so it can show up anywhere later in a plan too, wherever ordinary climbing has already "
-		+ "put it on a wall/ceiling: a posture.stare from wherever it currently is, then movement.drop, "
-		+ "then combat.lunge_attack reads just as naturally as the scripted spot_above version, without "
-		+ "needing to plan the overhead ambush deliberately from the start.";
+		+ "Example: movement.approach_spot(destination=unwatched), stalk while undetected, "
+		+ "sound.ambient_cue(chase), combat.lunge_attack once close, sound.ambient_cue(flee), "
+		+ "movement.retreat_with_fallback afterward. "
+		+ "destination=above unlocks this stage for both combat.teleport and movement.approach_spot, "
+		+ "alongside movement.drop - three independent primitives, not one combined move, so they mix "
+		+ "into whatever plan actually fits: position at destination=above (directly on the ceiling "
+		+ "above the player, walked via approach_spot or blinked via teleport), movement.drop to let go "
+		+ "and fall, then combat.lunge_attack once close enough to finish the catch - an overhead "
+		+ "ambush the player won't see coming from a ground-level glance, worth reaching for "
+		+ "specifically when they haven't noticed a ceiling presence at all. combat.teleport(destination"
+		+ "=above) specifically is worth opening the plan with when the player's sprinting, straight "
+		+ "into posture.stare/sound.breathe/combat.lunge_attack from there instead of climbing up "
+		+ "normally. movement.drop isn't reserved for that one scripted setup, though - it's a safe "
+		+ "no-op whenever the wendigo happens to already be on the floor, so it can show up anywhere "
+		+ "later in a plan too, wherever ordinary climbing has already put it on a wall/ceiling: a "
+		+ "posture.stare from wherever it currently is, then movement.drop, then combat.lunge_attack "
+		+ "reads just as naturally as the scripted destination=above version, without needing to plan "
+		+ "the overhead ambush deliberately from the start. The lunge pattern described above is the "
+		+ "strongest option when it fits, not a script to reproduce unchanged every wave - vary the "
+		+ "opener (a plain approach, a teleport, a torch break first), how long it stalks before "
+		+ "revealing itself, and how it closes afterward, using the prompt's own account of past "
+		+ "encounters with this player (see the generic note above) to avoid repeating the same shape "
+		+ "wave to wave.";
+
 
 	private static final String STAGE_80_PLUS =
 		"CURRENT STAGE: 80% and up, restless. The wendigo is done pretending to be subtle - it wants "
-		+ "direct contact and isn't holding back to get it, and every positioning band is unlocked now, "
-		+ "including close (and close_as_possible in a tight space). combat.chase unlocks here for the "
-		+ "first time (it wasn't available at all below 80%) - a sustained pursuit rather than lunge's "
-		+ "single commit, chasing the player down until it catches them (grabbing them, same as a lunge "
-		+ "does - see combat.lunge_attack) or genuinely can't reach them anymore, and always passively "
-		+ "destroys any torch within 10 blocks as it goes - a chase at this stage leaves real wreckage "
-		+ "behind it, every time, not just sometimes. Close the distance directly; combat.chase is the "
+		+ "direct contact and isn't holding back to get it. combat.chase unlocks here for the first "
+		+ "time (it wasn't available at all below 80%) - a sustained pursuit rather than lunge's single "
+		+ "commit, chasing the player down until it catches them (grabbing them, same as a lunge does - "
+		+ "see combat.lunge_attack) or genuinely can't reach them anymore, and always passively destroys "
+		+ "any torch within 10 blocks as it goes - a chase at this stage leaves real wreckage behind "
+		+ "it, every time, not just sometimes. Close the distance directly; combat.chase is the "
 		+ "expected move once seen, not a rare escalation, and retreating only makes sense after "
-		+ "catching them or being genuinely forced to. combat.chase should almost always be preceded by a "
-		+ "posture.stare, whether in the plan body or via a global_rule - it's the payoff for being "
-		+ "noticed while staring, not something to trigger with no reveal moment first. A reliable way to "
-		+ "guarantee the transition happens the instant it's spotted, regardless of what step the plan was "
-		+ "on: a global_rule with condition predicate.player_looking_at_self at whichever band fits and "
-		+ "action combat.chase. Example: approach_band(close), stalk and stare, a global_rule turns a spotted "
-		+ "stare straight into combat.chase, no explicit ending needed after it - the chase resolves on "
-		+ "its own once it can't reach the player anymore. combat.teleport_to_band reaches its own peak "
-		+ "here too: its destination menu gains THREE new options on top of everything unlocked so far "
-		+ "(farthest/farther/far/medium/close all still available) - band=behind_player, an instant "
-		+ "relocation right into the player's own blind spot, no travel time, no warning, nothing to path "
-		+ "around; band=above_player, a drop-in ceiling perch 10-30 blocks straight up from the player "
-		+ "(as close to directly overhead as a dark spot allows); and band=torch, an instant relocation "
-		+ "to the single nearest live torch, no side effect on the torch itself - it isn't destroyed and "
-		+ "this doesn't start a chase on its own, so ALWAYS follow it with something (combat.break_torch, "
-		+ "combat.lunge_attack, or straight into combat.chase - landing exposed at a torch and then just "
-		+ "standing there reads as a mistake, not a beat). The source side is at its own widest here too "
-		+ "- any of the 5 ordinary bands (close through farthest) now works, not just farthest. Use "
-		+ "behind_player when they've broken line of sight or are about to, right before a posture.stare "
-		+ "or combat.chase - the one tool in this creature's kit that closes distance without ever being "
-		+ "seen doing it. sound.breathe pairs especially well right after landing behind_player/above_player "
-		+ "or once spot_above+movement.drop has closed in - already as close as this stage ever gets, so "
-		+ "right before the stare/chase/lunge that follows is exactly the moment for it (see the generic "
-		+ "note above). Use above_player as an instant version of the ordinary spot_above+movement.drop "
-		+ "setup below - skip the climb there entirely and blink straight onto the ceiling, then "
-		+ "movement.drop into the same overhead ambush once positioned. Use torch specifically when the "
-		+ "prompt's own torch counts suggest a nearby target and a sudden, exposed appearance right at it "
-		+ "fits the moment better than staying hidden. combat.teleport_in_view(band="
-		+ "close) is this stage's own reveal option - blink into plain view right up close and let a "
-		+ "stare turn straight into combat.chase or combat.lunge_attack, the boldest version of the "
-		+ "reveal-then-strike pairing this ability offers at any stage. spot_above + "
-		+ "movement.drop (both unlocked since 60%, see that stage's own note) pair naturally with "
-		+ "combat.chase at this stage too, not just combat.lunge_attack - drop from directly overhead into "
-		+ "a sustained chase instead of a single lunge. And since movement.drop is a safe no-op whenever "
-		+ "it's already on the floor, it doesn't have to follow spot_above specifically here either - a "
-		+ "posture.stare wherever it's currently perched, then movement.drop, then combat.chase works just "
-		+ "as well mid-plan as the deliberate overhead-ambush version does.";
+		+ "catching them or being genuinely forced to. combat.chase should almost always be preceded by "
+		+ "a posture.stare, whether in the plan body or via a global_rule - it's the payoff for being "
+		+ "noticed while staring, not something to trigger with no reveal moment first. A reliable way "
+		+ "to guarantee the transition happens the instant it's spotted, regardless of what step the "
+		+ "plan was on: a global_rule with condition predicate.player_looking_at_self at whichever band "
+		+ "fits and action combat.chase. Example: movement.approach_spot(destination=unwatched), stalk "
+		+ "and stare, a global_rule turns a spotted stare straight into combat.chase, no explicit ending "
+		+ "needed after it - the chase resolves on its own once it can't reach the player anymore. "
+		+ "combat.teleport reaches its own peak here too: destination=behind unlocks, the single most "
+		+ "dramatic option this ability offers - an instant relocation right into the player's own "
+		+ "blind spot, no travel time, no warning, nothing to path around, could land on the floor, a "
+		+ "wall, or the ceiling behind them, whichever is actually there. Every other destination type "
+		+ "is still available too - above, torch, in_view, eyeline, ahead. Use behind when they've "
+		+ "broken line of sight or are about to, right before a posture.stare or combat.chase - the one "
+		+ "tool in this creature's kit that closes distance without ever being seen doing it. "
+		+ "sound.breathe pairs especially well right after landing destination=behind/above or once "
+		+ "movement.drop has closed in - already as close as this stage ever gets, so right before the "
+		+ "stare/chase/lunge that follows is exactly the moment for it (see the generic note above). "
+		+ "Use torch specifically when the prompt's own torch counts suggest a nearby target and a "
+		+ "sudden, exposed appearance right at it fits the moment better than staying hidden. "
+		+ "combat.teleport(destination=in_view) is this stage's own boldest reveal option - blink into "
+		+ "plain view and let a stare turn straight into combat.chase or combat.lunge_attack, the "
+		+ "boldest version of the reveal-then-strike pairing this ability offers at any stage. "
+		+ "destination=above + movement.drop (both unlocked since 60%, see that stage's own note) pair "
+		+ "naturally with combat.chase at this stage too, not just combat.lunge_attack - drop from "
+		+ "directly overhead into a sustained chase instead of a single lunge. And since movement.drop "
+		+ "is a safe no-op whenever it's already on the floor, it doesn't have to follow destination="
+		+ "above specifically here either - a posture.stare wherever it's currently perched, then "
+		+ "movement.drop, then combat.chase works just as well mid-plan as the deliberate overhead-"
+		+ "ambush version does. The chase pattern described above is the strongest option when it "
+		+ "fits, not a script to run unchanged every wave - vary the opener (a teleport straight to "
+		+ "destination=behind/above, a plain approach, a torch break first), how long it stalks before "
+		+ "revealing itself, and whether it ends in a lunge or a full chase, using the prompt's own "
+		+ "account of past encounters with this player (see the generic note above) to avoid repeating "
+		+ "the same shape wave to wave.";
 
-	private static String buildSystemPrompt(int severityPercent) {
+
+	// Package-private (not private) specifically so a same-package GameTest can build the exact
+	// same system prompt/context a real wave request would use, without duplicating this logic -
+	// see WendigoConvergenceTests, a standalone (not suite-registered) harness that calls these two
+	// plus SchemaBuilder.forSeverity and WendigoMod.llmClient.requestPlan directly to sample the
+	// model's real output across many scenarios.
+	static String buildSystemPrompt(int severityPercent) {
 		String stage = severityPercent < 20 ? STAGE_UNDER_20
 			: severityPercent < 40 ? STAGE_20_39
 			: severityPercent < 60 ? STAGE_40_59
@@ -471,6 +464,14 @@ public final class WendigoManager {
 	private final WendigoProgressionTracker progressionTracker;
 	private final EncounterHistory encounterHistory;
 	private final Map<ServerLevel, WaveState> waves = new java.util.HashMap<>();
+	// The user's own explicit "include context about... was mining something" request - there's no
+	// public "is this player mid-swing right now" signal on the server (ServerPlayerGameMode's own
+	// isDestroyingBlock/destroyPos tracking is private, no accessor), so this approximates it as
+	// "broke a block recently" instead (see MINING_RECENCY_TICKS/recentlyMined below) - close enough
+	// for a prompt hint, not a precise mechanical gate. Server tick count at the moment of the last
+	// real break, per player - never cleared, just superseded by a later break; recentlyMined reads it
+	// relative to "now" rather than needing its own expiry housekeeping.
+	private final Map<UUID, Integer> lastBlockBreakTick = new java.util.HashMap<>();
 
 	public WendigoManager(WendigoWaveConfig config, WendigoProgressionTracker progressionTracker, EncounterHistory encounterHistory) {
 		this.config = config;
@@ -487,7 +488,7 @@ public final class WendigoManager {
 		// letting a misconfigured value drift true.
 		double despawnDistance = orbitDespawnDistance();
 		for (CaveScale caveScale : CaveScale.values()) {
-			double maxOrbitDistance = orbitMaxDistance(caveScale);
+			double maxOrbitDistance = SemanticBands.orbitMaxDistance(caveScale);
 			if (maxOrbitDistance >= despawnDistance) {
 				throw new IllegalStateException("orbitMaxDistance(" + caveScale + ") = " + maxOrbitDistance
 					+ " must stay below orbitDespawnDistance (" + despawnDistance
@@ -527,6 +528,13 @@ public final class WendigoManager {
 			if (handler.player.getVehicle() instanceof WendigoEntity wendigo) {
 				wendigo.resolveRiderOnEnd();
 			}
+			// See endEngagementIfTarget's own doc comment - the same "don't linger on someone no longer
+			// meaningfully here" reasoning handleTargetDeath already established, extended to leaving
+			// the game entirely, not just dying. Run after resolveRiderOnEnd above (let an in-progress
+			// ride resolve properly first - by the time this runs, isForcingRide() correctly reads
+			// false either way, so this naturally still fires right afterward if there's nothing left
+			// to abruptly interrupt).
+			endEngagementIfTarget(handler.player, "disconnected");
 		});
 		// Defensive backstop for the same scenario, in case some disconnect path skips the DISCONNECT
 		// event above (a hard crash rather than a clean quit) - a stray reconnected-on-rejoin wendigo
@@ -537,10 +545,125 @@ public final class WendigoManager {
 				wendigo.resolveRiderOnEnd();
 				wendigo.discard();
 			}
+			// Defensive backstop for recentlyDied - if a player somehow rejoins without AFTER_RESPAWN
+			// ever having fired for them (dying then disconnecting from the death screen without ever
+			// clicking respawn, if that turns out not to auto-respawn them on rejoin the way ordinary
+			// vanilla behavior is expected to), this guarantees they can never get PERMANENTLY excluded
+			// from being a valid wendigo target just from an edge-case event ordering issue.
+			this.progressionTracker.markRespawned(handler.player.getUUID());
+		});
+		// See lastBlockBreakTick's own field comment - fires on the logical server for any real block
+		// break regardless of cause (survival mining, creative instant-break, a tool with efficiency,
+		// etc.), which is exactly "was mining something" in the broad sense the prompt context needs.
+		PlayerBlockBreakEvents.AFTER.register((level, player, pos, state, blockEntity) -> {
+			if (player instanceof ServerPlayer serverPlayer) {
+				this.lastBlockBreakTick.put(serverPlayer.getUUID(), serverPlayer.level().getServer().getTickCount());
+			}
+		});
+		// The user's own explicit death-handling request, plus a real underlying reference-staleness
+		// bug it surfaced: "after I died and came back... he kept on respawning and restarting a
+		// chase" - root cause, confirmed via decompile, PlayerList.respawn always hands back a
+		// genuinely NEW ServerPlayer instance (never the same object with health just reset), so
+		// state.lockedTarget (and WendigoEntity's own separate lockedTarget field - two independent
+		// references that both need to follow the same real player) silently went stale the instant
+		// anyone died and respawned, with nothing to ever refresh either one. Additionally drives the
+		// "hand off to the next eligible player, or disappear" behavior - see handleTargetDeath's own
+		// doc comment. Never vetoes death itself (always returns true). ServerLivingEntityEvents (not
+		// the player-specific ServerPlayerEvents.ALLOW_DEATH, deprecated in favor of exactly this) -
+		// confirmed via javap against the real fabric-entity-events-v1 jar.
+		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, amount) -> {
+			if (entity instanceof ServerPlayer player) {
+				handleTargetDeath(player);
+			}
+			return true;
+		});
+		ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
+			this.progressionTracker.markRespawned(oldPlayer.getUUID());
+			for (WaveState state : this.waves.values()) {
+				if (state.lockedTarget == oldPlayer) {
+					state.lockedTarget = newPlayer;
+				}
+				if (state.entity != null && state.entity.getLockedTarget() == oldPlayer) {
+					state.entity.setLockedTarget(newPlayer);
+				}
+			}
 		});
 	}
 
+	/**
+	 * ServerLivingEntityEvents.ALLOW_DEATH reaction - the user's own explicit request: "after a
+	 * target dies the wendigo should either pick the next player in the group to start a run on with
+	 * their stage or disappear if there's no one else in the group." markDied first (see its own
+	 * field comment for why - selectTarget needs this exclusion, since a dying player stays in
+	 * level.players() and stays nominally "resumable"/"under y=0" through the death screen, unlike a
+	 * disconnect), then the actual shared engagement-ending logic - see endEngagementIfTarget's own
+	 * doc comment for the rest.
+	 */
+	private void handleTargetDeath(ServerPlayer player) {
+		this.progressionTracker.markDied(player);
+		endEngagementIfTarget(player, "died");
+	}
+
+	/**
+	 * Shared by handleTargetDeath and the DISCONNECT handler right above - same "the wendigo shouldn't
+	 * keep lingering on someone who's no longer meaningfully here" reasoning applies to a player
+	 * leaving the game entirely, not just dying. Real, closely related gap this closes: the orbit-only
+	 * case (WendigoEntity.isOrbitTargetLost, checked every tick via tickOrbitingEntity) already
+	 * reacted to a disconnected target reasonably promptly on its own (Targeting.nearestPlayer simply
+	 * stops finding them, since a disconnected player isn't in level.players() at all) - but a MID-PLAN
+	 * wave had no equivalent: checkForcedWaveEnd's own target.getY()/distance checks read whatever
+	 * position the now-removed player entity was last at, which doesn't change on disconnect, so
+	 * neither check would ever fire - a disconnected mid-plan target could otherwise linger for the
+	 * full waveTimeoutTicks hard backstop (4 real minutes) before anything noticed at all. No
+	 * recentlyDied-style exclusion needed for THIS case specifically - a disconnected player is
+	 * already absent from level.players() entirely, so selectTarget can't re-pick them regardless.
+	 * <p>
+	 * A no-op for anyone who isn't the CURRENT wave's own locked target on their level (someone else
+	 * leaving, or a level with no active wave at all, changes nothing here) - and a no-op while a
+	 * forced ride is already in progress on them (see beginForcedRide/resolveRiderOnEnd's own
+	 * carry-to-despawn-point flow, called separately, right before this for the disconnect case - that
+	 * has its own resolution and shouldn't be abruptly short-circuited mid-carry).
+	 * <p>
+	 * Ends the current engagement outright (discard, clear entity/context/lockedTarget/stage) - same
+	 * shape as the "runJustEnded" branch in tickLevel, except the player's own ActiveRun in
+	 * WendigoProgressionTracker is deliberately left completely untouched (this isn't a completed or
+	 * abandoned run, just a paused one, same philosophy as the drowning/fire/lush-caves pauses
+	 * elsewhere in this class - it'll resume automatically, from wherever it left off, the next time
+	 * they're eligible - including simply reconnecting and going back into darkness). No cooldown set
+	 * here, so the very next tryEnterOrbit call - already running on its own short throttle - genuinely
+	 * finds the NEXT eligible player in the group if one exists, or comes up empty and stays
+	 * disappeared if not.
+	 */
+	private void endEngagementIfTarget(ServerPlayer player, String reason) {
+		WaveState state = this.waves.get(player.level());
+		if (state == null || state.lockedTarget != player || (state.entity != null && state.entity.isForcingRide())) {
+			return;
+		}
+		debugSay(player.level(), player.getGameProfile().name() + " " + reason
+			+ " - ending this engagement (hand off to another eligible group member, or disappear if none)");
+		if (state.entity != null && state.entity.isAlive()) {
+			saveStage5HealthIfApplicable(state);
+			state.entity.discard();
+		}
+		state.entity = null;
+		state.context = null;
+		state.lockedTarget = null;
+		state.stage = 0;
+	}
+
+	// How recently a real block break still counts as "was mining something" for prompt context
+	// purposes - long enough to span the gap between the actual swing and whenever a wave-start
+	// request happens to fire, short enough that it still reads as "just now" rather than some
+	// unrelated break minutes ago.
+	private static final int MINING_RECENCY_TICKS = 100; // 5s
+
+	private boolean recentlyMined(ServerPlayer player, int nowTick) {
+		Integer lastBreak = this.lastBlockBreakTick.get(player.getUUID());
+		return lastBreak != null && nowTick - lastBreak <= MINING_RECENCY_TICKS;
+	}
+
 	private void onEndServerTick(MinecraftServer server) {
+		tickSoulLightParticles(server);
 		for (ServerLevel level : server.getAllLevels()) {
 			// ServerTickEvents.END_SERVER_TICK fires every real server tick regardless of any single
 			// level's /tick freeze state - the server loop itself never stops, only level/entity
@@ -557,30 +680,41 @@ public final class WendigoManager {
 		}
 	}
 
+	// The user's own explicit reference command (revised once, to sit a little below eyeline): "/execute
+	// as @a at @s run particle minecraft:soul_fire_flame ~ ~0.5 ~4 0.25 0.4 0.25 0.01 10 normal", every
+	// 5 ticks - a real, always-on environmental effect (not gated on an active wendigo encounter at
+	// all - any player standing in a soul light's own safe zone gets it, engagement or not), so this
+	// lives in the same unconditional onEndServerTick every level already ticks through, not inside
+	// tickLevel's own per-wave logic.
+	private static final int SOUL_LIGHT_PARTICLE_INTERVAL_TICKS = 5;
+	private int soulLightParticleTickCounter;
+
+	private void tickSoulLightParticles(MinecraftServer server) {
+		this.soulLightParticleTickCounter++;
+		if (this.soulLightParticleTickCounter < SOUL_LIGHT_PARTICLE_INTERVAL_TICKS) {
+			return;
+		}
+		this.soulLightParticleTickCounter = 0;
+		for (ServerLevel level : server.getAllLevels()) {
+			if (!level.tickRateManager().runsNormally()) {
+				continue;
+			}
+			for (ServerPlayer player : level.players()) {
+				if (player.isSpectator() || !SoulLightScanner.isNearSoulLight(level, player.blockPosition())) {
+					continue;
+				}
+				// "~ ~0.5 ~4" (the command's own reference position) - a little below eyeline, not
+				// straight above the player's own feet anymore.
+				level.sendParticles(ParticleTypes.SOUL_FIRE_FLAME, player.getX(), player.getY() + 0.5, player.getZ(),
+					2, 0.25, 0.4, 0.25, 0.01);
+			}
+		}
+	}
+
 	// Point-blank, sustained a long time - real combat/close holds can legitimately last a while, so
 	// this tolerance is generous; it's a backstop against a genuinely stuck state, not a normal-play trigger.
-	private static final double EXTREME_PROXIMITY_DISTANCE = 2.0;
-	private static final int EXTREME_PROXIMITY_GIVEUP_TICKS = 400; // 20s sustained
-	// Kept in sync by hand with SemanticBands.orbitMinDistance/orbitMaxDistance (com.wendigo.plan,
-	// package-private there) - same tradeoff already accepted elsewhere in this codebase (see
-	// DarkSpotScanner's own DIM_LIGHT_MIN/MAX comment) rather than widening that class's visibility
-	// just for this.
-	private static double orbitMinDistance(CaveScale caveScale) {
-		return switch (caveScale) {
-			case TIGHT -> 8.0;
-			case MASSIVE -> 20.0;
-			default -> 12.0; // NORMAL
-		};
-	}
-
-	private static double orbitMaxDistance(CaveScale caveScale) {
-		return switch (caveScale) {
-			case TIGHT -> 14.0;
-			case MASSIVE -> 30.0;
-			default -> 20.0; // NORMAL
-		};
-	}
-
+	private static final double EXTREME_PROXIMITY_DISTANCE = 5.0;
+	private static final int EXTREME_PROXIMITY_GIVEUP_TICKS = 60; // 20s sustained
 	// Flat performance cap on how far an orbiting wendigo is allowed to be from its target before
 	// relocating straight back inside the orbit band instead of continuing to tick/pathfind toward it
 	// from very far away - see tickOrbitingEntity. Comfortably beyond MASSIVE's own 30-block max orbit
@@ -600,13 +734,40 @@ public final class WendigoManager {
 	// Throttles tryEnterOrbit's own dark-spot search while entity == null - see WaveState.nextRespawnSearchTick.
 	private static final int ORBIT_SPAWN_SEARCH_INTERVAL_TICKS = 20; // ~1s
 
+	/** The user's own explicit stage-5 request: the lower his health, the sooner the NEXT LLM plan
+	 * call is allowed to fire - a dying wendigo gets more desperate/aggressive instead of pacing
+	 * itself the same as a full-health one. Purely how long the gap BETWEEN calls is (this fires
+	 * once a wave has already fully ended - see its own call site in tickLevel, right where the
+	 * ordinary dynamicCooldownTicks value gets set - never while a plan is actively running, the
+	 * user's own explicit clarification), not a call frequency independent of the normal cooldown
+	 * system: still starts from the exact same config.dynamicCooldownTicks(severityPercent) baseline
+	 * every other stage already uses, just scaled down further for stage 5 specifically. Four flat
+	 * brackets, not a continuous scale - the user's own explicit "3/4 health -> normal, 1/2-3/4 ->
+	 * 3/4 interval, 1/4-1/2 -> 1/2 interval, 0-1/4 -> 1/4 interval" spec. No-ops (returns the plain
+	 * baseline unchanged) for every stage but 5, and if there's no live entity to read health from
+	 * (defensive only - state.entity is always non-null at this method's own real call site). */
+	private int stage5HealthScaledCooldownTicks(WaveState state, int severityPercent) {
+		int base = this.config.dynamicCooldownTicks(severityPercent);
+		if (state.stage != 5 || state.entity == null || state.entity.getMaxHealth() <= 0.0F) {
+			return base;
+		}
+		float healthFraction = state.entity.getHealth() / state.entity.getMaxHealth();
+		double multiplier;
+		if (healthFraction >= 0.75F) {
+			multiplier = 1.0;
+		} else if (healthFraction >= 0.5F) {
+			multiplier = 0.75;
+		} else if (healthFraction >= 0.25F) {
+			multiplier = 0.5;
+		} else {
+			multiplier = 0.25;
+		}
+		return (int) Math.round(base * multiplier);
+	}
+
 	private void tickLevel(ServerLevel level, WaveState state) {
 		int now = level.getServer().getTickCount();
 		updateStage5BossBar(state);
-		// Independent of everything else below (entity health, orbit/plan dispatch, forced-end
-		// discards) - a queued relight is just world block-state bookkeeping, not tied to whichever
-		// wendigo instance happens to be alive (or not) right now.
-		processPendingTorchRelights(level, state, now);
 		// Also independent of wave/entity state - applies to every player in the level, not just
 		// whoever this level's own single WaveState currently has locked, so it can't reuse
 		// state.lockedTarget/state.context the way most of this method does.
@@ -702,11 +863,6 @@ public final class WendigoManager {
 			String forcedEndReason = checkForcedWaveEnd(state, now);
 			if (!state.entity.isAlive() || state.entity.isWaveComplete() || forcedEndReason != null) {
 				int elapsedTicks = now - state.waveStartTick;
-				// Hand off whatever this wave snuffed into the relight queue right as it ends,
-				// regardless of how it ended (clean completion, forced end, or a debug/wavetest run) -
-				// see processPendingTorchRelights, which drains this a torch at a time now that the
-				// wave is over.
-				state.pendingTorchRelights.addAll(state.entity.consumeSnuffedTorches());
 				if (forcedEndReason != null) {
 					// A forced backstop discard used to eject a still-forced rider with no damage,
 					// unconditionally (see WendigoEntity.remove) - now resolved exactly like any other
@@ -721,6 +877,14 @@ public final class WendigoManager {
 					debugSay(level, "wave complete after " + elapsedTicks + " ticks at "
 						+ state.entity.blockPosition().toShortString() + " - returning to orbit - outcome: " + state.entity.getOutcome());
 				}
+				// Always-on (not debugSay/verbose-gated) - the user's own explicit "list what tasks have
+				// been completed per run in the debug, non-verbose mode" request, same "always show this"
+				// treatment plan structure/the AI's own recap already get, right below. Cave type
+				// (TIGHT/NORMAL/MASSIVE) is a later, separate always-on addition to the same line - the
+				// user's own explicit "tell me what type of cave I'm in" ask.
+				String caveScaleLabel = state.context != null ? state.context.caveScale().toString() : "unknown";
+				WendigoDebug.say(level, "tasks completed this run: " + state.entity.getOutcome().describeCompletedTasks()
+					+ " | cave type: " + caveScaleLabel);
 				// Debug-forced waves (wave/wavetest) never update real encounter history - a showcase
 				// or a debug-triggered test run shouldn't be told back to the model as if it were a
 				// real thing that happened to this player.
@@ -748,10 +912,13 @@ public final class WendigoManager {
 						// discard path (those never reach this branch of tickLevel at all - see
 						// tickOrbitingEntity's own discards, none of which fall through to here).
 						if (!state.entity.isAlive()) {
-							this.progressionTracker.endStage5Hunt(progressPlayer);
+							// Group-wide demotion to stage 2, not "no completedRuns change" - see
+							// endStage5Hunt's own doc comment for the redesign this is part of.
+							this.progressionTracker.endStage5Hunt(level, progressPlayer);
 							runJustEnded = true;
 							debugSay(level, progressPlayer.getGameProfile().name()
-								+ " killed the stage-5 wendigo - hunt over, eligibility timer restarting");
+								+ " killed the stage-5 wendigo - hunt over, group demoted to stage 2, "
+								+ "eligibility timer restarting");
 							// The user's own explicit "It lurks..." advancement chain - "killing a wendigo in
 							// stage 6" per their own wording, but stage 6 doesn't exist (WendigoProgressionTracker.
 							// stageFor caps at 5, "6+ -> stage 5 (permanent)") - granted here, the one real,
@@ -782,11 +949,26 @@ public final class WendigoManager {
 						if (outcome.successfulBreatheCount() > 0) {
 							this.progressionTracker.addBreatheProgress(progressPlayer, outcome.successfulBreatheCount());
 						}
+						// The soul-light progression redesign - see WendigoProgressionTracker
+						// .resolveRunOutcome's own doc comment. Fed regardless of whether isGoalMet is
+						// about to fire this exact tick - the tally needs to accumulate across every wave
+						// the run takes, not just the last one.
+						if (outcome.tasksNearSoulLight() > 0 || outcome.tasksNotNearSoulLight() > 0) {
+							this.progressionTracker.addSoulLightTally(progressPlayer,
+								outcome.tasksNearSoulLight(), outcome.tasksNotNearSoulLight());
+						}
 						if (this.progressionTracker.isGoalMet(progressPlayer)) {
-							this.progressionTracker.completeRun(progressPlayer);
+							boolean favorable = this.progressionTracker.resolveRunOutcome(level, progressPlayer);
 							runJustEnded = true;
 							debugSay(level, progressPlayer.getGameProfile().name() + " completed stage "
-								+ state.stage + "'s goal - run over, eligibility timer restarting");
+								+ state.stage + "'s goal - run "
+								+ (favorable ? "advancing" : "REGRESSING (spent too much time near soul light)")
+								+ " - eligibility timer restarting");
+							// The user's own explicit stage-completion advancement chain - a genuine forward
+							// advance only, not a soul-light regression (that isn't "completing" the stage).
+							if (favorable) {
+								WendigoAdvancements.grant(progressPlayer, WendigoAdvancements.stageComplete(state.stage));
+							}
 						}
 					}
 				}
@@ -797,7 +979,8 @@ public final class WendigoManager {
 				// exactly the condition someone testing would be standing in. That reads as "the
 				// despawned wendigo turned around and walked back", when it's really a second,
 				// unrelated wendigo from a genuine severity-triggered wave.
-				state.cooldownUntilTick = now + (state.debugForced ? this.config.debugCooldownTicks : this.config.dynamicCooldownTicks(severityPercent));
+				state.cooldownUntilTick = now + (state.debugForced ? this.config.debugCooldownTicks
+					: stage5HealthScaledCooldownTicks(state, severityPercent));
 				state.debugForced = false;
 				if (runJustEnded) {
 					// The run is genuinely, permanently over (completeRun/endStage5Hunt just fired) -
@@ -830,7 +1013,32 @@ public final class WendigoManager {
 					// point too - walk to a SECOND, distinct dark spot first (see startReturnToOrbit),
 					// only entering orbit once there (or once giving up trying).
 					ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
-					BlockPos returnSpot = findNearbyDarkSpot(level, state.entity.blockPosition(), target);
+					BlockPos selfPos = state.entity.blockPosition();
+					CaveScale returnCaveScale = CaveScaleScanner.classify(level, selfPos);
+					// A WALK, not a teleport (startReturnToOrbit calls the ordinary moveTo(x,y,z,speed)
+					// internally, no snap) - verify each candidate via a real path from the entity's own
+					// actual current position, same SemanticBands.isAcceptableOrbitPath judgment every
+					// other orbit-position search now uses, same bounded retry budget.
+					BlockPos returnSpot = null;
+					for (int attempt = 0; target != null && attempt < WendigoMod.tuningConfig.orbitReachRetryAttempts; attempt++) {
+						BlockPos candidate = findNearbyBandDarkSpot(level, target, returnCaveScale);
+						if (candidate == null) {
+							continue;
+						}
+						// distance=1, not 0 - see PlanRunner.findReachableOrbitPath's own comment: a raw
+						// BlockPos target (unlike pathToTarget's entity-target convention) needs
+						// distance=1 to reliably resolve canReach()=true for legitimately close
+						// candidates, confirmed live via a GameTest failure on a trivially-reachable
+						// same-room candidate.
+						Path path = state.entity.getNavigation().createPath(candidate, 1);
+						if (SemanticBands.isAcceptableOrbitPath(path, returnCaveScale)) {
+							returnSpot = candidate;
+							break;
+						}
+					}
+					if (returnSpot == null) {
+						returnSpot = findNearbyDarkSpotFallback(level, selfPos, target, returnCaveScale);
+					}
 					if (returnSpot != null) {
 						state.entity.startReturnToOrbit(returnSpot, target);
 					} else {
@@ -929,9 +1137,10 @@ public final class WendigoManager {
 		if (target == null || !target.isAlive()) {
 			return; // shouldn't happen (isOrbitTargetLost would have already caught it) - defensive only
 		}
-		if (isNearSoulLight(level, target.blockPosition())) {
-			return; // user's own explicit rule - still spawns/orbits near soul light, just can't engage
-		}
+		// Soul light no longer blocks engagement at all - the user's own explicit redesign: it's a
+		// "mask," not a wall. A plan runs exactly the same near soul light as anywhere else now; only
+		// whether each completed task counts FOR or AGAINST the run's own stage progression changes
+		// (see PlanRunner.recordSoulLightTally/WendigoProgressionTracker.resolveRunOutcome).
 		beginEngagement(level, state, target, this.progressionTracker.representativePercent(state.stage));
 	}
 
@@ -1041,7 +1250,7 @@ public final class WendigoManager {
 	 * user's own explicit request: while orbiting, the wendigo actively avoids standing somewhere too
 	 * lit (light above DarkSpotScanner.MAX_DARK_LIGHT, the same bar for every stage), REGARDLESS of
 	 * stage. The instant exposure starts, it tries to reposition to the nearest dark, unwatched spot
-	 * (findNearestUnwatchedDarkSpot) - and, unlike the original version of this, keeps retrying that
+	 * (findUnwatchedPosition3D) - and, unlike the original version of this, keeps retrying that
 	 * reposition every LIGHT_REPOSITION_RETRY_INTERVAL_TICKS for as long as it's still stuck in light,
 	 * not just once when exposure first began - the user's own explicit "he actively avoids being in
 	 * light... he should pathfind out of the light" request. Only STAGE 1 actually despawns over this -
@@ -1062,7 +1271,7 @@ public final class WendigoManager {
 	 * "dead-stared" are different exposure reasons worth their own independent grace windows, not a
 	 * combined one. This is a real guarantee, distinct from (and stronger than) whatever a currently-
 	 * running plan's own dead_stare reaction might already be doing (e.g. the model choosing
-	 * movement.retreat_with_fallback as its own stare-hold ending) - findNearestUnwatchedDarkSpot's own
+	 * movement.retreat_with_fallback as its own stare-hold ending) - findUnwatchedPosition3D's own
 	 * unwatched-spot bias already keeps the reposition attempt from walking somewhere still in view
 	 * anyway, so a genuinely sustained stare still ends in a real despawn either way once the grace
 	 * window runs out.
@@ -1121,7 +1330,9 @@ public final class WendigoManager {
 	 * of light/being seen, starting the instant exposure begins" (the user's own explicit requirement
 	 * for the light trigger, now shared by the dead-stare one too). */
 	private static void repositionAwayFromOrbitExposure(ServerLevel level, WendigoEntity entity, ServerPlayer target) {
-		BlockPos hideSpot = DarkSpotScanner.findNearestUnwatchedDarkSpot(level, target);
+		CaveScale caveScale = CaveScaleScanner.classify(level, target.blockPosition());
+		BlockPos hideSpot = DarkSpotScanner.findUnwatchedPosition3D(level, target,
+			SemanticBands.actionSearchMinDistance(caveScale), WendigoMod.tuningConfig.orbitDespawnDistance);
 		if (hideSpot != null) {
 			entity.getNavigation().moveTo(hideSpot.getX() + 0.5, hideSpot.getY(), hideSpot.getZ() + 0.5,
 				LIGHT_EXPOSURE_REPOSITION_SPEED_MULTIPLIER);
@@ -1149,41 +1360,6 @@ public final class WendigoManager {
 		state.orbitDeadStareTicks = 0;
 	}
 
-	// How close a queued torch can be to the wendigo's current position before relighting it is
-	// deferred - the user's own explicit "unless they are within light distance of the wendigo"
-	// request. Mirrors PlanRunner's own CHASE_TORCH_RADIUS (the "nearby the wendigo" scale that same
-	// torch already used to go dark in the first place), not a new arbitrary number.
-	private static final double TORCH_RELIGHT_MIN_DISTANCE = 10.0;
-	// The user's own explicit "one by one every 5 ticks" pacing.
-	private static final int TORCH_RELIGHT_INTERVAL_TICKS = 5;
-
-	/**
-	 * Drains state.pendingTorchRelights one torch at a time, paced by TORCH_RELIGHT_INTERVAL_TICKS -
-	 * the post-wave half of the user's own "keep track of the torches that have gone out, and then
-	 * after the plan we start re-enabling them back to their original torch type one by one every 5
-	 * ticks unless they are within light distance of the wendigo" request (the pre-wave/tracking half
-	 * is PlanRunner.snuffedTorches/consumeSnuffedTorches, handed off into this queue right as each wave
-	 * ends - see tickLevel's own wave-end handling). Only ever looks at the front of the queue: if it's
-	 * currently too close to the wendigo (still mid-encounter carryover, or the next wave already
-	 * started somewhere nearby), this cycle is skipped entirely rather than reordering past it - the
-	 * queue is small and the wendigo keeps moving, so a temporarily-blocked front torch resolves itself
-	 * naturally on a later pass instead of needing real skip-ahead bookkeeping. relightByWendigo itself
-	 * is a safe no-op if the torch was already broken/relit/replaced by a player in the meantime.
-	 */
-	private void processPendingTorchRelights(ServerLevel level, WaveState state, int now) {
-		BlockPos next = state.pendingTorchRelights.peek();
-		if (next == null || now < state.nextTorchRelightTick) {
-			return;
-		}
-		if (state.entity != null && state.entity.isAlive()
-				&& state.entity.blockPosition().distSqr(next) < TORCH_RELIGHT_MIN_DISTANCE * TORCH_RELIGHT_MIN_DISTANCE) {
-			return;
-		}
-		state.pendingTorchRelights.poll();
-		LightSourceScanner.relightByWendigo(level, next);
-		state.nextTorchRelightTick = now + TORCH_RELIGHT_INTERVAL_TICKS;
-	}
-
 	/** Relocates an alive entity (currently trapped mid-orbit, too far from its target, or a plan
 	 * that just force-ended via timeout/extreme-proximity) to a fresh dark spot back inside the
 	 * normal orbit band, via TELEPORT rather than a walked retreat - trapped/can't-move/too-far
@@ -1193,16 +1369,37 @@ public final class WendigoManager {
 	 * findLiveBandPosition call): a stuck-but-nearby entity and a genuinely-far-away one both want a
 	 * spot that's actually reachable and in-band relative to the PLAYER, and seeding from way out at
 	 * the entity's own far-away position (the too-far case specifically) risks the flood-fill never
-	 * making it back to the target's vicinity at all. Falls back to the entity's own position only
-	 * when there's no live target to seed from. Falls back further to a plain findDarkestAwayFrom
-	 * search if nothing in-band is flood-reachable, and to real discard (entering the no-entity
-	 * search state) if genuinely nothing dark is reachable at all - see the user's own "if it
-	 * genuinely cannot find a dark place, it despawns and keeps searching" rule. */
+	 * making it back to the target's vicinity at all. Tries up to orbitReachRetryAttempts fresh
+	 * candidates, each verified with a real pathfind (SemanticBands.isAcceptableOrbitPath) before
+	 * accepting one - the user's own explicit "if he can't reach the player in a spot he
+	 * spawns/teleports to, try again" request; previously this only tried once before committing
+	 * regardless. Falls back to findNearbyDarkSpotFallback (plain away-from-target darkest-spot
+	 * search, no reachability guarantee) only once that budget is exhausted, and to real discard
+	 * (entering the no-entity search state) if genuinely nothing dark is reachable at all - see the
+	 * user's own "if it genuinely cannot find a dark place, it despawns and keeps searching" rule. */
 	private void relocateOrDiscard(ServerLevel level, WaveState state, int now) {
 		WendigoEntity entity = state.entity;
 		ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
 		BlockPos seedPos = target != null ? target.blockPosition() : entity.blockPosition();
-		BlockPos spot = findNearbyDarkSpot(level, seedPos, target);
+		CaveScale caveScale = CaveScaleScanner.classify(level, seedPos);
+
+		BlockPos spot = null;
+		for (int attempt = 0; target != null && attempt < WendigoMod.tuningConfig.orbitReachRetryAttempts; attempt++) {
+			BlockPos candidate = findNearbyBandDarkSpot(level, target, caveScale);
+			if (candidate == null) {
+				continue;
+			}
+			entity.snapTo(candidate.getX() + 0.5, candidate.getY(), candidate.getZ() + 0.5, entity.getYRot(), 0f);
+			entity.syncPoseToSpawnPosition();
+			entity.nudgeTowardAttachedSurface(Direction.UP);
+			if (SemanticBands.isAcceptableOrbitPath(pathToTarget(entity, target), caveScale)) {
+				spot = candidate;
+				break;
+			}
+		}
+		if (spot == null) {
+			spot = findNearbyDarkSpotFallback(level, seedPos, target, caveScale);
+		}
 		if (spot == null) {
 			debugSay(level, "nowhere dark reachable to relocate to - discarding, will keep searching for a new spawn spot");
 			saveStage5HealthIfApplicable(state);
@@ -1214,18 +1411,6 @@ public final class WendigoManager {
 		entity.snapTo(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5, entity.getYRot(), 0f);
 		entity.syncPoseToSpawnPosition();
 		entity.nudgeTowardAttachedSurface(Direction.UP);
-		// See canReachTarget's own doc comment - one retry via a fresh search from the new position
-		// before accepting the spot anyway, same "some darkness beats none" philosophy as
-		// tryEnterOrbit's own identical check. No target to validate against (state.lockedTarget went
-		// invalid) means nothing to check reachability TO - skip entirely in that case.
-		if (target != null && !canReachTarget(entity, target)) {
-			BlockPos retry = findNearbyDarkSpot(level, entity.blockPosition(), target);
-			if (retry != null && !retry.equals(spot)) {
-				entity.snapTo(retry.getX() + 0.5, retry.getY(), retry.getZ() + 0.5, entity.getYRot(), 0f);
-				entity.syncPoseToSpawnPosition();
-				entity.nudgeTowardAttachedSurface(Direction.UP);
-			}
-		}
 		entity.startOrbit(target);
 	}
 
@@ -1297,56 +1482,74 @@ public final class WendigoManager {
 	}
 
 	/** Shared by relocateOrDiscard (teleport case) and the post-grab return-to-orbit case (walked
-	 * case, see the "ordinary completion" branch of tickLevel) - a dark spot within the orbit band of
-	 * target if target is still valid, falling back to a plain away-from-target search, or null if
-	 * genuinely nothing dark is reachable at all.
-	 * <p>
-	 * Two live-reported bugs fixed together here: (1) this used the old flood-based
-	 * findLiveBandPosition hardcoded to Direction.UP (floor only) - same systematic wall/ceiling
-	 * under-representation bug tickOrbit's own wander/waypoint picking already had fixed via
-	 * findLiveBandPosition3D + a random normal (see that method's own history), just never carried
-	 * over to this shared helper - a relocate (too far, trapped, or a forced backstop) never had a
-	 * real shot at landing anywhere but the ground. (2) relocating used the FULL orbit band up to
-	 * maxDistance - for the specific "too far from target" trigger, that could land the entity right
-	 * back out near the far edge of the band, close to orbitDespawnDistance()'s own threshold all
-	 * over again. The user's own explicit request: aim for medium distance instead of far - half the
-	 * band's own width, not the full min-max range. */
-	/** Real, live AWCAPI pathfind check - Path.canReach() (vanilla's own flag, set exactly when the
-	 * search genuinely reached the target rather than falling back to a best-effort nearest approach -
-	 * see PlanRunner.maybeDropForBetterPath's own doc comment for the full mechanism and how this
-	 * session's investigation confirmed it's the reliable signal) - not the flood-fill/ring-sample
-	 * heuristic DarkSpotScanner's own candidate searches already used to find this spot in the first
-	 * place. Those searches are explicitly documented as connectivity APPROXIMATIONS (see
-	 * findLiveBandPosition/findLiveBandPosition3D's own doc comments: "reachability true by
-	 * construction," "deliberately NOT flood-verified"), not a guarantee that matches AWCAPI's own
-	 * real climbing/pathing rules - the user's own explicit request, after this whole session's
-	 * ceiling-flip investigation already showed those two things CAN silently drift apart. Called right
-	 * after the entity is actually placed at the candidate spot (snapTo already ran), so this is a real
-	 * pathfind from where it genuinely is, no hypothetical-position trickery needed. onGround is forced
-	 * true for the duration - PathNavigation.createPath's own canUpdatePath() gate (confirmed via
-	 * decompile) requires it, and a freshly snapTo'd entity hasn't had a real physics tick yet to
-	 * resolve that naturally - restored immediately after, before the entity's own first real tick ever
-	 * observes it. */
-	private static boolean canReachTarget(WendigoEntity entity, ServerPlayer target) {
+	 * case, see the "ordinary completion" branch of tickLevel) - one band candidate near target, or
+	 * null if the sample missed. Split from the old findNearbyDarkSpot (which baked the unverified
+	 * findDarkestAwayFrom fallback in unconditionally) specifically so a bounded retry loop can call
+	 * just this half repeatedly, verifying each candidate with a real pathfind (see
+	 * SemanticBands.isAcceptableOrbitPath) before ever reaching for findNearbyDarkSpotFallback below -
+	 * the user's own explicit "if he can't reach the player in a spot he spawns/teleports to, try
+	 * again" request, previously only a single unverified attempt. Aims for medium distance (half the
+	 * band's own width, not the full min-max range) - the user's own explicit request, so a relocate
+	 * doesn't land right back out near the far edge of the band, close to orbitDespawnDistance()'s own
+	 * threshold all over again. */
+	private static BlockPos findNearbyBandDarkSpot(ServerLevel level, ServerPlayer target, CaveScale caveScale) {
+		if (target == null) {
+			return null;
+		}
+		double minDistance = SemanticBands.orbitMinDistance(caveScale);
+		double maxDistance = SemanticBands.orbitMaxDistance(caveScale);
+		double mediumDistance = minDistance + (maxDistance - minDistance) / 2.0;
+		return DarkSpotScanner.findLiveBandPosition3D(level, target.blockPosition(), minDistance, mediumDistance, randomOrbitSurfaceNormal());
+	}
+
+	/** The old findNearbyDarkSpot's own unverified last resort (plain away-from-target darkest-spot
+	 * search, no reachability guarantee at all) - now only reached once a bounded retry loop over
+	 * findNearbyBandDarkSpot above has already exhausted WendigoTuningConfig.orbitReachRetryAttempts
+	 * real, verified tries. Same "some darkness beats none" philosophy as before, just genuinely a
+	 * last resort now instead of the first (and only) thing tried. */
+	private static BlockPos findNearbyDarkSpotFallback(ServerLevel level, BlockPos selfPos, ServerPlayer target, CaveScale caveScale) {
+		double maxDistance = SemanticBands.orbitMaxDistance(caveScale);
+		return DarkSpotScanner.findDarkestAwayFrom(level, selfPos, maxDistance, target != null ? target.blockPosition() : null);
+	}
+	/** Real, live AWCAPI pathfind - not the flood-fill/ring-sample heuristic DarkSpotScanner's own
+	 * candidate searches already used to find this spot in the first place. Those searches are
+	 * explicitly documented as connectivity APPROXIMATIONS (see findLiveBandPosition/
+	 * findLiveBandPosition3D's own doc comments: "reachability true by construction," "deliberately
+	 * NOT flood-verified"), not a guarantee that matches AWCAPI's own real climbing/pathing rules - the
+	 * user's own explicit request, after this whole session's ceiling-flip investigation already
+	 * showed those two things CAN silently drift apart. Returns the raw Path (not just a boolean) so
+	 * callers can also judge it by node count, not just Path.canReach() - see
+	 * SemanticBands.isAcceptableOrbitPath, the shared judgment every orbit-position search now uses.
+	 * Called right after the entity is actually placed at the candidate spot (snapTo already ran), so
+	 * this is a real pathfind from where it genuinely is, no hypothetical-position trickery needed.
+	 * onGround is forced true for the duration - PathNavigation.createPath's own canUpdatePath() gate
+	 * (confirmed via decompile) requires it, and a freshly snapTo'd entity hasn't had a real physics
+	 * tick yet to resolve that naturally - restored immediately after, before the entity's own first
+	 * real tick ever observes it. */
+	private static Path pathToTarget(WendigoEntity entity, ServerPlayer target) {
 		boolean savedOnGround = entity.onGround();
 		entity.setOnGround(true);
 		Path path = entity.getNavigation().createPath(target, 0);
 		entity.setOnGround(savedOnGround);
-		return path != null && path.canReach();
+		return path;
 	}
 
-	private static BlockPos findNearbyDarkSpot(ServerLevel level, BlockPos selfPos, ServerPlayer target) {
-		CaveScale caveScale = CaveScaleScanner.classify(level, selfPos);
-		double minDistance = orbitMinDistance(caveScale);
-		double maxDistance = orbitMaxDistance(caveScale);
-		double mediumDistance = minDistance + (maxDistance - minDistance) / 2.0;
-		BlockPos spot = target != null
-			? DarkSpotScanner.findLiveBandPosition3D(level, target.blockPosition(), minDistance, mediumDistance, randomOrbitSurfaceNormal())
-			: null;
-		if (spot == null) {
-			spot = DarkSpotScanner.findDarkestAwayFrom(level, selfPos, maxDistance, target != null ? target.blockPosition() : null);
+	/** Keeps WaveState's own lockedTarget and the entity's separate WendigoEntity.lockedTarget field
+	 * (the one Targeting.nearestPlayer, and therefore every action's own target resolution - orbit,
+	 * chase, lunge, all of it - actually reads) in sync whenever the real target changes. The user's
+	 * own explicit "if there's a group with multiple players, changing targets randomly should also
+	 * change who the wendigo is orbiting around" request, confirmed as a genuinely broader gap while
+	 * tracing it: WendigoEntity.startOrbit already keeps these two in sync on its own (it calls
+	 * setLockedTarget directly), but overrideIntoChaseUntilLight/overrideIntoLunge/spawnWave's own
+	 * debug/ambush path all used to reassign state.lockedTarget directly without it, leaving
+	 * Targeting still pointed at whoever the entity was PREVIOUSLY locked onto (or nobody at all, for
+	 * a fresh spawn) regardless of what WendigoManager itself now considers the real target - not
+	 * just an orbit-specific bug, since Targeting.nearestPlayer backs action target resolution too. */
+	private static void setLockedTarget(WaveState state, ServerPlayer target) {
+		state.lockedTarget = target;
+		if (state.entity != null) {
+			state.entity.setLockedTarget(target);
 		}
-		return spot;
 	}
 
 	/** entity == null: spawn a fresh wendigo directly into orbit - no LLM call, no cooldown consumed
@@ -1363,12 +1566,27 @@ public final class WendigoManager {
 		state.nextRespawnSearchTick = now + ORBIT_SPAWN_SEARCH_INTERVAL_TICKS;
 
 		ServerPlayer target = state.lockedTarget != null && state.lockedTarget.isAlive() ? state.lockedTarget : null;
+		int stage;
 		if (target == null) {
 			WendigoProgressionTracker.TargetSelection selection = this.progressionTracker.selectTarget(level);
 			if (selection == null) {
 				return;
 			}
 			target = selection.target();
+			// Real bug found while fixing the group-stage derivation itself: selection.stage() used to
+			// be computed (see selectTarget's own fresh-branch doc comment) and then silently thrown
+			// away here in favor of independently re-deriving via stageOf(target) - the target's own
+			// individual stage, completely ignoring whichever group-based value selectTarget just
+			// worked out. That's WHY the "furthest-along group member" framing in this class's own
+			// buildContext doc comment was never actually true live - group consideration was dead code
+			// the whole time. Now genuinely wired through.
+			stage = selection.stage();
+		} else {
+			// Already had a locked target (a relocate/respawn retry, not a fresh selection) - state.stage
+			// already holds the correct value from whenever this run actually started; re-deriving via
+			// stageOf(target) here is equivalent (a stage can't change mid-run) and avoids needing to
+			// thread state.stage through as its own parameter.
+			stage = this.progressionTracker.stageOf(target);
 		}
 		// See isInLushCaves's own doc comment - a paused run (or a fresh target who happens to already
 		// be standing in lush caves) just doesn't spawn/resume here at all; the throttle above already
@@ -1376,7 +1594,6 @@ public final class WendigoManager {
 		if (isInLushCaves(level, target)) {
 			return;
 		}
-		int stage = this.progressionTracker.stageOf(target);
 		// Stage 5 no longer spawns unconditionally the instant it's eligible - the user's own
 		// explicit "make it a random chance" request, checked fresh on every attempt (not just once
 		// per hunt) so it stays unpredictable throughout, not just at the very first appearance. A
@@ -1388,25 +1605,14 @@ public final class WendigoManager {
 		// Spawn already inside the orbit band, not just "somewhere dark nearby" - a spawn that
 		// ignores the band (as a flat nearest-dark-spot search would) very often lands inside the
 		// too-close threshold, triggering an immediate despawn/chase the moment orbit's first tick
-		// runs. Falls back to a plain nearest-dark-spot search (within max band distance) if nothing
-		// flood-reachable in-band was found - some darkness beats none at all.
+		// runs. Tries up to orbitReachRetryAttempts fresh flood candidates, each verified with a real
+		// pathfind (SemanticBands.isAcceptableOrbitPath) before accepting one - the user's own
+		// explicit "if he can't reach the player in a spot he spawns/teleports to, try again" request;
+		// previously this only tried once (via a different, unverified fallback search) before
+		// committing regardless of whether even that fallback was actually reachable.
 		CaveScale caveScale = CaveScaleScanner.classify(level, target.blockPosition());
-		double maxDistance = orbitMaxDistance(caveScale);
-		BlockPos spawnPos = DarkSpotScanner.findLiveBandPosition(level, target.blockPosition(), target.blockPosition(),
-			orbitMinDistance(caveScale), maxDistance, Direction.UP);
-		if (spawnPos == null) {
-			spawnPos = DarkSpotScanner.findDarkest(level, target.blockPosition(), maxDistance);
-		}
-		if (spawnPos == null) {
-			return; // nothing dark near this target yet either - try again next throttled search
-		}
-		if (state.avoidSpawnPos != null && spawnPos.distSqr(state.avoidSpawnPos) < ORBIT_TOO_CLOSE_DISTANCE * ORBIT_TOO_CLOSE_DISTANCE) {
-			// Landed back on (or right next to) the exact spot a too-close discard just fired from -
-			// see checkOrbitTooClose's own comment. Skip this attempt rather than immediately
-			// re-triggering the same reaction the instant it settles in; the throttled retry above
-			// re-rolls the randomized flood search fresh next time.
-			return;
-		}
+		double minDistance = SemanticBands.orbitMinDistance(caveScale);
+		double maxDistance = SemanticBands.orbitMaxDistance(caveScale);
 
 		WendigoEntity wendigo = new WendigoEntity(ModEntities.WENDIGO, level);
 		if (stage == 5) {
@@ -1415,24 +1621,42 @@ public final class WendigoManager {
 			// to full; only actually killing it (see the wave-end handling in tickLevel) resets this.
 			wendigo.setHealth(this.progressionTracker.stage5HealthOf(target, wendigo.getMaxHealth()));
 		}
-		wendigo.snapTo(spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, 0f, 0f);
-		wendigo.syncPoseToSpawnPosition();
-		wendigo.nudgeTowardAttachedSurface(Direction.UP);
-		if (!canReachTarget(wendigo, target)) {
-			// One retry via a different search strategy (plain nearest-dark-spot, not the flood/band
-			// search that already produced spawnPos above) before accepting the spot anyway - see
-			// canReachTarget's own doc comment for why this check exists at all. Not an unbounded
-			// retry loop: if the fallback also fails (or finds nothing/the same spot), this still
-			// commits rather than leaving the player with no wendigo at all - "some darkness beats
-			// none," same philosophy every other fallback in this method already follows; a genuinely
-			// unreachable spot still gets caught and recovered from later via stuck/trapped detection.
-			BlockPos fallback = DarkSpotScanner.findDarkest(level, target.blockPosition(), maxDistance);
-			if (fallback != null && !fallback.equals(spawnPos)) {
-				wendigo.snapTo(fallback.getX() + 0.5, fallback.getY(), fallback.getZ() + 0.5, 0f, 0f);
-				wendigo.syncPoseToSpawnPosition();
-				wendigo.nudgeTowardAttachedSurface(Direction.UP);
-				spawnPos = fallback;
+
+		BlockPos spawnPos = null;
+		for (int attempt = 0; attempt < WendigoMod.tuningConfig.orbitReachRetryAttempts; attempt++) {
+			BlockPos candidate = DarkSpotScanner.findLiveBandPosition(level, target.blockPosition(), target.blockPosition(),
+				minDistance, maxDistance, Direction.UP);
+			if (candidate == null) {
+				continue;
 			}
+			if (state.avoidSpawnPos != null
+					&& candidate.distSqr(state.avoidSpawnPos) < ORBIT_TOO_CLOSE_DISTANCE * ORBIT_TOO_CLOSE_DISTANCE) {
+				// Landed back on (or right next to) the exact spot a too-close discard just fired from -
+				// see checkOrbitTooClose's own comment. Still counts against the retry budget - a bad
+				// neighborhood should exhaust it, not loop forever - but tries a fresh candidate rather
+				// than aborting this whole attempt immediately, unlike before.
+				continue;
+			}
+			wendigo.snapTo(candidate.getX() + 0.5, candidate.getY(), candidate.getZ() + 0.5, 0f, 0f);
+			wendigo.syncPoseToSpawnPosition();
+			wendigo.nudgeTowardAttachedSurface(Direction.UP);
+			if (SemanticBands.isAcceptableOrbitPath(pathToTarget(wendigo, target), caveScale)) {
+				spawnPos = candidate;
+				break;
+			}
+		}
+		if (spawnPos == null) {
+			// Bounded retry budget exhausted (or the flood found nothing in-band at all) - genuine last
+			// resort now, not the first thing tried: same "some darkness beats none" philosophy as
+			// before, via a different, unverified search strategy.
+			spawnPos = DarkSpotScanner.findDarkest(level, target.blockPosition(), maxDistance);
+			if (spawnPos == null || (state.avoidSpawnPos != null
+					&& spawnPos.distSqr(state.avoidSpawnPos) < ORBIT_TOO_CLOSE_DISTANCE * ORBIT_TOO_CLOSE_DISTANCE)) {
+				return; // nothing dark/usable near this target yet either - try again next throttled search
+			}
+			wendigo.snapTo(spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, 0f, 0f);
+			wendigo.syncPoseToSpawnPosition();
+			wendigo.nudgeTowardAttachedSurface(Direction.UP);
 		}
 		// Set here rather than left for a real plan's own startWave call - the orbit exposure
 		// reaction (see checkOrbitExposure) and the stage-1 despawn-effect scaling (see
@@ -1632,18 +1856,38 @@ public final class WendigoManager {
 	 * suppress the very first redirect out of some OTHER action (posture.stare, an AI-authored
 	 * combat.lunge_attack, plain orbiting, etc.) - isChasing() is false in all of those, so this only
 	 * ever blocks a chase from re-triggering itself.
+	 * <p>Also no-ops while isFleeingFromSpectralHit() OR isCurrentlyGlowing() - the user's own
+	 * explicit request: a forced flee from a landed spectral hit must run to completion before
+	 * anything else (this trigger included) can start a new plan on him, and while he's still
+	 * genuinely glowing afterward (PlanRunner.tickFleeWhileGlowing's own continuous flee - a longer,
+	 * separate window than the one-shot isFleeingFromSpectralHit lock, which only covers the initial
+	 * despawn/flee sequence, not however much longer the glow itself lasts) he keeps running instead
+	 * of being redirected into anything else either.
 	 */
 	public void overrideIntoChaseUntilLight(ServerLevel level, ServerPlayer target) {
 		WaveState state = this.waves.get(level);
 		if (state == null || state.entity == null || !state.entity.isAlive() || state.entity.isForcingRide()
-				|| state.entity.isChasing()) {
+				|| state.entity.isChasing() || state.entity.isFleeingFromSpectralHit() || state.entity.isCurrentlyGlowing()) {
 			return;
 		}
+		// Real, live-reported bug: this used to hardcode 100 here regardless of the player's actual
+		// stage - bypassTierGating=true is correct (internal.chase_until_light isn't a model-schema
+		// action, nothing to gate), but severityPercent ALSO drives PlanRunner.rideFairChanceTicks/
+		// rideEscapeThreshold once a grab actually lands mid-chase, so hardcoding 100 there silently
+		// clamped every catch reached via this path (this trigger fires on its own, independent of
+		// what the model's plan was doing) to stage 5's own shortest carry time - the user's own
+		// "seems to be a flat rate now" report, since this override (and overrideIntoLunge's matching
+		// bug right below) is a very common real path to a catch, not a rare edge case.
+		int severityPercent = this.progressionTracker.percentOf(target);
 		WaveContext context = state.context != null ? state.context
-			: buildContext(level, target, this.progressionTracker.percentOf(target), state.entity);
-		state.entity.startWave(buildChaseUntilLightOverridePlan(), 100, true);
+			: buildContext(level, target, severityPercent, state.entity);
+		// startWaveOverride, not startWave - the user's own explicit "hardcoded, circumstance-triggered
+		// plans shouldn't affect the current run's tasks" request (see PlanRunner.startOverride's own
+		// doc comment for the real bug an ordinary startWave here caused: this wave's own already-
+		// earned task progress was silently wiped every time this trigger fired).
+		state.entity.startWaveOverride(buildChaseUntilLightOverridePlan(), severityPercent);
 		state.context = context;
-		state.lockedTarget = target;
+		setLockedTarget(state, target);
 		state.stage = this.progressionTracker.stageOf(target);
 		state.waveStartTick = level.getServer().getTickCount();
 		state.extremeProximityTicks = 0;
@@ -1658,14 +1902,20 @@ public final class WendigoManager {
 	 * in darkness too long"; "got too close" is a different, more bounded provocation). */
 	private void overrideIntoLunge(ServerLevel level, ServerPlayer target) {
 		WaveState state = this.waves.get(level);
-		if (state == null || state.entity == null || !state.entity.isAlive() || state.entity.isForcingRide()) {
+		if (state == null || state.entity == null || !state.entity.isAlive() || state.entity.isForcingRide()
+				|| state.entity.isFleeingFromSpectralHit() || state.entity.isCurrentlyGlowing()) {
 			return;
 		}
+		// See overrideIntoChaseUntilLight's own comment - same real bug, same fix: hardcoding 100 here
+		// silently clamped every grab reached via this path to stage 5's own shortest carry time
+		// regardless of the player's real stage.
+		int severityPercent = this.progressionTracker.percentOf(target);
 		WaveContext context = state.context != null ? state.context
-			: buildContext(level, target, this.progressionTracker.percentOf(target), state.entity);
-		state.entity.startWave(buildTooCloseLungePlan(), 100, true);
+			: buildContext(level, target, severityPercent, state.entity);
+		// startWaveOverride, not startWave - see overrideIntoChaseUntilLight's own matching comment.
+		state.entity.startWaveOverride(buildTooCloseLungePlan(), severityPercent);
 		state.context = context;
-		state.lockedTarget = target;
+		setLockedTarget(state, target);
 		state.stage = this.progressionTracker.stageOf(target);
 		state.waveStartTick = level.getServer().getTickCount();
 		state.extremeProximityTicks = 0;
@@ -1769,8 +2019,13 @@ public final class WendigoManager {
 
 	private void checkUnconditionalGrab(ServerLevel level, WaveState state, int now) {
 		WendigoEntity entity = state.entity;
-		if (entity.isForcingRide() || entity.isReturningToOrbit()) {
-			return; // already caught, or already mid-transit somewhere - let that resolve first
+		if (entity.isForcingRide() || entity.isReturningToOrbit() || entity.isFleeingFromSpectralHit()
+				|| entity.isCurrentlyGlowing()) {
+			// Already caught, already mid-transit somewhere, fleeing a landed spectral hit, or still
+			// genuinely glowing from one (PlanRunner.tickFleeWhileGlowing's own continuous flee) - the
+			// user's own explicit request: he keeps running from a hit, an unconditional grab included,
+			// until he's no longer glowing. Let it resolve first.
+			return;
 		}
 		if (entity.consumeRideJustEnded()) {
 			state.grabGraceActive = true;
@@ -1800,19 +2055,6 @@ public final class WendigoManager {
 		WaveContext context = state.context != null ? state.context
 			: buildContext(level, target, this.progressionTracker.representativePercent(state.stage), entity);
 		entity.forceGrabNow(target);
-		if (entity.consumeSpearRepelJustHappened()) {
-			// A repel, not a real grab - forceGrabNow never starts a ride here, so nothing else would
-			// otherwise stop this method calling forceGrabNow again next tick and repelling a second
-			// time (the reported "spear sound spammed" bug: a player holding a charged spear aimed at
-			// the wendigo inside grab_distance got re-repelled every tick they kept holding it). Arm
-			// the exact same grace/cooldown a real grab's own release does (see consumeRideJustEnded's
-			// own call site above) so a repel buys the same breathing room a completed grab-and-drop
-			// already gets.
-			state.grabGraceActive = true;
-			state.grabCooldownUntilTick = now + GRAB_RELEASE_COOLDOWN_TICKS;
-			debugSay(level, "target within grab range but repelled it with a spear - backing off");
-			return;
-		}
 		state.context = context;
 		state.waveStartTick = now;
 		state.extremeProximityTicks = 0;
@@ -1864,9 +2106,16 @@ public final class WendigoManager {
 				// requestPending/entity without any way to actually cancel the in-flight LLM call, so a
 				// reset (or another wave spawned in the meantime some other way) followed by this request
 				// finally resolving can otherwise leave two live wendigos: this one, plus whatever already
-				// took state.entity. Only the request that's still first to land gets to spawn.
-				if (state.entity != null && state.entity.isAlive()) {
-					WendigoMod.LOGGER.warn("Discarding a stale wendigo plan - a wave was already active by the time it resolved: {}", plan);
+				// took state.entity. Only the request that's still first to land gets to spawn. Also
+				// discarded if the target died while this request was in flight (see
+				// WendigoProgressionTracker.isRecentlyDied's own doc comment for why this checks the
+				// specific target rather than comparing against state.lockedTarget - the latter would
+				// misfire on a legitimate /wendigo wave debug redirect onto a different player) - real
+				// bug this fixes: without it, a pending plan request completing after its own target
+				// already died would spawn a wendigo onto them anyway, exactly the "kept on respawning"
+				// symptom the user reported.
+				if ((state.entity != null && state.entity.isAlive()) || this.progressionTracker.isRecentlyDied(target)) {
+					WendigoMod.LOGGER.warn("Discarding a stale wendigo plan - a wave was already active, or the target died, by the time it resolved: {}", plan);
 					return;
 				}
 				spawnWave(level, state, context, plan, false);
@@ -1897,8 +2146,13 @@ public final class WendigoManager {
 				// Same staleness guard beginWave's own completion handler has, just checking
 				// alive-and-still-orbiting instead of entirely-absent - the entity could have died,
 				// gotten relocated, or already been engaged by something else while this was in flight.
-				if (state.entity == null || !state.entity.isAlive() || !state.entity.isOrbiting()) {
-					WendigoMod.LOGGER.warn("Discarding a stale wendigo engagement plan - no longer a valid orbiting entity: {}", plan);
+				// Also discarded if the specific target this request was FOR has since died - see
+				// beginWave's own matching comment for the full reasoning (isRecentlyDied, not a
+				// state.lockedTarget identity comparison, specifically to not misfire on a legitimate
+				// /wendigo wave debug redirect onto a different player).
+				if (state.entity == null || !state.entity.isAlive() || !state.entity.isOrbiting()
+						|| this.progressionTracker.isRecentlyDied(target)) {
+					WendigoMod.LOGGER.warn("Discarding a stale wendigo engagement plan - no longer a valid orbiting entity, or the target died: {}", plan);
 					return;
 				}
 				engageExistingWendigo(level, state, context, plan, false);
@@ -1935,7 +2189,7 @@ public final class WendigoManager {
 			stepLog.append(steps.get(i));
 		}
 		stepLog.append(". Everything from here needs a fresh 'plan' (and, if it should change,"
-			+ " 'despawn_band'/'global_rules') to replace what was left of the original.");
+			+ " 'global_rules') to replace what was left of the original.");
 
 		state.requestPending = true;
 		MinecraftServer server = level.getServer();
@@ -1962,7 +2216,7 @@ public final class WendigoManager {
 	 * counterpart to spawnWave (which constructs a brand new one, positioned via resolveUnwatchedSpot
 	 * since there's nothing to walk FROM yet). This entity already exists somewhere else in the cave
 	 * (wherever orbit left it) - repositioning, if the plan's own first step even calls for any, is
-	 * just an ordinary live movement.approach_band resolved once the plan actually starts running, not
+	 * just an ordinary live movement.approach_spot resolved once the plan actually starts running, not
 	 * a separate pre-plan walk this method has to orchestrate. */
 	private void engageExistingWendigo(ServerLevel level, WaveState state, WaveContext context, JsonObject plan, boolean bypassTierGating) {
 		int percent = context.severityCap() > 0 ? 100 * context.severity() / context.severityCap() : 0;
@@ -1987,18 +2241,22 @@ public final class WendigoManager {
 
 	/**
 	 * effectiveSeverity is what actually drives tier/schema/prompt for this encounter - usually just
-	 * target's own stage-derived percent, but for an automatically-selected multiplayer target it's
-	 * the whole proximity group's furthest-along member's stage (see
-	 * WendigoProgressionTracker.selectTarget) - the wendigo shows up at the full intensity that
-	 * group's most-established member has earned, even if the player it actually grabs happens to
-	 * have fewer completed runs of their own. engagingEntity is the
+	 * target's own stage-derived percent, but for an automatically-selected fresh multiplayer target
+	 * it's the whole proximity group's LEAST-established member's stage (see
+	 * WendigoProgressionTracker.selectTarget's own fresh-branch doc comment for why this is min, not
+	 * max/average) - the wendigo shows up at the intensity the group's newest member has actually
+	 * earned, protecting them from a full-intensity haunting a more-established groupmate standing
+	 * nearby hasn't earned on their behalf, even if the player it actually grabs happens to have more
+	 * completed runs of their own. engagingEntity is the
 	 * already-alive entity being engaged, or null for a fresh spawn - only affects whether the
 	 * resulting context carries current-position info for the prompt (see WaveContext.CurrentPosition).
 	 * Never fails/returns null - a live torch-count scan can legitimately come back all zeros, that's
 	 * not a failure, just a fact resolveSpawnSpot's own live resolution deals with when it actually
 	 * tries to find a position.
+	 * Package-private (not private) for the same reason as buildSystemPrompt above - reused directly
+	 * by WendigoConvergenceTests.
 	 */
-	private WaveContext buildContext(ServerLevel level, ServerPlayer target, int effectiveSeverity, WendigoEntity engagingEntity) {
+	WaveContext buildContext(ServerLevel level, ServerPlayer target, int effectiveSeverity, WendigoEntity engagingEntity) {
 		BlockPos playerPos = target.blockPosition();
 		Map<String, Integer> torchCountsByBand = new LinkedHashMap<>();
 		for (String band : WaveContext.BAND_LABELS) {
@@ -2030,13 +2288,23 @@ public final class WendigoManager {
 				isPlayerLookingAtSelf, engagingEntity.playerDirection());
 		}
 		CaveScale caveScale = CaveScaleScanner.classify(level, playerPos);
+		// containerMenu is always at least inventoryMenu (the player's own plain inventory screen,
+		// which every player technically "has" open at all times whether or not a real screen is
+		// visible) - only a genuine mismatch means some OTHER UI (chest, furnace, minecart chest,
+		// crafting table, anvil, etc.) is actually open right now. The registry id (e.g.
+		// "minecraft:generic_9x3" for a single chest/barrel/minecart chest alike, "minecraft:furnace")
+		// is model-legible enough on its own - no need to hand-map it to a friendlier name.
+		String openMenuId = target.containerMenu != target.inventoryMenu
+			? BuiltInRegistries.MENU.getKey(target.containerMenu.getType()).toString()
+			: null;
+		boolean recentlyMining = recentlyMined(target, level.getServer().getTickCount());
 		// Always 100 now - effectiveSeverity is already a fixed representative percent per stage (see
 		// WendigoProgressionTracker.representativePercent), not a cumulative score with a real cap to
 		// report anymore. Keeping the severity/severityCap field shape in WaveContext unchanged (rather
 		// than replacing it with a bare percent) means every existing "100 * context.severity() /
 		// context.severityCap()" call site elsewhere in this class keeps working unchanged too.
 		return new WaveContext(target, effectiveSeverity, 100, torchCountsByBand, currentPosition,
-			this.encounterHistory.all(target), level.getServer().getTickCount(), caveScale);
+			this.encounterHistory.all(target), level.getServer().getTickCount(), caveScale, openMenuId, recentlyMining);
 	}
 
 	private void spawnWave(ServerLevel level, WaveState state, WaveContext context, JsonObject plan, boolean bypassTierGating) {
@@ -2045,8 +2313,9 @@ public final class WendigoManager {
 			// Hard, unconditional block - checked here rather than folded into severity/eligibility
 			// gating (which debug paths like /wendigo wave/wavetest deliberately bypass for testing
 			// convenience) specifically so nothing can skip it: never above y=0 no matter how dark the
-			// area reads, and never onto a player with real night vision. Soul light no longer blocks
-			// spawning at all - see isNearSoulLight, checked instead at engagement time.
+			// area reads, and never onto a player with real night vision. Soul light was never checked
+			// here (see SoulLightScanner) - it never blocked spawning, and no longer blocks engagement
+			// either; it now only affects run progression (see resolveRunOutcome).
 			WendigoMod.LOGGER.info("Wendigo spawn blocked for {} (above y=0 or night vision) - skipping",
 				context.player().getGameProfile().name());
 			state.cooldownUntilTick = level.getServer().getTickCount() + this.config.dynamicCooldownTicks(percent);
@@ -2054,7 +2323,7 @@ public final class WendigoManager {
 		}
 		// Every genuinely fresh spawn appears unwatched, regardless of stage or bypassTierGating - the
 		// model (or a wavetest author) no longer picks a spawn position at all (see the schema's own
-		// removal of spawn_at); the plan just starts from here, and movement.approach_band as its own
+		// removal of spawn_at); the plan just starts from here, and movement.approach_spot as its own
 		// first step covers whatever bolder positioning is actually wanted (unrestricted for
 		// bypassTierGating content, same as every other tier-gated primitive).
 		BlockPos spawnPos = resolveUnwatchedSpot(level, context);
@@ -2092,8 +2361,11 @@ public final class WendigoManager {
 		// Keeps every spawnWave-constructed entity (debug/ambush paths - the automatic trigger now
 		// spawns via tryEnterOrbit instead) consistent with the locked-target model too, so if this
 		// entity's plan later completes normally, resuming orbit afterward has a real target to lock
-		// onto instead of null.
-		state.lockedTarget = context.player();
+		// onto instead of null. setLockedTarget (not a plain field assignment) so the entity's own
+		// separate WendigoEntity.lockedTarget field - the one Targeting.nearestPlayer actually reads,
+		// for THIS wave's own actions too, not just a later orbit - is correct from the start rather
+		// than defaulting to null until some later startOrbit call happens to fix it.
+		setLockedTarget(state, context.player());
 		state.waveStartTick = level.getServer().getTickCount();
 		state.extremeProximityTicks = 0;
 		debugSay(level, "wave started - spawned at " + spawnPos.toShortString()
@@ -2122,14 +2394,13 @@ public final class WendigoManager {
 	/** Hard, unconditional spawn eligibility - see spawnWave's own call site comment for why this is
 	 * checked directly rather than folded into the existing severity/eligibility gating (which debug
 	 * paths bypass on purpose). Never above y=0 regardless of darkness; never onto a player with real
-	 * night vision. Proximity to a soul light source (see isNearSoulLight) does NOT block spawning at
-	 * all anymore - the wendigo still spawns and orbits near soul light, it's just gated out of
-	 * engagement (see tickOrbitingEntity's own call to isNearSoulLight, right before beginEngagement)
-	 * so it can't actually run a plan on a player standing in it. The night-vision half is skipped for
-	 * a player with /wendigo debug enabled specifically - WendigoCommands.toggleDebug applies real
-	 * Night Vision for the whole debug session (so a tester can actually see what's happening), which
-	 * would otherwise permanently block their own testing under this exact rule. y=0 still applies
-	 * even while debugging - that isn't something debug mode itself causes. */
+	 * night vision. Soul light (see SoulLightScanner) was never checked here and still isn't - it
+	 * affects run progression only now (see resolveRunOutcome), not spawning or engagement at all. The
+	 * night-vision half is skipped for a player with /wendigo debug enabled specifically -
+	 * WendigoCommands.toggleDebug applies real Night Vision for the whole debug session (so a tester
+	 * can actually see what's happening), which would otherwise permanently block their own testing
+	 * under this exact rule. y=0 still applies even while debugging - that isn't something debug mode
+	 * itself causes. */
 	private static boolean canSpawnNear(ServerPlayer player) {
 		boolean blockedByNightVision = player.hasEffect(MobEffects.NIGHT_VISION) && !WendigoDebug.isEnabled(player);
 		return player.getY() < 0 && !blockedByNightVision;
@@ -2142,52 +2413,7 @@ public final class WendigoManager {
 		return level.getBiome(player.blockPosition()).is(Biomes.LUSH_CAVES);
 	}
 
-	// The user's own explicit per-block-type radii, replacing the old single flat
-	// SOUL_LIGHT_SUPPRESSION_RADIUS shared by every soul-fire-family block alike - a campfire's own
-	// glow genuinely reaches much farther than a single torch's, so the "safe zone" should scale with
-	// the source, not treat a torch and a campfire as equally protective.
-	private static final double SOUL_TORCH_RADIUS = 10.0;
-	private static final double SOUL_LANTERN_RADIUS = 20.0;
-	private static final double SOUL_CAMPFIRE_RADIUS = 30.0;
-	// The largest of the three above - governs how far out isNearSoulLight's own scan has to search at
-	// all (each candidate block is then checked against its OWN specific radius, not this one).
-	private static final double SOUL_LIGHT_MAX_RADIUS = SOUL_CAMPFIRE_RADIUS;
-
-	/** This block's own soul-light "safe zone" radius, or 0.0 if it isn't a soul-fire-family light
-	 * source at all - soul wall torches and bare soul fire share the plain torch's own radius (neither
-	 * is meaningfully brighter/bigger than a standing soul torch). */
-	private static double soulLightRadius(BlockState state) {
-		if (state.is(Blocks.SOUL_CAMPFIRE)) {
-			return SOUL_CAMPFIRE_RADIUS;
-		}
-		if (state.is(Blocks.SOUL_LANTERN)) {
-			return SOUL_LANTERN_RADIUS;
-		}
-		if (state.is(Blocks.SOUL_TORCH) || state.is(Blocks.SOUL_WALL_TORCH) || state.is(Blocks.SOUL_FIRE)) {
-			return SOUL_TORCH_RADIUS;
-		}
-		return 0.0;
-	}
-
-	/** Whether the player is currently close enough to a soul-fire-family light source that the
-	 * wendigo should hold off engaging them - the user's own explicit "safe zone" replacement for the
-	 * old inventory-based soul lantern check: it now has to actually be lit and nearby, not just
-	 * carried. Each source's own radius comes from soulLightRadius above (campfire reaches farthest,
-	 * torch/wall-torch/bare-fire reach least). Deliberately NOT checked by tryEnterOrbit (the wendigo
-	 * still spawns/orbits near soul light) - only by tickOrbitingEntity's own engagement trigger, right
-	 * before beginEngagement, so the wendigo just can't run a plan on a target standing in it. */
-	private static boolean isNearSoulLight(ServerLevel level, BlockPos center) {
-		int radius = (int) Math.ceil(SOUL_LIGHT_MAX_RADIUS);
-		for (BlockPos pos : BlockPos.betweenClosed(center.offset(-radius, -radius, -radius), center.offset(radius, radius, radius))) {
-			double sourceRadius = soulLightRadius(level.getBlockState(pos));
-			if (sourceRadius > 0.0 && pos.distSqr(center) <= sourceRadius * sourceRadius) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	// isNearSoulLight's own 3D radius scan isn't free - every player, every tick would be wasteful for
+	// SoulLightScanner.isNearSoulLight's own 3D radius scan isn't free - every player, every tick would be wasteful for
 	// a check that's purely cosmetic (an advancement, not gameplay-gating) - throttled the same way
 	// ORBIT_SPAWN_SEARCH_INTERVAL_TICKS throttles its own scan, no per-player state needed since a
 	// plain tick-modulo gate is enough here (award() itself is idempotent, so missing the exact tick
@@ -2195,16 +2421,16 @@ public final class WendigoManager {
 	private static final int SOUL_LIGHT_ACHIEVEMENT_CHECK_INTERVAL_TICKS = 20; // ~1s
 
 	/** The user's own explicit "It lurks..." advancement chain: grants lurks/soul_light to any player
-	 * standing under y=0 within isNearSoulLight's own radius of a real soul-fire-family light source -
-	 * the same "safe zone" concept tickOrbitingEntity already uses to hold off engagement, reused
-	 * here for the achievement instead of duplicating the block-family list. Applies to every player in
-	 * the level, not just whoever a wave happens to be locked onto right now. */
+	 * standing under y=0 within SoulLightScanner.isNearSoulLight's own radius of a real soul-fire-
+	 * family light source - the same "safe zone" concept resolveRunOutcome now uses for progression,
+	 * reused here for the achievement instead of duplicating the block-family list. Applies to every
+	 * player in the level, not just whoever a wave happens to be locked onto right now. */
 	private static void checkSoulLightAchievement(ServerLevel level, int now) {
 		if (now % SOUL_LIGHT_ACHIEVEMENT_CHECK_INTERVAL_TICKS != 0) {
 			return;
 		}
 		for (ServerPlayer player : level.players()) {
-			if (player.getY() < 0 && isNearSoulLight(level, player.blockPosition())) {
+			if (player.getY() < 0 && SoulLightScanner.isNearSoulLight(level, player.blockPosition())) {
 				WendigoAdvancements.grant(player, WendigoAdvancements.SOUL_LIGHT);
 			}
 		}
@@ -2297,9 +2523,12 @@ public final class WendigoManager {
 	/** Live position, roughly at the "farther" band, that the target player isn't currently looking
 	 * toward - every genuinely fresh spawn's own positioning now (see spawnWave - the model no longer
 	 * picks a spawn band at all). Only ever called for a genuinely fresh spawn, so self is always the
-	 * player's own position (see DarkSpotScanner.findUnwatchedPosition, the shared primitive this and
-	 * PlanRunner's movement.approach_band(no_players_looking) both delegate to now - self differs per
-	 * caller, but the retry/fallback logic is identical either way). */
+	 * player's own position. Uses DarkSpotScanner.findUnwatchedPosition (the floor-only, flood-
+	 * verified-reachable-from-self version) rather than the any-surface findUnwatchedPosition3D
+	 * PlanRunner's own movement.approach_spot(destination=unwatched)/combat.teleport(destination=
+	 * behind) use now - a fresh spawn genuinely needs to be reachable from wherever self (the
+	 * player's own position) is, the same reachability guarantee this whole method's name promises,
+	 * not just a geometrically-valid pick on some arbitrary surface. */
 	private static BlockPos resolveUnwatchedSpot(ServerLevel level, WaveContext context) {
 		ServerPlayer player = context.player();
 		return DarkSpotScanner.findUnwatchedPosition(level, player.blockPosition(), player,
@@ -2367,15 +2596,5 @@ public final class WendigoManager {
 		// explicit "despawn after 3 seconds of dead stare" number is a real, fixed grace window,
 		// unlike light's own stage-1 instant (0-tick) tolerance.
 		int orbitDeadStareTicks;
-		// Torches consumeSnuffedTorches handed off from a just-ended wave (see the wave-end handling in
-		// tickLevel), waiting their turn to relight - the user's own explicit "after the plan we start
-		// re-enabling them back to their original torch type one by one every 5 ticks unless they are
-		// within light distance of the wendigo" request. A queue, not a set: order is exactly the order
-		// they went dark in, and processPendingTorchRelights only ever looks at/removes the front.
-		final Deque<BlockPos> pendingTorchRelights = new ArrayDeque<>();
-		// Next tick processPendingTorchRelights is allowed to relight one more torch - the "every 5
-		// ticks" pacing. Only advanced on an actual relight (see that method), so a torch skipped for
-		// being too close to the wendigo doesn't burn through the pacing budget doing nothing.
-		int nextTorchRelightTick;
 	}
 }

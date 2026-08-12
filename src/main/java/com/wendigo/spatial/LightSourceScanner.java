@@ -16,6 +16,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CampfireBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 
@@ -130,6 +131,16 @@ public final class LightSourceScanner {
 			playSnuffSound(level, pos);
 			return;
 		}
+		// Soul campfire only - the user's own explicit request. A real, already-existing vanilla
+		// state (the same LIT property water/a snowball already extinguishes a campfire with, and
+		// isLitCampfire's own real getter reads), same in-place-flip shape as candles right above -
+		// no custom block needed the way torches (which have no vanilla "unlit" variant at all) do.
+		// Plain campfire is deliberately untouched - never asked for, and wasn't snuffable before.
+		if (state.is(Blocks.SOUL_CAMPFIRE)) {
+			level.setBlock(pos, state.setValue(CampfireBlock.LIT, false), Block.UPDATE_ALL);
+			playSnuffSound(level, pos);
+			return;
+		}
 		Block snuffed = WendigoBlocks.snuffedFor(state.getBlock());
 		if (snuffed instanceof SnuffedWallTorchBlock wallTorch) {
 			level.setBlock(pos, wallTorch.defaultBlockState()
@@ -146,30 +157,6 @@ public final class LightSourceScanner {
 		destroyByWendigo(level, pos, source);
 	}
 
-	/**
-	 * Reverses snuffByWendigo - restores a still-snuffed torch/candle at pos back to its real lit form,
-	 * the same state a player's own flint-and-steel relight would produce (see
-	 * SnuffedTorchBlock/SnuffedWallTorchBlock.useItemOn, which this mirrors exactly), just triggered by
-	 * the engine instead of a player interaction. No-op if pos no longer holds a snuffed instance (a
-	 * player broke it, relit it themselves, or replaced it with something else in the meantime, or a
-	 * candle that's already lit) - nothing left here for the caller's relight queue to do.
-	 */
-	public static void relightByWendigo(ServerLevel level, BlockPos pos) {
-		BlockState state = level.getBlockState(pos);
-		if (state.getBlock() instanceof SnuffedWallTorchBlock wallTorch) {
-			level.setBlock(pos, wallTorch.relightBlock().defaultBlockState()
-				.setValue(BlockStateProperties.HORIZONTAL_FACING, state.getValue(SnuffedWallTorchBlock.FACING)),
-				Block.UPDATE_ALL);
-			return;
-		}
-		if (state.getBlock() instanceof SnuffedTorchBlock torch) {
-			level.setBlock(pos, torch.relightBlock().defaultBlockState(), Block.UPDATE_ALL);
-			return;
-		}
-		if ((state.is(BlockTags.CANDLES) || state.is(BlockTags.CANDLE_CAKES)) && !state.getValue(BlockStateProperties.LIT)) {
-			level.setBlock(pos, state.setValue(BlockStateProperties.LIT, true), Block.UPDATE_ALL);
-		}
-	}
 
 	/** True for any light-emitting block combat.break_torch/the passive chase-destruction/torch-
 	 * linked-spawn machinery is allowed to target for full destruction (findLightSources' own scope) -
@@ -193,14 +180,18 @@ public final class LightSourceScanner {
 	}
 
 	/** True only for the 8 real torch blocks WendigoBlocks knows how to snuff (torch/soul_torch/
-	 * copper_torch/redstone_torch, standing + wall) or a candle/candle-cake block (BlockTags.CANDLES/
-	 * CANDLE_CAKES) - see snuffByWendigo. Deliberately much narrower than isBreakableLightSource (see
-	 * findSnuffableLightSources' own doc comment for why lanterns and everything else stay out of this
-	 * one specifically). */
+	 * copper_torch/redstone_torch, standing + wall), a candle/candle-cake block (BlockTags.CANDLES/
+	 * CANDLE_CAKES), or a lit soul campfire - see snuffByWendigo. Deliberately much narrower than
+	 * isBreakableLightSource (see findSnuffableLightSources' own doc comment for why lanterns and
+	 * everything else stay out of this one specifically) - soul LANTERNS in particular stay excluded
+	 * here on purpose, the user's own explicit "in line with our rules about other [regular]
+	 * lanterns" call: never snuffable/breakable, soul or not. Plain (non-soul) campfire is
+	 * deliberately excluded too - only soul campfires were ever asked for. */
 	private static boolean isSnuffableLightSource(Level level, BlockPos pos) {
 		BlockState state = level.getBlockState(pos);
 		return WendigoBlocks.snuffedFor(state.getBlock()) != null
-			|| state.is(BlockTags.CANDLES) || state.is(BlockTags.CANDLE_CAKES);
+			|| state.is(BlockTags.CANDLES) || state.is(BlockTags.CANDLE_CAKES)
+			|| state.is(Blocks.SOUL_CAMPFIRE);
 	}
 
 	/**

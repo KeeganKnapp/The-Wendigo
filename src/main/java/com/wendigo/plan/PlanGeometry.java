@@ -1,68 +1,26 @@
 package com.wendigo.plan;
 
-import com.google.gson.JsonObject;
-
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.entity.WendigoEntity;
 import com.wendigo.spatial.DarkSpotScanner;
 
-/** Spatial helpers for movement primitives: dark-spot scanning and relative-position targeting. */
+/** Spatial helper for movement primitives that still need a plain dark-spot scan (movement.
+ * retreat_to_dark, memory.store_dark_location) - movement.reposition itself (the only other former
+ * caller here, relative-to-reference-point tactical stepping) was fully absorbed into
+ * movement.approach_spot and removed entirely. */
 final class PlanGeometry {
 	private PlanGeometry() {
 	}
 
 	/** Darkest standable spot within radius of self, biased away from the nearest player if there is
-	 * one - see DarkSpotScanner.findDarkestAwayFrom. Every caller of this (movement.retreat_to_dark,
-	 * memory.store_dark_location) is picking a place to flee to, not just anywhere dark, so heading
-	 * toward/past the player it's meant to be getting away from defeats the point. */
+	 * one - see DarkSpotScanner.findDarkestAwayFrom. Every caller of this is picking a place to flee
+	 * to, not just anywhere dark, so heading toward/past the player it's meant to be getting away
+	 * from defeats the point. */
 	static BlockPos findDarkSpot(WendigoEntity self, double radius) {
 		Player player = Targeting.nearestPlayer(self);
 		BlockPos avoid = player != null ? player.blockPosition() : null;
 		return DarkSpotScanner.findDarkestAwayFrom(self.level(), self.blockPosition(), radius, avoid);
-	}
-
-	/** Target position for movement.reposition, relative to the requested reference point. */
-	static BlockPos repositionTarget(JsonObject step, WendigoEntity self) {
-		Vec3 referencePos = referencePosition(step.get("reference").getAsString(), self);
-		if (referencePos == null) {
-			return null;
-		}
-
-		Vec3 awayFromRef = self.position().subtract(referencePos);
-		if (awayFromRef.horizontalDistance() < 1.0e-4) {
-			awayFromRef = new Vec3(1, 0, 0); // degenerate case: standing on top of the reference
-		}
-		awayFromRef = awayFromRef.normalize();
-
-		double bandDistance = SemanticBands.distanceBlocks(step.get("distance").getAsString());
-		String direction = step.get("direction").getAsString();
-		// Rotation sign for orbit_cw/orbit_ccw is an assumption, not verified against a fixed
-		// screen-space convention - swap the two if testing shows it orbiting the wrong way.
-		Vec3 offset = switch (direction) {
-			case "toward" -> awayFromRef.scale(-bandDistance);
-			case "orbit_cw" -> rotateHorizontal(awayFromRef, -90).scale(bandDistance);
-			case "orbit_ccw" -> rotateHorizontal(awayFromRef, 90).scale(bandDistance);
-			default -> awayFromRef.scale(bandDistance); // "away"
-		};
-		return BlockPos.containing(referencePos.add(offset));
-	}
-
-	private static Vec3 referencePosition(String reference, WendigoEntity self) {
-		if ("stored_dark_spot".equals(reference)) {
-			BlockPos stored = self.getStoredDarkLocation();
-			return stored != null ? Vec3.atBottomCenterOf(stored) : null;
-		}
-		Player player = Targeting.nearestPlayer(self);
-		return player != null ? player.position() : null;
-	}
-
-	private static Vec3 rotateHorizontal(Vec3 v, double angleDegrees) {
-		double rad = Math.toRadians(angleDegrees);
-		double cos = Math.cos(rad);
-		double sin = Math.sin(rad);
-		return new Vec3(v.x * cos - v.z * sin, v.y, v.x * sin + v.z * cos);
 	}
 }

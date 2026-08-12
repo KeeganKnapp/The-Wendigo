@@ -8,11 +8,14 @@ import net.minecraft.world.entity.player.Player;
 import com.wendigo.entity.WendigoEntity;
 
 /** Player targeting: whoever's nearest for movement/distance purposes, re-resolved on demand rather
- * than cached. See nearbyPlayers for the multiplayer stare-detection case, where any player within
- * range should be able to trigger a look-based check, not just the single nearest one. Both methods
- * filter out anyone currently at y&gt;=0 entirely - the wendigo can't follow a player back above
- * ground (user's own explicit rule, matching WendigoManager.canSpawnNear's own "never above y=0"
- * spawn gate). A single filtering point here rather than scattered per-primitive checks: every
+ * than cached. See nearbyPlayers for the multiplayer APPROACH-detection case specifically (any
+ * player closing distance mid-stare still matters, even one the wave isn't actually targeting - see
+ * PlanRunner.isAnyPlayerApproachingDuringStare/PlanPredicates.hasApproachedByAnyone) - stare/look
+ * DETECTION itself is target-only now (PlanPredicates.isLookedAtByTarget, via nearestPlayer below),
+ * the user's own explicit reversal of an earlier "any player" design for that specific case. Both
+ * methods filter out anyone currently at y&gt;=0 entirely - the wendigo can't follow a player back
+ * above ground (user's own explicit rule, matching WendigoManager.canSpawnNear's own "never above
+ * y=0" spawn gate). A single filtering point here rather than scattered per-primitive checks: every
  * existing consumer (tickOrbit, combat.chase/lunge, movement resolution, every predicate) already
  * treats "no player found" as a legitimate, already-handled case (give up, lose the target, fail to
  * resolve) - see nearestPlayer's null return - so a player who steps back above y=0 simply
@@ -57,9 +60,10 @@ public final class Targeting {
 		return nearest;
 	}
 
-	/** Every player within the same radius nearestPlayer uses, not just the closest one - stare
-	 * detection is meant to be "global FOV" in multiplayer: any player looking at the wendigo counts,
-	 * regardless of who the wave is actually targeting/chasing. */
+	/** Every player within the same radius nearestPlayer uses, not just the closest one - backs
+	 * approach detection specifically (any player closing distance counts, regardless of who the wave
+	 * is actually targeting/chasing - see PlanPredicates.hasApproachedByAnyone/this class's own doc
+	 * comment). Stare/look detection no longer uses this - see isLookedAtByTarget. */
 	static List<? extends Player> nearbyPlayers(WendigoEntity self) {
 		double radius = SemanticBands.NEAREST_PLAYER_RADIUS;
 		double radiusSq = radius * radius;

@@ -24,7 +24,7 @@
   "display": {
     "background": "minecraft:gui/advancements/backgrounds/stone",
     "description": {
-      "text": "Enter the deepslate caves, below y=0"
+      "text": "Enter the deepslate caves, below y=0 (and abandon all hope)"
     },
     "icon": {
       "id": "minecraft:deepslate"

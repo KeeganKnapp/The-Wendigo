@@ -1,5 +1,8 @@
 package com.wendigo.plan;
 
+import net.minecraft.world.level.pathfinder.Path;
+
+import com.wendigo.WendigoMod;
 import com.wendigo.spatial.CaveScaleScanner.CaveScale;
 
 /**
@@ -7,7 +10,7 @@ import com.wendigo.spatial.CaveScaleScanner.CaveScale;
  * to real engine values, plus a few fixed tuning constants. Nothing here is scientifically
  * tuned - first-pass numbers to make the executor behave reasonably, adjust by feel.
  */
-final class SemanticBands {
+public final class SemanticBands {
 	private SemanticBands() {
 	}
 
@@ -16,17 +19,6 @@ final class SemanticBands {
 			case "slow" -> 1.25;
 			case "fast" -> 1.75;
 			default -> 1.5; // "normal"
-		};
-	}
-
-	// Representative block distance for a semantic band - movement.reposition's own tactical
-	// close/medium/far, distinct from the ProximityBands ladder predicate.player_distance and the
-	// wave prompt use (see ProximityBands - that one's public/shared, this one's reposition-only).
-	static double distanceBlocks(String distance) {
-		return switch (distance) {
-			case "close" -> 10.0;
-			case "far" -> 26.0;
-			default -> 18.0; // "medium"
 		};
 	}
 
@@ -108,7 +100,7 @@ final class SemanticBands {
 	}
 
 	// How long a player has to continuously sit in the next-weaker look band before
-	// PlanPredicates.isLookedAtByAnyoneGraduated treats the narrower band as satisfied anyway - user's
+	// PlanPredicates.isLookedAtByTargetGraduated treats the narrower band as satisfied anyway - user's
 	// own explicit call. Exists so a stare-hold loop can't be stuck forever waiting for a dead-on look
 	// that's merely close (a sustained corner_of_eye/in_view glance reads as "noticed" too, just more
 	// slowly than an actual dead_stare would).
@@ -133,7 +125,7 @@ final class SemanticBands {
 
 	static final double ARRIVAL_DISTANCE = 10;
 	// How close combat.lunge_attack needs to close to before it lands a hit.
-	static final double MELEE_RANGE = 2.0;
+	static final double MELEE_RANGE = 1.0;
 	// How close combat.break_torch needs to reach its target before it breaks it. Was tighter (2.0)
 	// but the pathfinder's actual stopping point near a wall-mounted block routinely landed just
 	// outside that - see isBreakTorchResolved's fallback for the other half of that fix (a clean,
@@ -147,7 +139,7 @@ final class SemanticBands {
 	// plan is active - pathfind away below the min, toward above the max, hold position in between.
 	// Tightens in smaller caves (see CaveScaleScanner) - nowhere to hold a wide ring in a mineshaft
 	// corridor. Tightened from an earlier, wider pass (TIGHT 12-18/NORMAL 20-30/MASSIVE 28-40) now
-	// that the wendigo can act directly from wherever it's orbiting (movement.approach_band handles
+	// that the wendigo can act directly from wherever it's orbiting (movement.approach_spot handles
 	// any repositioning a plan actually needs) rather than always having to walk to a chosen spot
 	// first - being farther out by default no longer buys anything, so there's no reason to hold as
 	// wide a ring as before. First pass, adjust by feel.
@@ -155,21 +147,77 @@ final class SemanticBands {
 	// pulled back in 4 blocks again (the user's own explicit "push in the orbit distances a little
 	// bit" follow-up, same session) - landing back on the original tightened-pass numbers documented
 	// above, not a coincidence worth re-deriving, just how the two modest same-magnitude adjustments
-	// happened to net out. Kept in sync by hand with WendigoManager's own orbitMinDistance/
-	// orbitMaxDistance copy.
-	static double orbitMinDistance(CaveScale caveScale) {
+	// happened to net out. Public (not package-private) specifically so WendigoManager
+	// (com.wendigo.wave) can call these directly instead of maintaining its own hand-copied version -
+	// that copy had already drifted stale (still held the pre-push-and-pull-back numbers) by the time
+	// this was caught, exactly the kind of silent divergence a single shared source of truth avoids.
+	public static double orbitMinDistance(CaveScale caveScale) {
 		return switch (caveScale) {
-			case TIGHT -> 12.0;
+			case TIGHT -> 10.0;
 			case MASSIVE -> 24.0;
 			default -> 16.0; // NORMAL
 		};
 	}
 
-	static double orbitMaxDistance(CaveScale caveScale) {
+	public static double orbitMaxDistance(CaveScale caveScale) {
 		return switch (caveScale) {
 			case TIGHT -> 16.0;
 			case MASSIVE -> 34.0;
 			default -> 24.0; // NORMAL
 		};
+	}
+
+	// First pass, ~2.5x TIGHT's own 16-block max orbit distance - AWCAPI's climbing-aware evaluator
+	// produces roughly one path node per traversed block in ordinary corridor movement, so a
+	// genuinely winding but still-connected mineshaft corridor to a spot 12-16 blocks away in
+	// straight-line terms should rarely need more than ~30 real steps; this leaves real slack for a
+	// winding path while still catching "a small hole into a barely-connected pocket 60+ blocks of
+	// real tunnel away" - the user's own explicit reported symptom. Adjust by feel once live-tested,
+	// same as every other band in this class.
+	private static final int TIGHT_ORBIT_NODE_COUNT_MAX = 80;
+
+	/**
+	 * Shared judgment for every orbit position-search call site (WendigoManager.tryEnterOrbit/
+	 * relocateOrDiscard, PlanRunner.tickOrbit) - given a real AWCAPI path the caller already computed
+	 * to/from a candidate position, decides whether that candidate is actually good enough to commit
+	 * to. Always requires path.canReach() (vanilla's own "the search genuinely reached the target"
+	 * flag, not a best-effort nearest approach). For TIGHT specifically (the user's own explicit
+	 * scope call - NOT NORMAL, NOT MASSIVE, after weighing it against the original "two smallest,
+	 * maybe three" framing), ALSO requires the path's own node count at/below
+	 * TIGHT_ORBIT_NODE_COUNT_MAX: a technically-reachable candidate through a tiny connecting hole
+	 * into a mostly-disconnected pocket can still demand an absurdly long real walk, which reads as
+	 * "not really connected" even though canReach() alone says yes. NORMAL/MASSIVE skip the node-count
+	 * check entirely - their own wider block-distance bands and open geometry make a long winding path
+	 * a normal shape, not the cramped-pinch-point failure mode this check targets.
+	 */
+	public static boolean isAcceptableOrbitPath(Path path, CaveScale caveScale) {
+		if (path == null || !path.canReach()) {
+			return false;
+		}
+		if (caveScale != CaveScale.TIGHT) {
+			return true;
+		}
+		return path.getNodeCount() <= TIGHT_ORBIT_NODE_COUNT_MAX;
+	}
+
+	/** Minimum search distance (blocks) movement.approach_spot/combat.teleport's own destination
+	 * resolvers start from, per cave scale - reads WendigoTuningConfig.*CaveActionMinDistance (see
+	 * their own field comments: the user's own explicit call to start all three equal for now, kept as
+	 * 3 distinct config fields for later differentiation). See actionSearchMaxDistance for the other
+	 * end of the search range - deliberately its own separate (not per-cave-scale) config value. */
+	public static double actionSearchMinDistance(CaveScale caveScale) {
+		return switch (caveScale) {
+			case TIGHT -> WendigoMod.tuningConfig.tightCaveActionMinDistance;
+			case MASSIVE -> WendigoMod.tuningConfig.massiveCaveActionMinDistance;
+			default -> WendigoMod.tuningConfig.normalCaveActionMinDistance; // NORMAL
+		};
+	}
+
+	/** Hard ceiling (blocks) movement.approach_spot/combat.teleport's own destination resolvers search
+	 * out to - see WendigoTuningConfig.actionMaxSearchDistance's own field comment for why this is a
+	 * dedicated value rather than reusing orbitDespawnDistance the way this used to. Not cave-scale-
+	 * dependent (unlike actionSearchMinDistance) - the user's own explicit ask was one flat limit. */
+	public static double actionSearchMaxDistance() {
+		return WendigoMod.tuningConfig.actionMaxSearchDistance;
 	}
 }

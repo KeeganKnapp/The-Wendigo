@@ -16,6 +16,7 @@ import net.minecraft.world.phys.Vec3;
 
 import com.wendigo.WendigoMod;
 import com.wendigo.entity.WendigoEntity;
+import com.wendigo.plan.PlanPredicates;
 
 /**
  * Every distinct situation the wendigo makes noise for, in one place - laid out by WHEN each cue
@@ -46,20 +47,22 @@ import com.wendigo.entity.WendigoEntity;
  * Every cue here is centered on EACH PLAYER, not the wendigo's own actual position - the user's own
  * explicit framing: these are cinematic cues (a horror movie's own sound design, not something
  * diegetically emitted from the wendigo's body that would naturally fall off with distance/
- * direction the way footsteps or a hurt sound do - see WendigoEntity.playHurtSound/playStepSound
- * and PlanRunner's own spear-hit sound, deliberately NOT changed by this, since those really are
- * meant to sound like they're coming from wherever the wendigo actually is). Playing near the
+ * direction the way footsteps or a hurt sound do - see WendigoEntity.playHurtSound/playStepSound,
+ * deliberately NOT changed by this, since those really are meant to sound like they're coming from
+ * wherever the wendigo actually is). Playing near the
  * player's own position means it's always heard clearly regardless of where the wendigo is hiding,
  * which is the whole point of an unplaced dread cue.
  * <p>
- * CHASE/FLEE/STARE/SPAWN/JUMPSCARE go one step further than a plain "at the player" cue, though -
- * the user's own explicit request: each is offset CINEMATIC_OFFSET_DISTANCE blocks out from every
- * player, in the direction of the wendigo actually causing this cue (see cinematicSoundPosition),
- * mirroring "/execute as @a at @s facing entity ... eyes run playsound wendigo player @a ^ ^ ^5" -
- * a directional hint toward where the dread is coming from without giving away its exact real
- * position (5 blocks is nowhere near where the wendigo actually is, just a plausible-sounding
- * nearby source). AMBIENT stays exactly where it always was - a plain, unplaced presence cue with
- * no directional hint at all, the one type this offset deliberately does NOT apply to.
+ * Every Type - AMBIENT included, per the user's own explicit follow-up request reversing an earlier
+ * "AMBIENT stays unplaced" carve-out - goes one step further than a plain "at the player" cue,
+ * though: each is offset CINEMATIC_OFFSET_DISTANCE blocks out from every player, in the direction
+ * of the wendigo actually causing this cue (see cinematicSoundPosition), mirroring "/execute as @a
+ * at @s facing entity ... eyes run playsound wendigo player @a ^ ^ ^5" - a directional hint toward
+ * where the dread is coming from without giving away its exact real position (5 blocks is nowhere
+ * near where the wendigo actually is, just a plausible-sounding nearby source). A cue genuinely
+ * emitted from the wendigo's own real position is reserved for hurt/death/despawn-style direct
+ * feedback now, never a cinematic one - see WendigoEntity.playHurtSound/die, neither of which goes
+ * through this class at all.
  */
 public final class WendigoSounds {
 	public enum Type {
@@ -135,7 +138,7 @@ public final class WendigoSounds {
 
 	// The user's own explicit "5 blocks out" distance from the hardcoded command this mirrors - see
 	// the class doc comment.
-	private static final double CINEMATIC_OFFSET_DISTANCE = 5.0;
+	private static final double CINEMATIC_OFFSET_DISTANCE = 14.0;
 
 	/** Plays immediately if the same MIN_SOUND_INTERVAL_TICKS gap every cue shares has already
 	 * elapsed, or does nothing at all otherwise - a plain availability check (see the class doc
@@ -150,20 +153,35 @@ public final class WendigoSounds {
 	 * shouldn't leak ambience into a different one) so every player hears it exactly as clearly as
 	 * everyone else, regardless of where they each are relative to each other or the wendigo.
 	 * <p>
-	 * source is the WendigoEntity actually responsible for this cue - required for every Type except
-	 * AMBIENT (see cinematicSoundPosition/the class doc comment for the directional offset this
-	 * drives), null-safe for AMBIENT specifically (callers with no entity handy, e.g.
-	 * DarknessOverstayTracker's own "still lingering in the dark" warning, can just pass null there). */
+	 * source is the WendigoEntity actually responsible for this cue - drives the directional offset
+	 * every Type now gets (see cinematicSoundPosition/the class doc comment), including AMBIENT: the
+	 * user's own explicit follow-up request, reversing the earlier "AMBIENT stays unplaced" carve-out
+	 * - a raw self-position cue is reserved for hurt/death/despawn-style direct feedback now (see
+	 * WendigoEntity.playHurtSound/die, neither of which goes through this class at all), never a
+	 * cinematic cue. Still null-safe for AMBIENT specifically (callers with no entity handy, e.g.
+	 * DarknessOverstayTracker's own "still lingering in the dark" warning, can just pass null there) -
+	 * falls back to the player's own unplaced position rather than offsetting toward nothing. */
 	public static void play(ServerLevel level, WendigoEntity source, Type type) {
 		int now = level.getServer().getTickCount();
 		if (now < NEXT_ALLOWED_TICK.getOrDefault(level, 0)) {
 			return;
 		}
 		SoundEvent event = eventFor(type);
-		boolean offset = type != Type.AMBIENT && source != null;
+		boolean offset = source != null;
 		for (ServerPlayer player : level.players()) {
+			// STARE's own live "obstructed line of sight" gate - the user's own explicit request: a stare
+			// sound should only actually reach a player who can genuinely see the wendigo's face right
+			// now (same head-visibility check the stare DETECTION predicate itself uses, not a new one),
+			// not everyone in the level regardless of a wall between them and it. Every other Type stays
+			// unconditional - a chase/flee/spawn/jumpscare cue is meant to reach the whole party
+			// regardless of sightline (see the class doc comment), only STARE is specifically about being
+			// looked at.
+			if (type == Type.STARE && source != null
+					&& !PlanPredicates.hasLineOfSightToSelf(player, source, source.getVisualEyePosition())) {
+				continue;
+			}
 			Vec3 pos = offset ? cinematicSoundPosition(player, source) : player.position();
-			level.playSound(null, pos.x, pos.y, pos.z, event, SoundSource.HOSTILE, 2.0F, 1.0F);
+			level.playSound(null, pos.x, pos.y, pos.z, event, SoundSource.HOSTILE, 1.0F, 1.0F);
 		}
 		NEXT_ALLOWED_TICK.put(level, now + MIN_SOUND_INTERVAL_TICKS);
 	}
@@ -190,7 +208,7 @@ public final class WendigoSounds {
 
 	// The user's own explicit volume/pitch for sound.breathe - deliberately NOT the same 2.0F/1.0F
 	// every Type above uses, so this gets its own dedicated method rather than folding into Type/play().
-	private static final float BREATHE_VOLUME = 1.0F;
+	private static final float BREATHE_VOLUME = 0.5F;
 	private static final float BREATHE_PITCH = 0.65F;
 	// vanilla's own registered id is "entity.player.breath" (no trailing "e", unlike e.g.
 	// entity.horse.breathe - confirmed via decompile) - the user asked for

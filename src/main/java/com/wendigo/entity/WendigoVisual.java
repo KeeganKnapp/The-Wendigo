@@ -47,7 +47,7 @@ public class WendigoVisual extends ElementHolder {
     // next path node every tick (no LookAtGoal/RandomLookAroundGoal-style smoothing, since it has no
     // Goals beyond FloatGoal) -- reading it raw made the rig visibly jerky. Easing toward it instead
     // of copying it verbatim smooths that out; Mth.rotLerp already takes the shortest way around.
-    private static final float YAW_LERP_FACTOR = 0.5f;
+    private static final float YAW_LERP_FACTOR = 0.3f;
     // Same easing treatment as YAW_LERP_FACTOR, for the same reason - a wall/ceiling attachment
     // orientation swap (see onTick's rigOrientation branch) is physics-driven, not eased on
     // AWCAPI's own side, and popping straight to a new orientation the instant ClimberComponent
@@ -62,7 +62,7 @@ public class WendigoVisual extends ElementHolder {
     // how far it swings each tick. (A windowed-average alternative was tried for the flip-flopping
     // "upside-down pyramid" case specifically - reverted back to this by request.) First pass,
     // adjust by feel.
-    private static final float ORIENTATION_LERP_FACTOR = 0.4f;
+    private static final float ORIENTATION_LERP_FACTOR = 0.2f;
     // See onTick's rigOrientation block - empirically-found correction for the rig facing exactly
     // backwards while climbing, not derived from any formula. Was 180 while
     // RigMatrices.fromOrientationAndYaw's composition still had the yaw-dependent handedness bug
@@ -94,6 +94,9 @@ public class WendigoVisual extends ElementHolder {
     // Bright, unmistakably-artificial cyan - distinct from anything else the rig or the cave itself
     // could plausibly tint, so it reads as "debug indicator" at a glance.
     private static final int DEBUG_GLOW_COLOR = 0x00FFFF;
+    // White - mirrors the real vanilla glowing outline color, for the post-spectral-hit glow window
+    // (see WendigoEntity.startGlow/isCurrentlyGlowing).
+    private static final int SPECTRAL_HIT_GLOW_COLOR = 0xFFFFFF;
 
     // This rig is a Polymer virtual entity (packet-only item_display elements), not a real
     // LivingEntity, so unlike a vanilla mob it gets NO free per-render-frame rotation interpolation
@@ -127,15 +130,15 @@ public class WendigoVisual extends ElementHolder {
     // bigger jumps per push (smoothed by interpolation, but a coarser sampling of the crawl loop's
     // own timing), lower values track both animation and rotation more responsively at the cost of
     // less interpolation runway.
-    private static final int ROTATION_INTERPOLATION_TICKS = 0;
+    private static final int ROTATION_INTERPOLATION_TICKS = 1;
 
     // Mirrors SemanticBands.speedMultiplier's slow/normal/fast values (com.wendigo.plan, package-
     // private - a plan-schema concern, not an animation one) - duplicated here rather than widening
     // that class's visibility for this, same tradeoff already accepted for
     // SemanticBands.DARKNESS_LIGHT_THRESHOLD vs DarkSpotScanner's own darkness cutoff. Used only to
     // classify the entity's actual live speed into a band below, not to drive movement itself.
-    private static final double SLOW_MOVE_MULTIPLIER = 1.25;
-    private static final double NORMAL_MOVE_MULTIPLIER = 1.5;
+    private static final double SLOW_MOVE_MULTIPLIER = 1.0;
+    private static final double NORMAL_MOVE_MULTIPLIER = 1.25;
     private static final double FAST_MOVE_MULTIPLIER = 1.75;
 
     // How much faster than real-time the crawl loop plays back at each band - even the slowest
@@ -206,7 +209,8 @@ public class WendigoVisual extends ElementHolder {
     private boolean yawInitialized;
     private final Quaternionf smoothedOrientation = new Quaternionf();
     private boolean orientationInitialized;
-    private boolean debugGlowing;
+    private boolean glowing;
+    private int lastGlowColor;
     // Debounced view of owner.isMoving(), used only for ANIMATION selection below - NOT a
     // replacement for the raw signal, which pose/hitbox logic still needs unchanged. Climbing's
     // stepwise, discontinuous movement can make the raw velocity-based isMoving() flicker true/false
@@ -260,7 +264,7 @@ public class WendigoVisual extends ElementHolder {
 
     @Override
     protected void onTick() {
-        applyDebugGlow();
+        applyGlow();
         // Three visual states, matched to the entity's real movement/hitbox state rather than just
         // hitbox alone: actually moving (regardless of pose) plays the looping crawl animation;
         // stopped but still in the crawl/swim hitbox (too cramped to stand, or between crawl moves)
@@ -754,21 +758,30 @@ public class WendigoVisual extends ElementHolder {
         return this.genuinelyProgressing;
     }
 
-    private void applyDebugGlow() {
-        boolean glowing = WendigoDebug.anyEnabled();
-        if (glowing == this.debugGlowing) {
+    /** Combines two independent glow sources onto the rig: the debug indicator (WendigoDebug) and
+     * the real post-spectral-hit glow (owner.isCurrentlyGlowing(), reflecting WendigoEntity's own
+     * setGlowingTag - see its startGlow). Debug wins the color in the rare case both are active at
+     * once, since it's a deliberate developer signal, not something that should get masked by
+     * whatever the entity itself happens to be doing. */
+    private void applyGlow() {
+        boolean debugGlow = WendigoDebug.anyEnabled();
+        boolean spectralGlow = this.owner.isCurrentlyGlowing();
+        boolean glowNow = debugGlow || spectralGlow;
+        int color = debugGlow ? DEBUG_GLOW_COLOR : SPECTRAL_HIT_GLOW_COLOR;
+        if (glowNow == this.glowing && (!glowNow || color == this.lastGlowColor)) {
             return;
         }
-        this.debugGlowing = glowing;
+        this.glowing = glowNow;
+        this.lastGlowColor = color;
         for (ItemDisplayElement bone : this.bones.values()) {
-            bone.setGlowing(glowing);
-            if (glowing) {
-                bone.setGlowColorOverride(DEBUG_GLOW_COLOR);
+            bone.setGlowing(glowNow);
+            if (glowNow) {
+                bone.setGlowColorOverride(color);
             }
         }
-        this.headGlow.setGlowing(glowing);
-        if (glowing) {
-            this.headGlow.setGlowColorOverride(DEBUG_GLOW_COLOR);
+        this.headGlow.setGlowing(glowNow);
+        if (glowNow) {
+            this.headGlow.setGlowColorOverride(color);
         }
     }
 

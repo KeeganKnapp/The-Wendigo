@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WendigoActionPlan",
-  "description": "One complete engagement for the wendigo: where it positions itself, what it does, and where it withdraws to afterward. The wendigo is a persistent presence, not something that spawns fresh each time - it's usually already nearby, quietly keeping its distance, before this plan ever runs; spawn_at is where it moves to (walking there if not already close - or not moving at all if it's already at a good distance for what the plan is about to do - appearing fresh only for a genuine first encounter) before 'plan' starts, not a guaranteed brand-new appearance every request. Positioning throughout this whole plan works the same way: everywhere a distance band is named (spawn_at, movement.approach_band, despawn_band), it's resolved LIVE, fresh, against wherever the player actually is at that exact moment - never a position frozen from earlier in the request. combat.break_torch has no band of its own - it always targets the nearest torch to wherever the wendigo itself currently is. This one call drives the entire engagement start to finish - there is no mid-engagement re-planning, so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player, their dweller severity, the live band distance-from-player ladder, and how many torches currently sit at each band - that context is NOT part of this schema since it's different every request. Where the wendigo withdraws to afterward IS a model choice (see despawn_band) - the engine resolves a live position in that band at the moment it's actually time to flee, re-resolving fresh if the first attempt fails; this is a retreat back into hiding, not vanishing from existence, unless it genuinely can't find anywhere dark to go. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
+  "description": "One complete engagement for the wendigo: where it positions itself and what it does. The wendigo is a persistent presence, not something that spawns fresh each time - it's usually already nearby, quietly keeping its distance, before this plan ever runs; it just begins from wherever it already is, not a guaranteed brand-new appearance every request. Positioning throughout this whole plan works through movement.approach/combat.teleport's own destination types (behind/eyeline/above/in_view/torch/ahead - torch is teleport-only), each resolved LIVE, fresh, against wherever the player actually is at that exact moment - never a position frozen from earlier in the request, and never a distance the model picks: how far a resolved spot actually sits from the player is entirely engine-determined by the size of the surrounding cave, not something this schema exposes. combat.break_torch has no destination of its own - it always targets the nearest torch to wherever the wendigo itself currently is. This one call drives the entire engagement start to finish - there is no mid-engagement re-planning (aside from control.re_evaluate, see its own description), so 'plan' should account for how the target might react (e.g. predicate.player_unreachable, predicate.player_looking_at_self) rather than assuming a fresh decision partway through. The prompt accompanying this schema describes the target player and their dweller severity - that context is NOT part of this schema since it's different every request. Withdrawing afterward is NOT a model choice - a flee (movement.retreat_with_fallback, or whenever 'plan' finishes) always heads back toward the wendigo's own ordinary orbit range for its current stage, engine-resolved, nothing to pick here. The model is never asked for raw coordinates, exact tick counts, or arbitrary speed floats - those are all engine-side lookups from semantic enums, and predicates are likewise engine-evaluated facts, not expressions the model computes itself. 'global_rules' back hard requirements that must hold no matter which plan step is currently running (see its own description) - use those for anything non-negotiable; use control.if/control.while inside 'plan' for everything else.",
   "type": "object",
   "properties": {
     "previous_encounter_recap": {
@@ -18,16 +18,6 @@
       },
       "description": "Runs after spawning, before the despawn move. Executed in order. If a step's precondition isn't met (e.g. retreat_to_dark with source=stored but nothing has been stored yet), the engine falls back to a sensible default rather than erroring - it never rejects a whole plan for one bad step."
     },
-    "despawn_band": {
-      "type": "string",
-      "enum": [
-        "medium",
-        "far",
-        "farther",
-        "farthest"
-      ],
-      "description": "Which live distance band from the player the wendigo withdraws to once 'plan' finishes (or whenever a movement.retreat_with_fallback step runs) - resolved fresh at that moment, re-resolved again from wherever it actually ended up if the first attempt fails. This is a genuine choice, not always the maximum distance: a wendigo that just had a fleeting, subtle encounter might only need to back off to medium before resuming its quiet watch, while one that just committed to a chase or a grab plausibly wants real distance (farther/farthest) before showing itself again. medium is the closest option offered - deliberately no closer band exists here, since retreating any nearer than that isn't a real withdrawal. Independent of spawn_at's own severity-gated unlock ladder - all four options are always available regardless of severity, since choosing to retreat modestly rather than maximally is never the bold/risky half of a decision."
-    },
     "global_rules": {
       "type": "array",
       "minItems": 0,
@@ -41,13 +31,12 @@
   "required": [
     "previous_encounter_recap",
     "plan",
-    "despawn_band",
     "global_rules"
   ],
   "additionalProperties": false,
   "$defs": {
     "step": {
-      "description": "Top-level plan entries: any primitive action, or a control.if/control.while wrapping a nested block of primitive actions. Control steps cannot nest inside each other (see action_step) - that keeps a plan at most two levels deep, which is what both the grammar-constrained decoder and a small model can reliably produce.",
+      "description": "Top-level plan entries: any primitive action, or a control.if/control.while wrapping a nested block of primitive actions. Control steps otherwise can't nest inside each other (see action_step), with exactly one exception: control.if is allowed inside a control.while's own body (see control_while_body_step) - 'while waiting, if the player looks, break the hold' is common enough to be worth the one extra level. Nothing else nests: control.while can't appear inside a control.if or another control.while, and control.if's own then/else stay flat action_step lists.",
       "anyOf": [
         {
           "$ref": "#/$defs/action_step"
@@ -61,22 +50,19 @@
       ]
     },
     "action_step": {
-      "description": "A primitive action - the only kind of step allowed inside a control.if/control.while block, so branches/loop bodies can't themselves contain more control flow.",
+      "description": "A primitive action - the only kind of step allowed inside a control.if's then/else, and (aside from control.if itself, see control_while_body_step) inside a control.while's body.",
       "anyOf": [
         {
           "$ref": "#/$defs/movement_approach"
         },
         {
-          "$ref": "#/$defs/movement_approach_band"
+          "$ref": "#/$defs/movement_approach_spot"
         },
         {
           "$ref": "#/$defs/movement_retreat_to_dark"
         },
         {
           "$ref": "#/$defs/movement_retreat_with_fallback"
-        },
-        {
-          "$ref": "#/$defs/movement_reposition"
         },
         {
           "$ref": "#/$defs/movement_hold"
@@ -109,16 +95,7 @@
           "$ref": "#/$defs/combat_chase"
         },
         {
-          "$ref": "#/$defs/combat_teleport_to_band"
-        },
-        {
-          "$ref": "#/$defs/combat_teleport_in_view"
-        },
-        {
-          "$ref": "#/$defs/combat_teleport_to_eyeline"
-        },
-        {
-          "$ref": "#/$defs/combat_teleport_ahead"
+          "$ref": "#/$defs/combat_teleport"
         },
         {
           "$ref": "#/$defs/control_none"
@@ -155,27 +132,25 @@
       ],
       "additionalProperties": false
     },
-    "movement_approach_band": {
+    "movement_approach_spot": {
       "type": "object",
-      "description": "MOVEMENT branch: pathfind to a live position at the given distance band from the player - resolved fresh at the moment this step actually runs, against wherever the player is by then, never a position decided earlier in the plan. Only bands actually offered in the prompt are valid for this request (same severity/cave-scale gating as spawn_at). If the wendigo's current live distance already roughly fits what comes next, this step can simply be omitted - there's no requirement to move at all before an action if the current position already works.",
+      "description": "MOVEMENT branch: pathfind to a live-resolved spot of the given type, relative to the player right now - resolved fresh at the moment this step actually runs, against wherever the player is by then, never a position decided earlier in the plan, and reachability-verified (a real path, not just a geometric guess) before committing to it. How far away the resolved spot actually sits is entirely engine-determined by the size of the surrounding cave (tight spaces search close in, open caverns search wider) - not something this step chooses. If the wendigo's current live position already roughly fits what comes next, this step can simply be omitted - there's no requirement to move at all before an action if the current position already works.",
       "properties": {
         "type": {
           "type": "string",
-          "const": "movement.approach_band"
+          "const": "movement.approach_spot"
         },
-        "band": {
+        "destination": {
           "type": "string",
           "enum": [
-            "close_as_possible",
-            "close",
-            "medium",
-            "far",
-            "farther",
-            "farthest",
-            "no_players_looking",
-            "spot_above"
+            "behind",
+            "eyeline",
+            "above",
+            "in_view",
+            "ahead",
+            "unwatched"
           ],
-          "description": "Which live distance band to move to, relative to the player right now. 'no_players_looking' is a special value instead of naming a distance band (same meaning as spawn_at's own): pathfind from wherever the wendigo currently is to a live position roughly at the farther band that the player isn't currently facing toward, always available regardless of severity. Especially useful as the very first step of a plan that's engaging an entity already orbiting nearby - unlike a fresh spawn, an already-alive entity doesn't get repositioned by spawn_at at all, so this is how to explicitly walk it somewhere unwatched before the rest of the plan runs, the same way a fresh spawn_at=no_players_looking would. 'spot_above' (60%+ only, same meaning as spawn_at's own) - pathfind to the ceiling directly above the player, staying dark the whole way, settling for the closest reachable spot if light blocks a clean route straight above. Mid-plan repositioning onto the ceiling for a movement.drop, not just a fresh spawn choice - e.g. an already-orbiting entity moving into position for an overhead ambush."
+          "description": "Which kind of spot to walk to. 'behind' - the player's own blind spot, not currently visible to them, could be on the floor, a wall, or the ceiling behind them. 'eyeline' - dark, but genuinely inline with wherever the player is looking right now, not just broadly in view. 'above' - a ceiling attachment point roughly overhead the player, staying dark the whole way (pairs with movement.drop once unlocked). 'in_view' - dark, but somewhere the player CAN currently see, for a deliberate reveal. 'ahead' - a guess at where the player is actually heading (a point along their live movement, if they're moving), landing somewhere dim rather than fully dark. 'unwatched' - the plain 'go somewhere the player isn't looking' option, no other constraint - the standard first step for repositioning before the rest of a plan runs, e.g. for an entity already orbiting nearby that a fresh spawn wouldn't otherwise reposition at all."
         },
         "speed": {
           "type": "string",
@@ -189,7 +164,7 @@
       },
       "required": [
         "type",
-        "band",
+        "destination",
         "speed"
       ],
       "additionalProperties": false
@@ -247,59 +222,6 @@
       },
       "required": [
         "type",
-        "speed"
-      ],
-      "additionalProperties": false
-    },
-    "movement_reposition": {
-      "type": "object",
-      "description": "MOVEMENT branch: short-range tactical movement relative to a reference point - never absolute coordinates.",
-      "properties": {
-        "type": {
-          "type": "string",
-          "const": "movement.reposition"
-        },
-        "reference": {
-          "type": "string",
-          "enum": [
-            "player",
-            "stored_dark_spot"
-          ],
-          "description": "What the direction/distance below are relative to."
-        },
-        "direction": {
-          "type": "string",
-          "enum": [
-            "toward",
-            "away",
-            "orbit_cw",
-            "orbit_ccw"
-          ]
-        },
-        "distance": {
-          "type": "string",
-          "enum": [
-            "close",
-            "medium",
-            "far"
-          ],
-          "description": "Semantic distance band - engine maps to a block-count range, not an exact value."
-        },
-        "speed": {
-          "type": "string",
-          "enum": [
-            "slow",
-            "normal",
-            "fast"
-          ],
-          "description": "Semantic pace, not a raw multiplier - engine maps each value to a fixed speed constant."
-        }
-      },
-      "required": [
-        "type",
-        "reference",
-        "direction",
-        "distance",
         "speed"
       ],
       "additionalProperties": false
@@ -449,7 +371,7 @@
     },
     "sound_breathe": {
       "type": "object",
-      "description": "SOUND branch: a single, deliberate breathing sound, played right at the wendigo's own real position (audible to every player, not just whoever's closest) rather than the unplaced dread cues sound.ambient_cue uses. Available at every stage, including the very first, faintest one - get as close as possible to the target before using it; the closer it is when this plays, the more it reads as genuinely, physically there right beside them rather than a distant noise. Reach for it right after a close instant reposition - combat.teleport_to_band(band=close/behind_player), an ordinary close approach, or (once unlocked) band=above_player - and again right before escalating into whatever comes next for the current stage (movement.retreat_with_fallback/control.despawn early on, combat.lunge_attack/combat.chase/another teleport once those unlock). No parameters beyond 'type' - unlike sound.ambient_cue, there's only the one sound here, nothing to choose between.",
+      "description": "SOUND branch: a single, deliberate breathing sound, played right at the wendigo's own real position (audible to every player, not just whoever's closest) rather than the unplaced dread cues sound.ambient_cue uses. NOT available at the very first, faintest stage - too concrete and physically present a cue for how deniable that stage is meant to stay; unlocks once the relationship with this player is established enough to be bold. Get as close as possible to the target before using it - the closer it is when this plays, the more it reads as genuinely, physically there right beside them rather than a distant noise. Reach for it right after a close instant reposition (combat.teleport/movement.approach_spot with destination=behind/in_view/above) and again right before escalating into whatever comes next for the current stage (movement.retreat_with_fallback/control.despawn early on, combat.lunge_attack/combat.chase/another teleport once those unlock). No parameters beyond 'type' - unlike sound.ambient_cue, there's only the one sound here, nothing to choose between.",
       "properties": {
         "type": {
           "type": "string",
@@ -513,98 +435,30 @@
       ],
       "additionalProperties": false
     },
-    "combat_teleport_to_band": {
+    "combat_teleport": {
       "type": "object",
-      "description": "COMBAT branch: instantly relocates the wendigo to a live-resolved spot at the given band, no travel time, no warning - a teleport, not a movement primitive, so it resolves the same instant it runs, nothing to wait on afterward. Every destination except band=torch must be completely unlit (0 light level, not merely dim) - torch is the one deliberate exception, since landing at a live light source can never itself read as unlit. Always available at every stage, unlike most of this creature's other combat options - the real gating here is which band value(s) are even offered right now (see 'band' below - the offered set GROWS with stage, cumulative, not replaced: everything unlocked at an earlier stage stays available at every later one too, alongside whatever's new) and a SEPARATE engine-enforced precondition this schema can't show directly: the wendigo can only actually pull this off while ITS OWN current live distance from the player already sits in one of the bands unlocked so far this stage (roughly the inverse of the destination progression, also cumulative - an early-stage wendigo can only blink away while already right on top of the player, a late-stage one has a much wider set of positions it can pull this off from). If that precondition isn't met right now, this is a clean no-op and the plan just continues - never a hard failure. If the chosen band itself can't be live-resolved (nothing fully unlit/valid found there, or no torch nearby for band=torch), the engine automatically falls back to the next best-to-worst option instead of failing outright - the full order, best to worst, is above_player, behind_player, torch, close, medium, far, farther, farthest, so a failed close attempt quietly becomes a medium teleport rather than nothing happening at all; only genuinely offer a band this schema is currently letting you pick, the engine handles the rest of the degradation on its own. Reach for this specifically when the player is sprinting AND the prompt's own account of the wendigo's current distance/band suggests the precondition is likely met - ideally as the very FIRST step of the plan, teleporting straight into position rather than pathing there normally, since a sprinting player is exactly the moment a sudden, silent reposition reads as unsettling rather than redundant. Pair with combat.lunge_attack, combat.chase, or posture.stare right after landing - band=torch specifically should almost always be followed by one of those, not left as the whole beat on its own, since arriving already exposed at a torch only reads as deliberate if something follows it up.",
+      "description": "COMBAT branch: instantly relocates the wendigo to a live-resolved spot of the given type, no travel time, no warning - a teleport, not a movement primitive, so it resolves the same instant it runs, nothing to wait on afterward, and reachability doesn't matter the way it does for a walked movement. Every destination except type=torch must be completely unlit (0 light level, not merely dim); type=ahead is deliberately dim instead. How far away the resolved spot actually sits is entirely engine-determined by the size of the surrounding cave, not something this step chooses. Which types are even offered right now depends on stage (the offered set GROWS with stage, cumulative - everything unlocked earlier stays available later too, alongside whatever's new); type=ahead has no failure state (always resolves to some placement, falling back to type=in_view's own search if the player isn't moving or nothing dim turns up), every other type is a clean no-op (plan just continues) if nothing valid can be found live. Reach for this specifically when the player is sprinting - a sudden, silent reposition reads as unsettling rather than redundant right as they've committed to moving fast. Pair with combat.lunge_attack, combat.chase, or posture.stare right after landing - type=torch specifically should almost always be followed by one of those, not left as the whole beat on its own.",
       "properties": {
         "type": {
           "type": "string",
-          "const": "combat.teleport_to_band"
+          "const": "combat.teleport"
         },
-        "band": {
+        "destination": {
           "type": "string",
           "enum": [
-            "farthest",
-            "farther",
-            "far",
-            "medium",
-            "close",
+            "behind",
+            "eyeline",
+            "above",
+            "in_view",
             "torch",
-            "behind_player",
-            "above_player"
+            "ahead"
           ],
-          "description": "Which destination this teleport resolves to - the set of values actually offered grows with stage (cumulative: everything unlocked earlier stays available later too, alongside whatever's new that stage), never shrinks or replaces. farthest/farther/far/medium/close are the ordinary live-resolved positioning bands (same distance ranges as movement.approach_band), completely unlit (0 light level) but not necessarily unwatched. close and behind_player both specifically resolve to a completely unlit spot the player ISN'T currently looking toward - behind_player is the classic blind-spot ambush (right in their blind spot, the original version of this ability); close is the same idea from a slightly less point-blank range. above_player resolves to a ceiling attachment point directly (or as close to directly) above the player, 10-30 blocks straight up - a drop-in vantage rather than a ground-level appearance, also completely unlit. torch resolves to the single nearest live torch to the player - the one destination NOT required to be unlit (it's a light source by definition) - just a relocation, no side effect on the torch itself (it isn't destroyed and this doesn't start a chase on its own, unlike how spawning on a torch used to work) - the model decides separately whether to follow up with combat.break_torch, combat.lunge_attack, or combat.chase from there (see this action's own top-level description - a torch teleport with no follow-up reads as pointless, always pair it with something)."
+          "description": "Which kind of spot this teleport resolves to. 'behind' - the player's own blind spot, completely unlit and not currently visible to them, could be on the floor, a wall, or the ceiling behind them - the classic blind-spot ambush. 'eyeline' - dark, but genuinely inline with wherever the player is looking right now, not just broadly in view - the most unsettling reveal, something already sitting exactly where their gaze rests. 'above' - a ceiling attachment point roughly overhead the player, completely unlit - a drop-in vantage (pairs with movement.drop once unlocked), not a ground-level appearance. 'in_view' - dark, but a spot the player CAN currently see - a deliberate reveal: teleport in, then let yourself be seen doing something specific. 'torch' - the single nearest live torch to the player, the one destination NOT required to be unlit - just a relocation, no side effect on the torch itself (doesn't break it, doesn't start a chase on its own) - decide separately whether to follow up with combat.break_torch, combat.lunge_attack, or combat.chase. 'ahead' - a guess at where the player is actually heading (a point along their live movement, if they're moving), landing somewhere dim rather than fully dark since they're more likely to actually walk near their own light than through genuine darkness - reads as already lying in wait along their real route. Meant for patience: land ahead, then either hold a stare and let predicate.player_approaching do the waiting, or let the stare turn into combat.chase/combat.lunge_attack once they're close."
         }
       },
       "required": [
         "type",
-        "band"
-      ],
-      "additionalProperties": false
-    },
-    "combat_teleport_in_view": {
-      "type": "object",
-      "description": "COMBAT branch: instantly relocates the wendigo to a live-resolved spot at the given band, same no-travel-time mechanic as combat.teleport_to_band, but the resolved spot is one the player CAN currently see (in view), not one they're blind to - the deliberate opposite of that ability's own close/behind_player values. The spot is still required to be completely unlit (0 light level) even though it's in view - a visible silhouette in the dark, not a lit-up reveal. Meant for a reveal: teleport in, then let yourself be seen doing something specific rather than just noticed standing somewhere. Early stages, pair it with an immediate posture.stare right after landing - the reveal-and-stare read of this creature. Later stages, pair it with a stare that quickly turns into combat.chase or combat.lunge_attack (directly, or via a global_rule on predicate.player_looking_at_self) - the stare becomes the wind-up for the strike rather than the whole beat. Always available as an action type, same as combat.teleport_to_band - the offered band(s) grow with stage (see 'band' below), cumulative like that ability's own bands, EXCEPT stage 1 specifically gets every band at once (a deliberate exception - see 'band' below), not just the farthest one the ordinary progression would otherwise give it alone. No separate source-band precondition here, unlike combat.teleport_to_band - this reveal is meant to be pullable off from wherever the wendigo currently is. If nothing in-view/unlit is live-resolvable at the requested band, the engine automatically searches outward (progressively farther bands) instead of failing outright, so only ever pick one of the bands this schema is currently offering and let the engine handle the rest.",
-      "properties": {
-        "type": {
-          "type": "string",
-          "const": "combat.teleport_in_view"
-        },
-        "band": {
-          "type": "string",
-          "enum": [
-            "farthest",
-            "farther",
-            "far",
-            "medium",
-            "close"
-          ],
-          "description": "Which distance band this in-view teleport resolves to. Grows with stage like combat.teleport_to_band's own bands (farthest unlocks at stage 1, farther adds at stage 2, far at stage 3, medium at stage 4, close at stage 5 - each stage keeps everything from before too), with one deliberate exception: stage 1 alone is offered every band at once (farthest through close), not just farthest - a one-time allowance so even the very first, most cautious stage has real variety in how far away its single reveal-and-vanish beat happens, rather than always the identical distance. Unlike combat.teleport_to_band's bands, the resolved spot is always one the player can currently see, never a blind spot."
-        }
-      },
-      "required": [
-        "type",
-        "band"
-      ],
-      "additionalProperties": false
-    },
-    "combat_teleport_to_eyeline": {
-      "type": "object",
-      "description": "COMBAT branch: instantly relocates the wendigo to a live-resolved spot at the given band, same no-travel-time mechanic as combat.teleport_to_band/combat.teleport_in_view, but the resolved spot is BOTH completely unlit (0 light level, like every other teleport destination) AND genuinely inline with the player's current eyeline - not merely somewhere broadly in their field of view the way combat.teleport_in_view's own spots are, a tight, dead-on alignment with wherever they're actually looking right now. Meant for the most unsettling version of a reveal: something dark, barely visible, already sitting exactly where their gaze already rests, so the moment of being noticed feels like it was already waiting for them rather than announcing itself. Pair it the same way combat.teleport_in_view recommends - an immediate posture.stare right after landing early on, or a stare that turns straight into combat.chase/combat.lunge_attack at later stages. Always available as an action type at every stage, no separate source-band precondition (pullable off from wherever the wendigo currently is, same as combat.teleport_in_view) - the offered band(s) grow with stage (see 'band' below), cumulative, EXCEPT stage 1 specifically gets every band at once, same one-time exception combat.teleport_in_view's own stage 1 gets. If nothing unlit-and-inline-with-eyeline is live-resolvable at the requested band, the engine automatically searches outward (progressively farther bands) instead of failing outright, so only ever pick one of the bands this schema is currently offering and let the engine handle the rest.",
-      "properties": {
-        "type": {
-          "type": "string",
-          "const": "combat.teleport_to_eyeline"
-        },
-        "band": {
-          "type": "string",
-          "enum": [
-            "farthest",
-            "farther",
-            "far",
-            "medium",
-            "close"
-          ],
-          "description": "Which distance band this eyeline teleport resolves to. Grows with stage exactly like combat.teleport_in_view's own band field (farthest unlocks at stage 1, farther adds at stage 2, far at stage 3, medium at stage 4, close at stage 5 - each stage keeps everything from before too), with the same one deliberate exception: stage 1 alone is offered every band at once (farthest through close), not just farthest. Unlike combat.teleport_in_view's bands (broadly in view), the resolved spot is always dark AND tightly aligned with the player's current gaze."
-        }
-      },
-      "required": [
-        "type",
-        "band"
-      ],
-      "additionalProperties": false
-    },
-    "combat_teleport_ahead": {
-      "type": "object",
-      "description": "COMBAT branch: instantly relocates the wendigo to a live-predicted spot along the player's own path, rather than a fixed band around wherever they currently stand - the closest thing this creature has to actually anticipating where the player is going, not just reacting to where they are right now. If the player is currently moving, the engine extrapolates a point some distance ahead along their live horizontal movement direction, then searches near THAT point for a landing spot - deliberately DIM (faintly lit, not pitch black) rather than the usual fully-dark requirement, since a player is far more likely to actually be walking through or near their own placed light than through genuine total darkness; landing somewhere dim near their predicted route reads as lying in wait along their real path, not teleporting to a random dark pocket that happens to be nearby but off their way. No band parameter - it always searches a fixed radius around the predicted point, not a distance-from-player band. If the player isn't currently moving, or nothing suitably dim turns up near the prediction, the engine automatically falls back to an ordinary combat.teleport_in_view instead (no failure state to plan around - this always resolves to SOME placement). Meant for a genuine ambush-in-wait: land ahead of them, then either posture.stare and hold (a control.while on predicate.player_approaching, letting the distance actually close before reacting) or let a held stare turn into combat.chase/combat.lunge_attack once they're close enough - waiting for them to arrive reads as far more unsettling than immediately closing the distance yourself. Always available as an action type, every stage.",
-      "properties": {
-        "type": {
-          "type": "string",
-          "const": "combat.teleport_ahead"
-        }
-      },
-      "required": [
-        "type"
+        "destination"
       ],
       "additionalProperties": false
     },
@@ -638,7 +492,7 @@
     },
     "control_re_evaluate": {
       "type": "object",
-      "description": "CONTROL branch: end the current plan right here and ask for a brand new one to replace everything after this point - available at any severity, any point in the plan (top-level, inside a control.if branch, inside a control.while body), WITH ONE HARD REQUIREMENT: at least one real, non-control action (movement/combat/posture/sound - anything that actually does something, not timing.wait or memory.store_dark_location) must already have run earlier in this same plan first. This is engine-enforced, not just a guideline - a re_evaluate placed before any real action has run is silently skipped as a no-op and the plan just continues past it, wasting the step. Use it to check whether something ALREADY TRIED is actually working - e.g. put it right after a posture.stare to see if the stare is landing or the player is drifting away, or partway through a chase that's dragging on - not to immediately second-guess a plan that was just handed to you before anything in it has happened. Use it when whatever the original plan committed to no longer fits what's actually happening: the player left, got obstructed by geometry, the same beat has been held too long with nothing changing, or the situation has just genuinely moved on since the plan was written - rather than trying to force the rest of the original plan through regardless. When this runs, the engine gathers a completely fresh read of the current situation (the same kind of context this whole request already received, current position/torch counts/history included) PLUS a log of every step that has actually run so far this engagement and how long each one took, and asks for a new sub-plan. That sub-plan's own 'plan'/'despawn_band'/'global_rules' fully replace whatever was left of the original - not merged, a clean continuation from here. Not a substitute for ordinary control.if/control.while branching (which is free, instant, no LLM round trip) - this is for when the plan itself, not just one branch of it, needs to change; don't reach for it reflexively on every step, only when something has actually gone stale enough to be worth a real reconsideration.",
+      "description": "CONTROL branch: end the current plan right here and ask for a brand new one to replace everything after this point - available at any severity, any point in the plan (top-level, inside a control.if branch, inside a control.while body), WITH ONE HARD REQUIREMENT: at least one real, non-control action (movement/combat/posture/sound - anything that actually does something, not timing.wait or memory.store_dark_location) must already have run earlier in this same plan first. This is engine-enforced, not just a guideline - a re_evaluate placed before any real action has run is silently skipped as a no-op and the plan just continues past it, wasting the step. Use it to check whether something ALREADY TRIED is actually working - e.g. put it right after a posture.stare to see if the stare is landing or the player is drifting away, or partway through a chase that's dragging on - not to immediately second-guess a plan that was just handed to you before anything in it has happened. Use it when whatever the original plan committed to no longer fits what's actually happening: the player left, got obstructed by geometry, the same beat has been held too long with nothing changing, or the situation has just genuinely moved on since the plan was written - rather than trying to force the rest of the original plan through regardless. When this runs, the engine gathers a completely fresh read of the current situation (the same kind of context this whole request already received, current position/torch counts/history included) PLUS a log of every step that has actually run so far this engagement and how long each one took, and asks for a new sub-plan. That sub-plan's own 'plan'/'global_rules' fully replace whatever was left of the original - not merged, a clean continuation from here. Not a substitute for ordinary control.if/control.while branching (which is free, instant, no LLM round trip) - this is for when the plan itself, not just one branch of it, needs to change; don't reach for it reflexively on every step, only when something has actually gone stale enough to be worth a real reconsideration.",
       "properties": {
         "type": {
           "type": "string",
@@ -696,7 +550,7 @@
     },
     "control_while": {
       "type": "object",
-      "description": "CONTROL branch: repeat 'body' in a loop as long as 'condition' holds (re-checked between each iteration by the engine). Example: 'stalk the player while they are not looking at us' = while(not(predicate.player_looking_at_self)) { movement.approach }. 'max_iterations' is a mandatory safety cap - the engine still stops the loop after that many iterations even if the condition never flips, so a stuck predicate can't hang the entity forever without a new decision turn.",
+      "description": "CONTROL branch: repeat 'body' in a loop as long as 'condition' holds (re-checked between each iteration by the engine). Example: 'stalk the player while they are not looking at us' = while(not(predicate.player_looking_at_self)) { movement.approach }. 'max_iterations' is a mandatory safety cap - the engine still stops the loop after that many iterations even if the condition never flips, so a stuck predicate can't hang the entity forever without a new decision turn. 'body' may include control.if (see control_while_body_step) - e.g. 'while waiting, if the player looks, break the hold' - the one exception to control flow otherwise never nesting; control.if's own condition is (re-)evaluated fresh each time the loop actually reaches it, same as anywhere else.",
       "properties": {
         "type": {
           "type": "string",
@@ -708,7 +562,7 @@
         "body": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/action_step"
+            "$ref": "#/$defs/control_while_body_step"
           },
           "minItems": 1,
           "maxItems": 3
@@ -730,6 +584,17 @@
         "max_iterations"
       ],
       "additionalProperties": false
+    },
+    "control_while_body_step": {
+      "description": "A control.while body entry: any primitive action, or control.if - the one place control flow is allowed to nest one level deep. control.if used here still can't itself contain another control.if or control.while (its then/else stay flat action_step lists, same as everywhere else).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/action_step"
+        },
+        {
+          "$ref": "#/$defs/control_if"
+        }
+      ]
     },
     "predicate": {
       "description": "A boolean fact the engine evaluates on demand - the model picks which fact to check, never computes the answer itself. Compound predicates (not/and/or) wrap only simple predicates, one level deep, to keep the condition tree shallow and reliable for a small model to produce.",

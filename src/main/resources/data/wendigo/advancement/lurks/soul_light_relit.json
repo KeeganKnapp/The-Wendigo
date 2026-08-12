@@ -1,0 +1,25 @@
+{
+  "parent": "wendigo:lurks/soul_light",
+  "criteria": {
+    "impossible": {
+      "trigger": "minecraft:impossible"
+    }
+  },
+  "display": {
+    "description": {
+      "text": "Keep those soul lights lit with a flint and steel. It will try again and again to snuff them out and reap havoc."
+    },
+    "hidden": false,
+    "icon": {
+      "id": "minecraft:flint_and_steel"
+    },
+    "title": {
+      "text": "Learn to live with it"
+    }
+  },
+  "requirements": [
+    [
+      "impossible"
+    ]
+  ]
+}

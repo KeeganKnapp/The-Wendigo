@@ -27,7 +27,7 @@ public final class PlanPredicates {
 	 * player distance captured when the currently-active control.while began (NaN if there isn't
 	 * one - see PlanRunner, the only source of a real value). inViewStreakTicks/cornerOfEyeStreakTicks
 	 * are PlanRunner's own graduated-look-band streak counters (see
-	 * isLookedAtByAnyoneGraduated's own comment) - tracked continuously every tick regardless of
+	 * isLookedAtByTargetGraduated's own comment) - tracked continuously every tick regardless of
 	 * while-state, so a streak that started before a stare-hold loop even began still counts once the
 	 * loop actually starts checking it. */
 	record Context(double whileBaselineDistance, int inViewStreakTicks, int cornerOfEyeStreakTicks) {
@@ -176,9 +176,9 @@ public final class PlanPredicates {
 
 	/** Human-readable live snapshot (distance to nearest player + looking state at every band) - used
 	 * purely for debugSay diagnostics, e.g. explaining why a control.while ended after 0 iterations.
-	 * Looking state reflects any nearby player (see isLookedAtByAnyone), not just the nearest one, and
-	 * is the RAW (non-graduated) check - a diagnostic snapshot should show what's actually true right
-	 * now, not the leniency plan predicates apply. */
+	 * Looking state reflects only the target (see isLookedAtByTarget), and is the RAW (non-graduated)
+	 * check - a diagnostic snapshot should show what's actually true right now, not the leniency plan
+	 * predicates apply. */
 	static String debugSnapshot(WendigoEntity self) {
 		Player player = Targeting.nearestPlayer(self);
 		if (player == null) {
@@ -186,55 +186,62 @@ public final class PlanPredicates {
 		}
 		return String.format("distance=%.1f looking(corner_of_eye)=%b looking(in_view)=%b looking(dead_stare)=%b",
 			self.distanceTo(player),
-			isLookedAtByAnyone(self, "corner_of_eye"),
-			isLookedAtByAnyone(self, "in_view"),
-			isLookedAtByAnyone(self, "dead_stare"));
+			isLookedAtByTarget(self, "corner_of_eye"),
+			isLookedAtByTarget(self, "in_view"),
+			isLookedAtByTarget(self, "dead_stare"));
 	}
 
 	private static boolean isDark(Level level, BlockPos pos) {
 		return level.getMaxLocalRawBrightness(pos) <= SemanticBands.DARKNESS_LIGHT_THRESHOLD;
 	}
 
-	/** Global stare FOV for multiplayer: any player within range looking at the wendigo counts,
-	 * regardless of who the wave is actually targeting/chasing - a group member noticing it from the
-	 * side should "spot" it just as much as the one being stalked. Graduated (see
-	 * isLookedAtByAnyoneGraduated) - a control-flow predicate, not a raw fact, so the leniency applies
-	 * here. */
+	/** Target-only stare detection - the user's own explicit "changing player detected to just if the
+	 * target detects them" reversal of the earlier "any player within range" multiplayer FOV design
+	 * (see git history/this method's own prior revision): a group member noticing the wendigo from
+	 * the side while it's actually haunting someone ELSE no longer counts as "spotted" - only the
+	 * wave's own actual target (Targeting.nearestPlayer, which already resolves to the locked target
+	 * first when one's set - see its own doc comment) does. Approach-based detection
+	 * (hasApproachedByAnyone/predicate.player_approaching) deliberately stays "any player" - a
+	 * DIFFERENT group member closing distance mid-stare is still a real threat/opportunity worth
+	 * reacting to even if they're not who the encounter is officially "for" (see
+	 * PlanRunner.isAnyPlayerApproachingDuringStare, the new hardcoded rule built on exactly that
+	 * distinction). Graduated (see isLookedAtByTargetGraduated) - a control-flow predicate, not a raw
+	 * fact, so the leniency applies here. */
 	private static boolean playerLookingAtSelf(JsonObject predicate, WendigoEntity self, Context context) {
-		return isLookedAtByAnyoneGraduated(self, predicate.get("band").getAsString(), context);
+		return isLookedAtByTargetGraduated(self, predicate.get("band").getAsString(), context);
 	}
 
 	/** Used by PlanRunner's per-tick outcome polling (see EncounterHistory) - independent of whether
-	 * the plan itself ever checks predicate.player_looking_at_self(dead_stare). Same "any player"
-	 * multiplayer semantics as playerLookingAtSelf, but deliberately the RAW (non-graduated) check -
-	 * this is a factual outcome record ("did a real dead stare happen"), not a control-flow predicate
-	 * that should get the graduated-timeout leniency. Public (unlike most of this package - see
+	 * the plan itself ever checks predicate.player_looking_at_self(dead_stare). Same target-only
+	 * semantics as playerLookingAtSelf, but deliberately the RAW (non-graduated) check - this is a
+	 * factual outcome record ("did a real dead stare happen"), not a control-flow predicate that
+	 * should get the graduated-timeout leniency. Public (unlike most of this package - see
 	 * PositionBands/SchemaBuilder/isLookingAtSelf's own precedent for the same exception) specifically
 	 * so com.wendigo.wave.WendigoManager can reuse it directly for its own orbit exposure check
 	 * (checkOrbitExposure's stage-1-only dead_stare trigger). */
 	public static boolean isDeadStare(WendigoEntity self) {
-		return isLookedAtByAnyone(self, "dead_stare");
+		return isLookedAtByTarget(self, "dead_stare");
 	}
 
 	/** Package-visible so PlanRunner's own updateLookStreaks can poll it every tick to feed the
-	 * graduated-look-band streak counters (see isLookedAtByAnyoneGraduated). */
-	static boolean isLookedAtByAnyone(WendigoEntity self, String band) {
-		for (Player player : Targeting.nearbyPlayers(self)) {
-			if (isLookingAtSelf(player, self, band)) {
-				return true;
-			}
-		}
-		return false;
+	 * graduated-look-band streak counters (see isLookedAtByTargetGraduated). Target-only - see
+	 * playerLookingAtSelf's own doc comment for why this changed from "any nearby player." */
+	static boolean isLookedAtByTarget(WendigoEntity self, String band) {
+		Player target = Targeting.nearestPlayer(self);
+		return target != null && isLookingAtSelf(target, self, band);
 	}
 
-	/** RAW line-of-sight only - no facing-angle requirement at all, unlike isLookedAtByAnyone/
+	/** RAW line-of-sight only - no facing-angle requirement at all, unlike isLookedAtByTarget/
 	 * isLookingAtSelf above - true if ANY nearby player currently has an unobstructed view of self's
 	 * own live position, purely a geometry question independent of whether they're actually looking
 	 * that way right now. Backs PlanRunner's own pre-stare obstruction check (see its own comment) -
 	 * the user's own explicit request: before committing to a held stare, make sure it would even be
 	 * VISIBLE at all if the player turned to look, not just currently unwatched because of angle
-	 * (which is all isLookedAtByAnyone/predicate.player_looking_at_self can tell you). Package-visible
-	 * for that same PlanRunner consumer. */
+	 * (which is all isLookedAtByTarget/predicate.player_looking_at_self can tell you). Package-visible
+	 * for that same PlanRunner consumer.
+	 * <p>NOTE: currently unreferenced (PlanRunner.ensureVisibleBeforeStaring, the consumer this doc
+	 * comment describes, doesn't exist in the current codebase - left as-is, out of scope for this
+	 * pass, since it predates and is unrelated to the target-only stare-detection change above). */
 	static boolean isVisibleToAnyPlayer(WendigoEntity self) {
 		return isPositionVisibleToAnyPlayer(self, self.getVisualEyePosition());
 	}
@@ -272,7 +279,7 @@ public final class PlanPredicates {
 		};
 	}
 
-	/** True if band is currently satisfied outright (isLookedAtByAnyone), OR if the next-weaker band
+	/** True if band is currently satisfied outright (isLookedAtByTarget), OR if the next-weaker band
 	 * has been continuously satisfied for SemanticBands.GRADUATED_LOOK_STREAK_TICKS - see that
 	 * constant's own comment. E.g. wanting dead_stare but only ever reaching in_view still counts
 	 * once the player's held in_view for 3 straight seconds; wanting in_view but only reaching
@@ -280,17 +287,17 @@ public final class PlanPredicates {
 	 * needing an exact dead-on look that a player who's merely glancing over might never quite give
 	 * it - see PlanRunner's own control.while-start handling for the matching restriction on using
 	 * predicate.player_distance to gate a stare instead. */
-	private static boolean isLookedAtByAnyoneGraduated(WendigoEntity self, String band, Context context) {
-		if (isLookedAtByAnyone(self, band)) {
+	private static boolean isLookedAtByTargetGraduated(WendigoEntity self, String band, Context context) {
+		if (isLookedAtByTarget(self, band)) {
 			return true;
 		}
 		String weaker = nextWeakerBand(band);
 		return weaker != null && streakTicksForBand(weaker, context) >= SemanticBands.GRADUATED_LOOK_STREAK_TICKS;
 	}
 
-	/** Package-visible so PlanRunner can reuse this exact facing check for the spear-defense
-	 * mechanic (see isPlayerDefendingWithSpear) and its own graduated-look-streak tracking
-	 * (updateLookStreaks) instead of duplicating the eye-position/dot-product math.
+	/** Package-visible so PlanRunner can reuse this exact facing check for its own graduated-
+	 * look-streak tracking (updateLookStreaks) instead of duplicating the eye-position/dot-product
+	 * math.
 	 * <p>Deliberately targets WendigoEntity.getVisualEyePosition(), NOT self.getEyePosition() (left
 	 * at vanilla's own default - see that method's own doc comment for the real suffocation bug that
 	 * happened trying to raise it instead). The line-of-sight half needs the same substitution - see
@@ -302,10 +309,9 @@ public final class PlanPredicates {
 
 	/** Same facing/line-of-sight check as isLookingAtSelf(band) above, but against a raw angle in
 	 * degrees instead of one of the fixed named bands - for callers that need a value the band
-	 * vocabulary doesn't cover, e.g. PlanRunner's per-spear-tier defense angle (see
-	 * PlanRunner.spearDefenseAngleDegrees), which needs a continuum of values rather than one of
-	 * dead_stare/in_view/corner_of_eye. isLookingAtSelf(band) itself now just resolves its band to a
-	 * degrees value and delegates here - the two are the same check, just different entry points. */
+	 * vocabulary doesn't cover, a continuum of values rather than one of dead_stare/in_view/
+	 * corner_of_eye. isLookingAtSelf(band) itself now just resolves its band to a degrees value and
+	 * delegates here - the two are the same check, just different entry points. */
 	public static boolean isLookingAtSelfWithinAngle(Player player, WendigoEntity self, double angleDegrees) {
 		Vec3 selfEyes = self.getVisualEyePosition();
 		Vec3 toSelf = selfEyes.subtract(player.getEyePosition()).normalize();
@@ -351,7 +357,11 @@ public final class PlanPredicates {
 	private static final int HEAD_RING_POINTS = 6;
 	private static final double HEAD_SAMPLE_RADIUS = 0.25;
 
-	private static boolean hasLineOfSightToSelf(Player player, WendigoEntity self, Vec3 selfEyes) {
+	/** Public specifically so com.wendigo.sound.WendigoSounds can reuse this exact per-player head-
+	 * visibility check for sound.ambient_cue(stare)'s own live "obstructed line of sight" gate - the
+	 * user's own explicit request: a stare sound should only actually reach a player who can genuinely
+	 * see the wendigo's face right now, not everyone in the level regardless of walls between them. */
+	public static boolean hasLineOfSightToSelf(Player player, WendigoEntity self, Vec3 selfEyes) {
 		Vec3 from = player.getEyePosition();
 		if (hasClearRayTo(player, from, selfEyes)) {
 			return true;
@@ -382,7 +392,11 @@ public final class PlanPredicates {
 		return hasApproachedByAnyone(self, predicate.get("band").getAsString(), whileBaselineDistance);
 	}
 
-	private static boolean hasApproachedByAnyone(WendigoEntity self, String band, double whileBaselineDistance) {
+	/** Package-visible so PlanRunner's own isAnyPlayerApproachingDuringStare can reuse this exact
+	 * "any player" approach check directly for its new hardcoded stare-interrupt rule - see that
+	 * method's own doc comment for why approach detection deliberately stays multiplayer-global even
+	 * though look detection (isLookedAtByTarget) no longer is. */
+	static boolean hasApproachedByAnyone(WendigoEntity self, String band, double whileBaselineDistance) {
 		if (Double.isNaN(whileBaselineDistance)) {
 			return false;
 		}
@@ -398,18 +412,19 @@ public final class PlanPredicates {
 
 	/** Backs predicate.player_undetected: !looking_at_self(band) && !hasApproached(approach_band), as
 	 * one atomic check - see its schema description for why this exists instead of making the model
-	 * hand-compose predicate.and(predicate.not(...), predicate.not(...)) for this idiom. Both halves
-	 * are multiplayer-global now (any nearby player spotting it, or any nearby player closing in,
-	 * counts) - see isLookedAtByAnyoneGraduated/hasApproachedByAnyone. The approach half's distance
-	 * scaling still always comes from whileBaselineDistance, captured once from whoever was closest
-	 * the moment the loop began - "any player" only changes who gets checked against that baseline,
-	 * not how it's computed. The looking half is graduated the same as predicate.player_looking_at_self
-	 * itself - a sustained near-miss glance counts as "detected" here too, not just an exact look. */
+	 * hand-compose predicate.and(predicate.not(...), predicate.not(...)) for this idiom. The looking
+	 * half is target-only now (see isLookedAtByTargetGraduated/playerLookingAtSelf's own comment on
+	 * why); the approach half stays multiplayer-global (any nearby player closing in counts) - see
+	 * hasApproachedByAnyone. The approach half's distance scaling still always comes from
+	 * whileBaselineDistance, captured once from whoever was closest the moment the loop began - "any
+	 * player" only changes who gets checked against that baseline, not how it's computed. The looking
+	 * half is graduated the same as predicate.player_looking_at_self itself - a sustained near-miss
+	 * glance counts as "detected" here too, not just an exact look. */
 	private static boolean playerUndetected(JsonObject predicate, WendigoEntity self, Context context) {
 		if (Targeting.nearestPlayer(self) == null) {
 			return false; // nothing to hide from - not the same as "safely undetected", so don't loop forever on this
 		}
-		if (isLookedAtByAnyoneGraduated(self, predicate.get("band").getAsString(), context)) {
+		if (isLookedAtByTargetGraduated(self, predicate.get("band").getAsString(), context)) {
 			return false;
 		}
 		return !hasApproachedByAnyone(self, predicate.get("approach_band").getAsString(), context.whileBaselineDistance());
