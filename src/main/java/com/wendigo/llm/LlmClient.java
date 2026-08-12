@@ -74,6 +74,16 @@ public class LlmClient {
 			this.openAiHttpClient = HttpClient.newBuilder()
 				.connectTimeout(Duration.ofSeconds(config.requestTimeoutSeconds))
 				.build();
+			// A real, live-reported gap: unlike the Anthropic branch below, nothing here used to
+			// call resolveApiKey at construction time at all - it only ran lazily inside
+			// requestPlanOpenAi, the first time an actual wave attempted a real API call. On a
+			// server where no wendigo encounter had happened yet, that method never ran, so the
+			// placeholder file never got written no matter how many times the server restarted.
+			// Result discarded - called purely for its own side effect (writing the placeholder
+			// file if missing); requestPlanOpenAi still re-resolves per-request below, both for the
+			// real value once one exists and so editing the file mid-session doesn't need a restart
+			// to take effect (unlike the Anthropic client, which bakes its key in once here).
+			resolveApiKey("OPENAI_API_KEY", "openai");
 		} else {
 			AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder()
 				.timeout(Duration.ofSeconds(config.requestTimeoutSeconds));
