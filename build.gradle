@@ -19,6 +19,16 @@ repositories {
 	mavenCentral()
 }
 
+// A dedicated configuration for the Anthropic Java SDK - see its own dependencies{} entry below
+// for why this can't just be a plain include(implementation(...)) line like the polymer-*
+// dependencies use. Its full resolved graph gets walked in the afterEvaluate block at the bottom
+// of this file, which include()s every one of those artifacts individually (so a future SDK
+// version bump can't silently drop a newly-added transitive the way a hand-written list would).
+configurations {
+	anthropicShade
+}
+configurations.implementation.extendsFrom(configurations.anthropicShade)
+
 loom {
 	splitEnvironmentSourceSets()
 
@@ -75,11 +85,30 @@ dependencies {
 	include(implementation("eu.pb4:polymer-resource-pack:${project.polymer_version}"))
 
 	// Anthropic Java SDK - drives the wendigo's decision plans (see com.wendigo.llm).
-	// Plain `implementation`, not `include()`: it and its transitive deps (OkHttp, Jackson,
-	// kotlin-stdlib) aren't bundled into the jar yet, so this only works for dev runs
-	// (runServer/runClient) right now. Shade/include the full dependency graph before
-	// distributing this mod as a standalone jar to other server admins.
-	implementation "com.anthropic:anthropic-java:2.34.0"
+	// anthropicShade, not a plain include(implementation(...)) line: this SDK's real dependency
+	// graph is far deeper than just itself - OkHttp, Jackson (databind/datatype-jdk8/jsr310/
+	// module-kotlin), Kotlin stdlib, Apache HttpComponents 5, victools jsonschema-generator (+
+	// its jackson/swagger modules), slf4j-api, and a few smaller ones (confirmed via `gradlew
+	// dependencies` - the anthropic-java artifact ITSELF is a ~350-byte empty aggregator POM-jar
+	// with zero real classes). include(implementation(...)) only nests the ONE literal artifact
+	// you wrap, not that artifact's own transitive deps (confirmed empirically), so every one of
+	// those ~25 real jars needs its own individual include() entry for Loom to actually bundle
+	// it - see the afterEvaluate block at the bottom of this file, which does that
+	// programmatically off this configuration's own fully-resolved graph instead of a
+	// hand-maintained list.
+	//
+	// slf4j-api excluded deliberately: confirmed via `gradlew dependencies` that Fabric/Minecraft
+	// itself already directly depends on org.slf4j:slf4j-api (paired with its own
+	// log4j-slf4j2-impl logging bridge) at 2.0.17 - the version every OTHER slf4j-api request in
+	// the whole project's graph gets conflict-resolved up to. anthropicShade resolves in
+	// isolation from that project-wide resolution, so left unexcluded it nested a stale
+	// 2.0.16 copy instead - a real, if probably-harmless-in-practice, version mismatch against
+	// what the rest of the mod (and Fabric itself) actually uses. Excluding it here means the
+	// mod links against the one real copy Fabric/Minecraft already guarantees is present, same
+	// as every other library shouldn't re-bundle a logging facade its host platform already owns.
+	anthropicShade("com.anthropic:anthropic-java:2.34.0") {
+		exclude group: 'org.slf4j', module: 'slf4j-api'
+	}
 
 	// Advanced Wall Climber API (AWCAPI, by Nyfaria: https://nyfaria.com/docs) - real spider-style
 	// wall/ceiling climbing physics + pathfinding, used by WendigoEntity for wall/ceiling movement.
@@ -119,6 +148,17 @@ dependencies {
 	// unmodified into libs/ purely so the compileOnly reference has a stable path independent of
 	// whatever happens to be in run/mods/ at any given moment.
 	compileOnly files('libs/stormiespiders-fabric-26.1-3.3.0.jar')
+}
+
+// See anthropicShade's own comment above - walks its fully-resolved dependency graph (only
+// available after the configuration is actually resolved, hence afterEvaluate) and adds every
+// resolved artifact to Loom's own "include" configuration individually, so each one gets nested
+// into the built jar under META-INF/jars/ the same way the polymer-* dependencies already are.
+afterEvaluate {
+	configurations.anthropicShade.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+		def id = artifact.moduleVersion.id
+		dependencies.add('include', "${id.group}:${id.name}:${id.version}")
+	}
 }
 
 processResources {
