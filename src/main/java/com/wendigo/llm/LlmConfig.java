@@ -13,9 +13,15 @@ import net.fabricmc.loader.api.FabricLoader;
 /**
  * Tunables for the wendigo's LLM calls, stored as config/wendigo-llm.json so a server admin can
  * change provider/model/limits without recompiling. API keys themselves are intentionally NOT
- * fields here - read from the environment by LlmClient (ANTHROPIC_API_KEY for provider=anthropic,
- * or an `ant auth login` profile; OPENAI_API_KEY for provider=openai), so neither ends up
- * committed alongside this file.
+ * fields here - resolved by LlmClient.resolveApiKey instead (ANTHROPIC_API_KEY for
+ * provider=anthropic, OPENAI_API_KEY for provider=openai), which tries, in order: a real OS
+ * environment variable, a same-named Java system property (a "-DOPENAI_API_KEY=..." JVM
+ * argument - works on locked-down hosting panels that expose custom startup flags but not real
+ * env vars), then a plain config/wendigo-<provider>-api-key.txt file (works regardless of what a
+ * given panel supports at all, since file-manager/SFTP access is already required just to install
+ * the mod jar in the first place) - the Anthropic path also still falls back further to the SDK's
+ * own `ant auth login` CLI profile lookup if none of those three have anything. Kept out of this
+ * class/file specifically so a key never ends up committed alongside the rest of this config.
  */
 public class LlmConfig {
 	// "anthropic" or "openai" - selects which of the two below (model/openaiModel) and which env
