@@ -141,7 +141,7 @@ public final class WendigoSounds {
 
 	// The user's own explicit "5 blocks out" distance from the hardcoded command this mirrors - see
 	// the class doc comment.
-	private static final double CINEMATIC_OFFSET_DISTANCE = 14.0;
+	private static final double CINEMATIC_OFFSET_DISTANCE = 10.0;
 
 	/** Plays immediately if the same MIN_SOUND_INTERVAL_TICKS gap every cue shares has already
 	 * elapsed, or does nothing at all otherwise - a plain availability check (see the class doc
@@ -184,7 +184,7 @@ public final class WendigoSounds {
 				continue;
 			}
 			Vec3 pos = offset ? cinematicSoundPosition(player, source) : player.position();
-			level.playSound(null, pos.x, pos.y, pos.z, event, SoundSource.HOSTILE, 1.0F, 1.0F);
+			level.playSound(null, pos.x, pos.y, pos.z, event, SoundSource.HOSTILE, 2.0F, 1.0F);
 		}
 		NEXT_ALLOWED_TICK.put(level, now + MIN_SOUND_INTERVAL_TICKS);
 	}
