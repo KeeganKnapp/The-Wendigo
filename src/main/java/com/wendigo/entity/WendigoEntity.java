@@ -155,11 +155,35 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
      * defensively: if this real EnderMan-based entity's own synced-data layout ever happened to
      * already have an entry at the exact same numeric id (pure coincidence based on each class's
      * own unrelated field-registration order), appending a second entry for the same id without
-     * clearing the first could leave a duplicate the client isn't guaranteed to resolve sanely. */
+     * clearing the first could leave a duplicate the client isn't guaranteed to resolve sanely.
+     * <p>
+     * Also strips FLAG_GLOWING out of the real shared-flags byte before it reaches the client - a
+     * real, live-reported bug: vanilla's own glow-outline rendering deliberately bypasses normal
+     * invisibility occlusion (that's the whole point of Glowing - seeing an entity's silhouette
+     * through walls/invisibility), so once startGlow's real setGlowingTag(true) call landed on the
+     * client's own locally-rendered baby-zombie stand-in, its outline rendered right there,
+     * mismatched and out of place under the actual visible rig (which already has its OWN separate,
+     * correctly-working glow treatment - see WendigoVisual.applyGlow, which mirrors
+     * isCurrentlyGlowing() onto the item-display rig directly, entirely independent of this real
+     * vanilla flag). SERVER-side logic that reads isCurrentlyGlowing() (isFleeingFromSpectralHit
+     * gating, etc.) is completely unaffected - only what's actually transmitted to clients changes
+     * here. DATA_SHARED_FLAGS_ID/FLAG_GLOWING are real vanilla Entity fields, both protected
+     * (confirmed via javap) - directly accessible here through this class's own real Entity
+     * inheritance, no reflection needed (unlike Zombie's own private DATA_BABY_ID above). */
     @Override
     public void modifyRawTrackedData(List<SynchedEntityData.DataValue<?>> data, ServerPlayer player, boolean initial) {
         data.removeIf(value -> value.id() == ZOMBIE_BABY_ACCESSOR.id());
         data.add(SynchedEntityData.DataValue.create(ZOMBIE_BABY_ACCESSOR, true));
+
+        for (int i = 0; i < data.size(); i++) {
+            SynchedEntityData.DataValue<?> value = data.get(i);
+            if (value.id() == DATA_SHARED_FLAGS_ID.id()) {
+                byte flags = (Byte) value.value();
+                byte withoutGlow = (byte) (flags & ~(1 << FLAG_GLOWING));
+                data.set(i, SynchedEntityData.DataValue.create(DATA_SHARED_FLAGS_ID, withoutGlow));
+                break;
+            }
+        }
     }
 
     // Enderman's own tall/narrow hitbox doesn't suit a low horizontal crawl -- swap to a low

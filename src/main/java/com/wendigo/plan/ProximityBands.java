@@ -19,7 +19,9 @@ public final class ProximityBands {
 	/** Upper bound of each band, in blocks - used as the threshold for predicate.player_distance. */
 	public static double blocks(String band) {
 		return switch (band) {
-			case "grab_distance" -> 3.0;
+			// The user's own explicit tightening - the actual physical melee/grab range
+			// (WendigoManager.checkUnconditionalGrab's own trigger distance), was 3.0.
+			case "grab_distance" -> 0.5;
 			case "lunge_distance" -> 9.0;
 			case "close_quarters" -> 14.0;
 			case "far" -> 35.0;
@@ -29,7 +31,7 @@ public final class ProximityBands {
 
 	/** Which band a raw distance falls into - used to label spot distances in the wave prompt. */
 	public static String labelFor(double distanceBlocks) {
-		if (distanceBlocks <= 3.0) {
+		if (distanceBlocks <= 0.5) {
 			return "grab_distance";
 		}
 		if (distanceBlocks <= 9.0) {
