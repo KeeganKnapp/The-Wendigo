@@ -80,27 +80,39 @@ import com.wendigo.spatial.DarkSpotScanner;
  * instant it joins ("Received N registry entries that are unknown to this client"), regardless of
  * whether {@link WendigoVisual}'s own separate item-display rig is properly Polymer-virtualized -
  * registry-sync runs at login, well before any entity ever actually spawns. getPolymerEntityType
- * resolving to vanilla's own real EntityType.MARKER (not EntityType.ENDERMAN, tried first) is what
- * lets PolymerEntityUtils.registerType (see ModEntities.init) exclude WENDIGO from that sync
- * entirely and have Polymer present this entity to a non-Polymer client as something genuinely
- * invisible. Enderman was tried first (matching this class's own EnderMan inheritance, and
+ * resolving to vanilla's own real EntityType.ZOMBIE (after two other real, live-tested attempts -
+ * see below) is what lets PolymerEntityUtils.registerType (see ModEntities.init) exclude WENDIGO
+ * from that sync entirely and have Polymer present this entity to a non-Polymer client as
+ * something that renders correctly.
+ * <p>
+ * EntityType.ENDERMAN was tried first (matching this class's own EnderMan inheritance, and
  * preserving real hitbox/click-targeting for a non-mod client), but real live-testing found a
  * well-known vanilla EndermanRenderer quirk: its glowing eyes are drawn via a separate emissive
  * layer that bypasses the normal invisibility alpha fade entirely, so an invisible Enderman still
  * shows floating eyes - no per-entity data flag can suppress that without a client-side renderer
- * change, which this project's own "no client mod required" design rules out. Marker is a real,
- * genuinely invisible-by-design vanilla type with none of that - the user's own explicit choice,
- * made with the accepted tradeoff that Marker has zero client-side collision, so a real vanilla
- * client's own left-click attack-targeting (client-side raycast against a KNOWN local hitbox)
- * likely can't select it anymore even though the SERVER's own real hitbox (used for arrow physics,
- * the grab mechanic, etc.) is completely unaffected - melee is a real, functional (if
- * secondary/incidental) damage path in hurtServer below, worth live-retesting if it turns out to
- * matter.
+ * change, which this project's own "no client mod required" design rules out.
+ * <p>
+ * EntityType.MARKER was tried next (genuinely invisible by design, no eye-glow quirk) - but real
+ * live-testing found this broke the carry mechanic entirely: a carried player went blind (a real
+ * status effect, unaffected by any of this) but never visually moved with the wendigo, even though
+ * the despawn damage still landed correctly after the real countdown (proof the SERVER-side
+ * passenger/vehicle relationship - real Java state on this actual EnderMan-subclass entity - was
+ * never the problem). Confirmed via decompiling vanilla's own real Marker.class: canAddPassenger()
+ * and couldAcceptPassenger() are hardcoded to return false, addPassenger() throws
+ * IllegalStateException if ever reached, and even getAddEntityPacket() itself throws
+ * "Markers should never be sent" - Mojang never designed this type to be sent to a client as a
+ * real, passenger-carrying entity at all, a hard restriction, not a tunable quirk.
+ * <p>
+ * EntityType.ZOMBIE has none of Enderman's eye-glow-bypasses-invisibility quirk (invisibility
+ * fully hides the whole model, same as most ordinary mobs) and, being a normal passenger-capable
+ * LivingEntity like every other common hostile mob, should carry a rider correctly - real hitbox/
+ * melee-click-targeting for a non-mod client comes back too, the same property Enderman had and
+ * Marker didn't.
  */
 public class WendigoEntity extends EnderMan implements IAdvancedClimber, PolymerEntity {
     @Override
     public EntityType<?> getPolymerEntityType(PacketContext context) {
-        return EntityType.MARKER;
+        return EntityType.ZOMBIE;
     }
 
     // Enderman's own tall/narrow hitbox doesn't suit a low horizontal crawl -- swap to a low
