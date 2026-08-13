@@ -1,5 +1,6 @@
 package com.wendigo.entity;
 
+import java.lang.reflect.Field;
 import java.util.List;
 import java.util.function.Predicate;
 
@@ -10,6 +11,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
@@ -25,6 +28,7 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.FloatGoal;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.monster.EnderMan;
+import net.minecraft.world.entity.monster.zombie.Zombie;
 import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
 import net.minecraft.world.entity.projectile.arrow.SpectralArrow;
 import net.minecraft.server.level.ServerLevel;
@@ -105,14 +109,57 @@ import com.wendigo.spatial.DarkSpotScanner;
  * <p>
  * EntityType.ZOMBIE has none of Enderman's eye-glow-bypasses-invisibility quirk (invisibility
  * fully hides the whole model, same as most ordinary mobs) and, being a normal passenger-capable
- * LivingEntity like every other common hostile mob, should carry a rider correctly - real hitbox/
+ * LivingEntity like every other common hostile mob, carries a rider correctly - real hitbox/
  * melee-click-targeting for a non-mod client comes back too, the same property Enderman had and
- * Marker didn't.
+ * Marker didn't. One real follow-up, live-reported: a carried player rode too high, floating well
+ * above the (visually low/crawling) rig - a full-adult zombie's own real mount-attachment height is
+ * computed from a full-adult zombie's own real dimensions, nowhere close to the rig's own actual
+ * silhouette. Medium slime/magma cube were considered as a shorter alternative, but ruled out after
+ * decompiling Slime.tick(): its landing-squish particle emission has no client/server guard
+ * whatsoever (MagmaCube inherits it unchanged, doesn't override tick() at all) - it would trigger
+ * client-side, unsuppressably, from the CLIENT's own locally-predicted on-ground transitions,
+ * regardless of anything this class does. modifyRawTrackedData below instead injects Zombie's own
+ * real DATA_BABY_ID flag (true) into the raw synced-data list Polymer sends for this entity -
+ * baby zombies are a real, roughly-half-height vanilla variant of this SAME entity type (not a
+ * separate EntityType), with none of Slime's particle baggage, so this keeps every property the
+ * plain-adult-Zombie choice already earned while fixing the mount height too.
  */
 public class WendigoEntity extends EnderMan implements IAdvancedClimber, PolymerEntity {
+    // Zombie.DATA_BABY_ID is private - resolved once via reflection rather than hand-copying its
+    // real numeric synced-data ID (which is assigned sequentially at class-load time based on
+    // registration order across Zombie's own whole inheritance chain, not something safe to
+    // hardcode a literal for). The server and client both run the exact same real Zombie.java
+    // class, so whatever id this JVM's own registration assigns is guaranteed identical to
+    // whatever the client's own locally-constructed stand-in Zombie assigns for the same field.
+    private static final EntityDataAccessor<Boolean> ZOMBIE_BABY_ACCESSOR = resolveZombieBabyAccessor();
+
+    @SuppressWarnings("unchecked")
+    private static EntityDataAccessor<Boolean> resolveZombieBabyAccessor() {
+        try {
+            Field field = Zombie.class.getDeclaredField("DATA_BABY_ID");
+            field.setAccessible(true);
+            return (EntityDataAccessor<Boolean>) field.get(null);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Failed to resolve Zombie's own DATA_BABY_ID field via reflection", e);
+        }
+    }
+
     @Override
     public EntityType<?> getPolymerEntityType(PacketContext context) {
         return EntityType.ZOMBIE;
+    }
+
+    /** See this class's own doc comment for why - forces the client-visible stand-in to read as a
+     * baby zombie (roughly half height, fixing the carried-player-rides-too-high bug) regardless
+     * of whatever this real entity's own actual synced data would otherwise say. removeIf first,
+     * defensively: if this real EnderMan-based entity's own synced-data layout ever happened to
+     * already have an entry at the exact same numeric id (pure coincidence based on each class's
+     * own unrelated field-registration order), appending a second entry for the same id without
+     * clearing the first could leave a duplicate the client isn't guaranteed to resolve sanely. */
+    @Override
+    public void modifyRawTrackedData(List<SynchedEntityData.DataValue<?>> data, ServerPlayer player, boolean initial) {
+        data.removeIf(value -> value.id() == ZOMBIE_BABY_ACCESSOR.id());
+        data.add(SynchedEntityData.DataValue.create(ZOMBIE_BABY_ACCESSOR, true));
     }
 
     // Enderman's own tall/narrow hitbox doesn't suit a low horizontal crawl -- swap to a low
