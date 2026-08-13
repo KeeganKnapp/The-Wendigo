@@ -89,29 +89,41 @@ public final class DarknessOverstayTracker {
 				continue;
 			}
 			int ticks = this.darkTicks.merge(id, SAMPLE_INTERVAL_TICKS, Integer::sum);
+			// Ambush/override check runs BEFORE the ambient warning nag below, not after - a real,
+			// live-reported bug: OVERRIDE_THRESHOLD_TICKS and WARNING_NOISE_INTERVAL_TICKS are both
+			// exactly 100, so the nag's own trigger condition became true on the EXACT SAME tick the
+			// override fired every single time, and since every sound cue (this nag included) shares
+			// one global per-level throttle (see WendigoSounds.MIN_SOUND_INTERVAL_TICKS, 13s), the nag
+			// firing first was silently eating the slot the override plan's own opening "chase" sound
+			// cue needed a moment later. triggeredAmbushOrOverride below both runs this check first AND
+			// skips the nag entirely on a tick that also triggered the ambush/override - the chase cue
+			// already covers "something's happening" far better than a redundant nag fired the same
+			// instant the real thing starts.
+			boolean triggeredAmbushOrOverride = false;
+			int percent = this.progressionTracker.percentOf(player);
+			if (percent >= AMBUSH_MIN_PERCENT) {
+				boolean alreadyActive = this.wendigoManager.hasActiveWave(player.level());
+				int thresholdTicks = alreadyActive
+					? OVERRIDE_THRESHOLD_TICKS
+					: this.rolledThresholdTicks.computeIfAbsent(id, k -> rollThresholdTicks(percent));
+				if (ticks >= thresholdTicks) {
+					this.darkTicks.remove(id);
+					this.rolledThresholdTicks.remove(id);
+					if (alreadyActive) {
+						this.wendigoManager.overrideIntoChaseUntilLight(player.level(), player);
+					} else {
+						this.wendigoManager.triggerDarknessAmbush(player.level(), player);
+					}
+					triggeredAmbushOrOverride = true;
+				}
+			}
 			// The user's own explicit request: only play this "still lingering in the dark" warning
 			// while the wendigo is genuinely active on THIS player right now, not just because
 			// they're sitting in darkness generally (with no wendigo around at all, or one that's
 			// busy on someone else in a multiplayer group).
-			if (ticks % WARNING_NOISE_INTERVAL_TICKS < SAMPLE_INTERVAL_TICKS && this.wendigoManager.isActiveOn(player)) {
+			if (!triggeredAmbushOrOverride && ticks % WARNING_NOISE_INTERVAL_TICKS < SAMPLE_INTERVAL_TICKS
+					&& this.wendigoManager.isActiveOn(player)) {
 				WendigoSounds.play(player.level(), null, WendigoSounds.Type.AMBIENT);
-			}
-			int percent = this.progressionTracker.percentOf(player);
-			if (percent < AMBUSH_MIN_PERCENT) {
-				continue;
-			}
-			boolean alreadyActive = this.wendigoManager.hasActiveWave(player.level());
-			int thresholdTicks = alreadyActive
-				? OVERRIDE_THRESHOLD_TICKS
-				: this.rolledThresholdTicks.computeIfAbsent(id, k -> rollThresholdTicks(percent));
-			if (ticks >= thresholdTicks) {
-				this.darkTicks.remove(id);
-				this.rolledThresholdTicks.remove(id);
-				if (alreadyActive) {
-					this.wendigoManager.overrideIntoChaseUntilLight(player.level(), player);
-				} else {
-					this.wendigoManager.triggerDarknessAmbush(player.level(), player);
-				}
 			}
 		}
 	}
