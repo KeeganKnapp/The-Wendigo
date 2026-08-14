@@ -261,6 +261,21 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
     // pick which model set renders, and two different absorption windows on inputs to the same
     // downstream decision was never a deliberate design choice.
     private static final int RESTING_ON_FLOOR_DEBOUNCE_TICKS = 10;
+    // Gates posture.stare(enabled=true) specifically (see PlanRunner's own "posture.stare" case) -
+    // the user's own live report that starting a theatrical stare-hold on tilted/uneven ground (a
+    // slope, a step, a ledge right at the isRestingOnFloor threshold) looks wrong and feeds the same
+    // tilted-surface hitbox-vs-visual mismatch SemanticBands.lookAngleDegrees' own dead_stare comment
+    // already documents. Deliberately its OWN debounce, not a reuse of RESTING_ON_FLOOR_DEBOUNCE_TICKS
+    // - that one exists purely to damp visual jitter and stays short (10 ticks) on purpose so pose
+    // rendering doesn't lag; this one gates whether a stare is even allowed to BEGIN, where a longer
+    // wait before committing is free (nothing else is happening yet) and actually desirable - want
+    // real confidence the ground has been flat for a while, not just flat for one debounced tick.
+    private static final int STARE_FLAT_GROUND_DEBOUNCE_TICKS = 40; // 2s
+    // Orientation.pitch (0=floor, 90=dead-on wall - see CLIMBING_PENALTY_RAMP_START_PITCH's own
+    // comment for the confirmed scale) below which the current surface counts as "flat" for stare
+    // eligibility - a small tolerance, not a strict 0.0, since pitch is AWCAPI's own smoothed value
+    // and can sit a fraction of a degree off dead-flat even standing still on an ordinary floor.
+    private static final float STARE_FLAT_GROUND_MAX_PITCH_DEGREES = 3.0f;
     // Mirrors SpiderMixin's own FOLLOW_RANGE_INCREASE exactly (verified via javap: an ADD_VALUE +8.0
     // permanent modifier, applied once at construction) - a climbing route up/around a wall or
     // ceiling covers more real distance than a straight-line target-tracking check accounts for, so
@@ -369,6 +384,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
     private int desiredPoseStableTicks;
     private boolean restingOnFloorDebounced = true;
     private int restingOnFloorStableTicks;
+    private int flatGroundStableTicks;
     // See recoverFromSpuriousAttachmentLoss's own doc comment - tracks the last real wall/ceiling
     // normal seen while genuinely climbing, and the raw (undebounced) resting-on-floor reading from
     // the previous tick, purely to detect the specific one-tick transition that mitigation reacts to.
@@ -1211,6 +1227,7 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
         updateOrientationConvergence();
         updateGroundDirectionStability();
         updateRestingOnFloorDebounce();
+        updateFlatGroundStableTicks();
         updatePose();
         logDiagnostics();
 
@@ -1760,6 +1777,27 @@ public class WendigoEntity extends EnderMan implements IAdvancedClimber, Polymer
                 this.restingOnFloorStableTicks = 0;
             }
         }
+    }
+
+    /** Counts consecutive ticks spent on genuinely flat ground - see STARE_FLAT_GROUND_DEBOUNCE_TICKS'
+     * own comment for why this is a separate streak from restingOnFloorStableTicks rather than reusing
+     * it. Reads the debounced isRestingOnFloor() (not the raw per-tick value) so this can never run
+     * ahead of the pose/rendering system's own idea of "on a floor at all", plus a tight pitch
+     * tolerance on top to additionally rule out shallow slopes/steps that still debounce to "resting
+     * on floor" but aren't truly flat. Resets to zero the instant either condition breaks - no partial
+     * credit, a genuine interruption (stepping off onto a slope, briefly climbing) should require the
+     * full wait again before a stare is allowed to start. */
+    private void updateFlatGroundStableTicks() {
+        boolean flat = this.isRestingOnFloor() && this.getOrientation().pitch <= STARE_FLAT_GROUND_MAX_PITCH_DEGREES;
+        this.flatGroundStableTicks = flat ? this.flatGroundStableTicks + 1 : 0;
+    }
+
+    /** Whether the ground has read as flat (see updateFlatGroundStableTicks) for at least
+     * STARE_FLAT_GROUND_DEBOUNCE_TICKS in a row - the gate PlanRunner's "posture.stare" case checks
+     * before allowing a fresh stare to START (never forces an already-in-progress one to end, same
+     * convention as that case's stage-5/health cutoff just above it). */
+    public boolean isStareEligibleGround() {
+        return this.flatGroundStableTicks >= STARE_FLAT_GROUND_DEBOUNCE_TICKS;
     }
 
     /** Crawl pose is forced by four independent triggers - moving (the original mechanic), simply

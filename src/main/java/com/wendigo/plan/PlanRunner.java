@@ -1779,6 +1779,15 @@ public class PlanRunner {
 					debugSay("issue: stage 5 and <=50% health - too far gone to bother staring, skipping posture.stare");
 					return false;
 				}
+				// Only blocks STARTING a fresh stare, same as the stage-5/health cutoff just above -
+				// enabled=false always goes through regardless. See WendigoEntity.isStareEligibleGround's
+				// own comment: tilted/uneven ground produces a visible hitbox-vs-visual mismatch during a
+				// held stare, so a fresh one isn't allowed to begin until the ground has read as flat for
+				// STARE_FLAT_GROUND_DEBOUNCE_TICKS in a row.
+				if (enabled && !this.modelIntendedStaring && !this.self.isStareEligibleGround()) {
+					debugSay("issue: ground hasn't been flat long enough yet, skipping posture.stare");
+					return false;
+				}
 				if (enabled && !this.modelIntendedStaring) {
 					// Allow a new success to be counted, see successfulStareCount's own field comment.
 					this.currentStareCounted = false;
